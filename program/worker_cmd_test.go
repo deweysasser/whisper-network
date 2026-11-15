@@ -1,7 +1,10 @@
 package program
 
 import (
+	"os"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -89,4 +92,36 @@ func TestWorkerCmdChildIdentityFlags(t *testing.T) {
 	assert.Equal(t, 10001, opts.Worker.ChildUID)
 	assert.Equal(t, 10002, opts.Worker.ChildGID)
 	assert.Empty(t, opts.Worker.MetricsListen, "no metrics listener unless asked for")
+}
+
+func TestSecondSignalAborts(t *testing.T) {
+	sigs := make(chan os.Signal, 2)
+	done := make(chan struct{})
+	defer close(done)
+	abort := secondSignal(sigs, done)
+
+	sigs <- syscall.SIGTERM
+	select {
+	case <-abort:
+		t.Fatal("the first signal must only drain")
+	case <-time.After(100 * time.Millisecond):
+	}
+	sigs <- syscall.SIGTERM
+	select {
+	case <-abort:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the second signal did not abort")
+	}
+}
+
+func TestReleaseOnTermFlag(t *testing.T) {
+	skipOnWindows(t, "the worker is unsupported")
+	var opts Options
+	_, err := opts.Parse([]string{"worker", "--server", "https://wn.example"})
+	require.NoError(t, err)
+	assert.False(t, opts.Worker.ReleaseOnTerm, "draining is the default")
+	opts = Options{}
+	_, err = opts.Parse([]string{"worker", "--server", "https://wn.example", "--release-on-term", "--drain"})
+	require.NoError(t, err, "--drain is still accepted")
+	assert.True(t, opts.Worker.ReleaseOnTerm)
 }

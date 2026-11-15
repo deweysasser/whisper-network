@@ -66,6 +66,10 @@ type taskStats struct {
 // errFinished is the cancellation cause once a task has run its course.
 var errFinished = errors.New("task finished")
 
+// errAborted cancels running tasks when a drain is aborted; they are
+// released, not reported as failed.
+var errAborted = errors.New("drain aborted")
+
 // leaseRun is the state a lease's task shares with its heartbeat.
 type leaseRun struct {
 	// uploading is set once the result upload starts. From then on the

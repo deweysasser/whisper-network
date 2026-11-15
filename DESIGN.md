@@ -550,7 +550,7 @@ The server validates the result: segment times must be monotonic, within the tas
 2. Probe facts: cores (cgroup quota aware), memory (cgroup limit aware), `whisper-cli --version`, `ffmpeg -version`, available models, and the sandbox level (§7.4).
 3. While `pending`, poll `GET /worker/{id}` with backoff (30 s → 5 min). Log the ID and description once, so the operator knows what to approve.
 4. Once `active`, start N slot goroutines (§7.3).
-5. On SIGTERM: stop claiming, then by default `DELETE` every live lease and kill the children, so tasks requeue immediately instead of waiting out the lease timeout. With `--drain`, finish running tasks first.
+5. On SIGTERM (or SIGINT): **drain**. Stop claiming at once, keep heartbeating, let running tasks finish and upload, then exit. A **second** signal aborts the drain: kill the children and `DELETE` their leases so the tasks requeue immediately without consuming an attempt. `--release-on-term` skips the drain and does the abort path on the first signal. A drain needs the supervisor's kill grace period (e.g. `docker stop -t`, compose `stop_grace_period`) to exceed the longest task; if the worker is killed mid-drain, its leases expire and the retries consume an attempt.
 
 **Without a state volume**, every container restart registers a new worker and the pending list fills with dead entries. Mitigations: the docs say to mount the volume, and the reaper deletes `pending` workers unseen for 7 days. Rejected workers stay for the audit trail.
 
@@ -1020,7 +1020,7 @@ Every flag has an env var equivalent (`WHISPER_*`). There is no config file in v
 | `--max-host-load-resume` | 60 | Percent; a slot resumes claiming below this. At most `--max-host-load` |
 | `--kinds` | `prepare,transcribe` | e.g. `transcribe` only, to keep ffmpeg off a machine |
 | `--whisper-cli` / `--ffmpeg` | on `$PATH` | |
-| `--drain` | false | Graceful shutdown finishes running tasks first |
+| `--release-on-term` | false | On SIGTERM release running tasks at once instead of draining (`--drain` is accepted but obsolete) |
 | `--debug` / `--quiet` / `--output-format` | off / off / `auto` | Template flags (§10.1) |
 | `--metrics-listen` / `--metrics-push-url` | — / — | Optional (§10.2) |
 

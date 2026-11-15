@@ -26,6 +26,7 @@ const (
 	EventWorkerResumed    Event = "worker.resumed"
 	EventWorkerRejected   Event = "worker.rejected"
 	EventWorkerSandbox    Event = "worker.sandbox"
+	EventWorkerDraining   Event = "worker.draining"
 	EventAuthDenied       Event = "auth.denied"
 	EventAdminChange      Event = "admin.change"
 	EventReaperRun        Event = "reaper.run"

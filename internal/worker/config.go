@@ -69,8 +69,14 @@ type Config struct {
 	// worker's own process tree, and whether it is known (default: measured
 	// from /proc over the last minute on Linux, unknown elsewhere).
 	HostLoad func() (float64, bool)
-	// Drain makes shutdown finish running tasks instead of releasing them.
+	// Drain makes shutdown finish running tasks instead of releasing them:
+	// cancelling Run's context stops new claims, and running tasks continue
+	// to completion and upload their results.
 	Drain bool
+	// Abort, when closed during a drain, ends it early: running children
+	// are killed and their leases released (no attempt consumed), as in
+	// a non-draining shutdown. The command closes it on a second signal.
+	Abort <-chan struct{}
 	// ChildUID and ChildGID are the identity children run as. A worker
 	// running as root must set both (non-zero): its children would
 	// otherwise run as root, able to read credentials.json. A worker not

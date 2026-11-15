@@ -49,6 +49,10 @@ services:
     # Transcription must not compete with real work on the host.
     cpu_shares: 128
     mem_limit: 6g
+    # On stop the worker finishes its running task before exiting. A task
+    # can take tens of minutes, so give it time before SIGKILL; a second
+    # stop (or `docker kill -s TERM`) releases the task immediately instead.
+    stop_grace_period: 1h
     labels: *shipped
     restart: unless-stopped
 

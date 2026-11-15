@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"os/signal"
 	"runtime"
+	"syscall"
 	"time"
 
 	"github.com/VictoriaMetrics/metrics"
@@ -33,7 +36,8 @@ type WorkerCmd struct {
 	WhisperCLI     string        `name:"whisper-cli" default:"whisper-cli" env:"WHISPER_WHISPER_CLI" help:"whisper-cli binary"`
 	FFmpeg         string        `name:"ffmpeg" default:"ffmpeg" env:"WHISPER_FFMPEG" help:"ffmpeg binary"`
 	EngineVersion  string        `env:"WHISPER_ENGINE_VERSION" help:"Override the engine version reported by whisper-cli"`
-	Drain          bool          `env:"WHISPER_DRAIN" help:"On shutdown, finish running tasks instead of releasing them"`
+	ReleaseOnTerm  bool          `name:"release-on-term" env:"WHISPER_RELEASE_ON_TERM" help:"On SIGTERM/SIGINT, release running tasks to other workers at once instead of finishing them first"`
+	Drain          bool          `hidden:"" env:"WHISPER_DRAIN" help:"Deprecated: draining is now the default"`
 	MaxHostLoad    float64       `default:"70" env:"WHISPER_MAX_HOST_LOAD" help:"Stop claiming new tasks while the host's CPU use by other processes (percent, 1-minute average) is above this; running tasks continue (0: disabled; Linux only)"`
 	HostLoadResume float64       `name:"max-host-load-resume" default:"60" env:"WHISPER_MAX_HOST_LOAD_RESUME" help:"Resume claiming once the host's CPU use by other processes falls below this (percent)"`
 	ChildTimeout   float64       `default:"4" env:"WHISPER_CHILD_TIMEOUT_FACTOR" help:"whisper-cli time limit as a multiple of the audio duration (plus 10 min)"`
@@ -71,13 +75,22 @@ func (c *WorkerCmd) Run(ctx context.Context, logger zerolog.Logger) error {
 	for i, k := range c.Kinds {
 		kinds[i] = api.TaskKind(k)
 	}
+	// The first SIGTERM/SIGINT cancels ctx (main.go): the worker stops
+	// claiming and finishes running tasks. A second one aborts the drain.
+	sigs := make(chan os.Signal, 2)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigs)
+	stopWatch := make(chan struct{})
+	defer close(stopWatch)
+	abort := secondSignal(sigs, stopWatch)
+
 	w, err := worker.New(worker.Config{
 		Client: cl, StateDir: c.State, Description: c.Description,
 		ThreadsPerSlot: c.ThreadsPerSlot, Slots: c.Slots,
 		MemoryReserve: int64(c.MemoryReserve), Memory: int64(c.Memory), Kinds: kinds,
 		DiskReserve: int64(c.DiskReserve), ModelCacheMax: int64(c.ModelCacheMax),
 		MaxHostLoad: c.MaxHostLoad, MaxHostLoadResume: c.HostLoadResume,
-		WhisperCLI: c.WhisperCLI, FFmpeg: c.FFmpeg, EngineVersion: c.EngineVersion, Drain: c.Drain,
+		WhisperCLI: c.WhisperCLI, FFmpeg: c.FFmpeg, EngineVersion: c.EngineVersion, Drain: !c.ReleaseOnTerm, Abort: abort,
 		ChildUID: c.ChildUID, ChildGID: c.ChildGID,
 		Version: Version, Logger: log, Metrics: m,
 		Limits: worker.Limits{TimeoutFactor: c.ChildTimeout},
@@ -143,4 +156,25 @@ func workerSupported(goos string) error {
 		return errWorkerUnsupported
 	}
 	return nil
+}
+
+// secondSignal returns a channel closed when the second signal arrives on
+// sigs, which aborts a drain. It stops watching when done is closed.
+func secondSignal(sigs <-chan os.Signal, done <-chan struct{}) <-chan struct{} {
+	abort := make(chan struct{})
+	go func() {
+		seen := 0
+		for {
+			select {
+			case <-sigs:
+				if seen++; seen == 2 {
+					close(abort)
+					return
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+	return abort
 }

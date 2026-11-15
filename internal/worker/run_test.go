@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -252,6 +253,57 @@ func TestDrainFinishesRunningTasks(t *testing.T) {
 	assert.Equal(t, api.OutcomeDone, l[0].Outcome)
 	assert.Equal(t, api.TaskDone, h.srv.Task(task).State)
 	assert.Empty(t, h.srv.LeasesFor(other), "no claims after the shutdown signal")
+}
+
+// TestDrainAbortReleasesRunningTasks: while draining, closing Abort (the
+// command's second signal) kills the running child and releases its lease
+// without consuming an attempt, then the worker exits.
+func TestDrainAbortReleasesRunningTasks(t *testing.T) {
+	h := newHarness(t)
+	abort := make(chan struct{})
+	h.cfg.Drain = true
+	h.cfg.Abort = abort
+	h.cfg.ChildEnv = []string{workertest.WhisperMode(workertest.ModeHang)}
+	task := h.srv.AddTask(workertest.Task{Kind: api.KindTranscribe, Input: workertest.WAV(2), Model: "tiny.test"})
+	cancel, done := h.run()
+	h.activate()
+	h.liveLease(task)
+	h.eventually(func() bool { return h.srv.LeasesFor(task)[0].Heartbeats >= 1 }, "worker never held the lease")
+
+	cancel() // first signal: drain
+	h.eventually(func() bool { return strings.Contains(string(h.logs.Bytes()), `"event":"worker.draining"`) },
+		"no draining event")
+	select {
+	case err := <-done:
+		t.Fatalf("worker exited during the drain of a hung task: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	start := time.Now()
+	close(abort) // second signal: abort the drain
+	require.NoError(t, waitDone(t, done))
+	assert.Less(t, time.Since(start), 5*time.Second, "abort is prompt")
+	l := h.srv.LeasesFor(task)
+	require.Len(t, l, 1)
+	assert.Equal(t, api.OutcomeReleased, l[0].Outcome)
+	got := h.srv.Task(task)
+	assert.Equal(t, api.TaskPending, got.State)
+	assert.Equal(t, 0, got.Attempts, "an aborted drain does not consume an attempt")
+	assert.Empty(t, got.Failures, "an aborted drain is not a failure")
+}
+
+// TestDrainWhileIdleExitsPromptly: with nothing running, a drain ends at
+// once.
+func TestDrainWhileIdleExitsPromptly(t *testing.T) {
+	h := newHarness(t)
+	h.cfg.Drain = true
+	cancel, done := h.run()
+	h.activate()
+	h.eventually(func() bool { return len(h.srv.Claims()) > 0 }, "worker never polled")
+	start := time.Now()
+	cancel()
+	require.NoError(t, waitDone(t, done))
+	assert.Less(t, time.Since(start), 5*time.Second)
 }
 
 func TestChildFailureIsReportedWithStderr(t *testing.T) {

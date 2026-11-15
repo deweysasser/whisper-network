@@ -192,6 +192,26 @@ with `whisper-network retry "$id"`; nothing needs uploading again.
 VictoriaMetrics, VictoriaLogs, a log shipper and vmalert. It is an example, not
 a hardened deployment.
 
+### Stopping a worker
+
+SIGTERM (what `docker stop` sends) or Ctrl-C makes a worker **drain**: it
+takes no new tasks, finishes the ones it is running, uploads their
+transcripts and exits. A **second** signal aborts the drain: the running
+tasks are released and immediately picked up by other workers, at no cost
+to their retry budget, though the work in progress is redone.
+
+A transcribe task can take tens of minutes, so give the supervisor a long
+enough grace period before it escalates to SIGKILL, or the drain is cut
+short and the task is retried after its lease expires:
+
+```sh
+docker stop -t 3600 wn-worker      # compose: stop_grace_period: 1h
+```
+
+To hand running work to other workers immediately instead, run the worker
+with `--release-on-term`, or send the signal twice
+(`docker kill -s TERM wn-worker` after `docker stop`).
+
 ## Quick start with binaries
 
 Release archives for linux, darwin and windows (amd64 and arm64) are attached
@@ -401,7 +421,7 @@ for the authoritative list.
 | `--whisper-cli` | `whisper-cli` | `WHISPER_WHISPER_CLI` | whisper-cli binary |
 | `--ffmpeg` | `ffmpeg` | `WHISPER_FFMPEG` | ffmpeg binary |
 | `--engine-version` | probed | `WHISPER_ENGINE_VERSION` | Override the reported engine version |
-| `--drain` | off | `WHISPER_DRAIN` | On shutdown, finish running tasks instead of releasing them |
+| `--release-on-term` | off | `WHISPER_RELEASE_ON_TERM` | On SIGTERM/SIGINT, release running tasks to other workers at once instead of finishing them (see [Stopping a worker](#stopping-a-worker)) |
 | `--child-timeout` | `4` | `WHISPER_CHILD_TIMEOUT_FACTOR` | whisper-cli time limit as a multiple of audio duration, plus 10 min |
 | `--child-uid` | | `WHISPER_CHILD_UID` | Dedicated unprivileged uid for ffmpeg and whisper-cli; required (and only allowed) when the worker runs as root |
 | `--child-gid` | | `WHISPER_CHILD_GID` | Group for the children; required with `--child-uid` |

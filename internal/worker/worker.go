@@ -102,7 +102,8 @@ func (w *Worker) modelDir() string        { return filepath.Join(w.cfg.StateDir,
 //
 // On cancellation the worker stops claiming. By default it kills running
 // children and releases their leases so the tasks requeue at once; with
-// Config.Drain it lets running tasks finish and upload first.
+// Config.Drain it lets running tasks finish and upload first, unless
+// Config.Abort is closed meanwhile.
 func (w *Worker) Run(ctx context.Context) error {
 	if err := os.MkdirAll(w.cfg.StateDir, 0o700); err != nil {
 		return err
@@ -140,16 +141,30 @@ func (w *Worker) Run(ctx context.Context) error {
 
 	workCtx := runCtx
 	if w.cfg.Drain {
-		// Running tasks survive the shutdown signal but not a fatal error.
+		// Running tasks survive the shutdown signal but not a fatal error,
+		// and not an abort (which releases them instead).
 		var cancelWork context.CancelCauseFunc
 		workCtx, cancelWork = context.WithCancelCause(context.WithoutCancel(ctx))
 		defer cancelWork(nil)
 		stop := context.AfterFunc(runCtx, func() {
 			if cause := context.Cause(runCtx); isFatal(cause) {
 				cancelWork(cause)
+				return
 			}
+			obs.Info(&w.log, obs.EventWorkerDraining).Int32("running", w.busy.Load()).
+				Msg("draining: no new tasks; finishing running tasks (signal again to abort)")
 		})
 		defer stop()
+		if w.cfg.Abort != nil {
+			go func() {
+				select {
+				case <-w.cfg.Abort:
+					w.log.Warn().Int32("running", w.busy.Load()).Msg("drain aborted; releasing running tasks")
+					cancelWork(errAborted)
+				case <-workCtx.Done():
+				}
+			}()
+		}
 	}
 
 	w.mem = newMemBudget(w.budget())
