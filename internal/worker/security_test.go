@@ -148,7 +148,10 @@ func TestChildTimeoutKillsDescendants(t *testing.T) {
 	h := newHarness(t)
 	h.cfg.ChildEnv = []string{workertest.WhisperMode(workertest.ModeForkTree)}
 	h.cfg.Limits.TimeoutFactor = 0.01
-	h.cfg.Limits.TimeoutBase = 500 * time.Millisecond
+	// Long enough for the fake child (a re-executed, possibly race-built
+	// test binary) to start and report its grandchild even on a loaded
+	// machine; the child then hangs, so the timeout still fires.
+	h.cfg.Limits.TimeoutBase = 5 * time.Second
 	task := h.srv.AddTask(workertest.Task{Kind: api.KindTranscribe, Input: workertest.WAV(1), Model: "tiny.test"})
 	_, _ = h.run()
 	h.activate()
@@ -156,7 +159,7 @@ func TestChildTimeoutKillsDescendants(t *testing.T) {
 	f := h.srv.Task(task).Failures[0]
 	assert.Contains(t, f.Reason, "timed out")
 	m := regexp.MustCompile(`grandchild pid (\d+)`).FindStringSubmatch(f.StderrTail)
-	require.NotNil(t, m, "stderr: %s", f.StderrTail)
+	require.NotNil(t, m, "the child was killed before it reported its grandchild (timeout shorter than startup?); stderr: %q", f.StderrTail)
 	pid, _ := strconv.Atoi(m[1])
 	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
 	assert.Eventually(t, func() bool { return processGone(pid) }, 5*time.Second, 10*time.Millisecond,
