@@ -158,11 +158,12 @@ func TestPruneRejectedWorkerReturnsAndDeletesStats(t *testing.T) {
 	assert.Zero(t, rows, "counters go with the worker")
 }
 
-// rollBackToV2 makes the database look as it did before migration 3, then
-// reopens it so the migration (and its backfill) runs.
+// rollBackToV2 makes the database look as it did at schema version 2
+// (undoing every later migration: 0003 worker_stats and 0004's index), then
+// reopens it so migrations 3 onward, including the backfill, run again.
 func (f *fixture) rollBackToV2() {
 	f.t.Helper()
-	_, err := f.s.w.ExecContext(f.ctx, `DROP TABLE worker_stats; PRAGMA user_version = 2`)
+	_, err := f.s.w.ExecContext(f.ctx, `DROP TABLE worker_stats; DROP INDEX IF EXISTS leases_task_failures; PRAGMA user_version = 2`)
 	require.NoError(f.t, err)
 	require.NoError(f.t, f.s.Close())
 	f.s = f.open()
