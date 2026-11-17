@@ -3,7 +3,6 @@ package server
 import (
 	"fmt"
 	"net/http"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -65,7 +64,8 @@ func TestDetectLoop(t *testing.T) {
 			got := detectLoop(segs(tc.texts...))
 			if tc.loop {
 				require.NotNil(t, got)
-				assert.Contains(t, got.Error(), "moment of silence")
+				assert.Contains(t, got.Error(), "repetition loop")
+				assert.NotContains(t, got.Error(), "silence", "the reason never quotes transcript text")
 			} else {
 				assert.Nil(t, got)
 			}
@@ -136,7 +136,11 @@ func TestLoopedResultRetriesWithoutContext(t *testing.T) {
 	j = h.job(job.ID)
 	assert.Equal(t, api.JobFailed, j.State)
 	require.NotNil(t, j.Error)
-	assert.Contains(t, *j.Error, "moment of silence")
+	assert.Contains(t, *j.Error, "repetition loop")
+	// Transcript text needs read permission; the job error and the logs
+	// are visible without it (DESIGN.md §10.1).
+	assert.NotContains(t, *j.Error, "silence")
+	assert.NotContains(t, string(h.logs.Bytes()), "silence")
 }
 
 // TestLoopRetryCleanResult: a clean result on the no-context retry
@@ -177,14 +181,4 @@ func TestLoopsDoNotTripBreaker(t *testing.T) {
 		h.expectProblem(resp, body, http.StatusUnprocessableEntity, api.ProblemResultInvalid)
 	}
 	assert.Empty(t, h.logs.events(t, obs.EventWorkerAutoPaused))
-}
-
-// TestDetectLoopLongLine: the reason quotes at most loopQuoteRunes of the
-// line, since it ends up in the job's error.
-func TestDetectLoopLongLine(t *testing.T) {
-	long := strings.Repeat("word ", 200)
-	got := detectLoop(segs(repeat(long, 60)...))
-	require.NotNil(t, got)
-	assert.Less(t, len(got.Error()), 250)
-	assert.Contains(t, got.Error(), "…")
 }

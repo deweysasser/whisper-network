@@ -15,24 +15,19 @@ const (
 	loopMaxRun   = 50   // more identical segments in a row than this is a loop
 	loopMinCount = 50   // ... as is one line seen more often than this
 	loopMaxShare = 0.30 // ... when it is also over this share of the segments
-
-	loopQuoteRunes = 100 // the reason quotes at most this much of the line
 )
 
-// errLoop describes a refused looping transcript.
+// errLoop describes a refused looping transcript. It carries counts only:
+// its text becomes the task's error, which is logged and shown to anyone
+// who can see the job, so it must never quote the transcript (DESIGN.md
+// §10.1).
 type errLoop struct {
-	line       string
-	run, count int
-	total      int
+	run, count, total int
 }
 
 func (e *errLoop) Error() string {
-	line := e.line
-	if r := []rune(line); len(r) > loopQuoteRunes {
-		line = string(r[:loopQuoteRunes]) + "…"
-	}
-	return fmt.Sprintf("repetition loop: %q repeated %d times in a row, %d of %d segments",
-		line, e.run, e.count, e.total)
+	return fmt.Sprintf("repetition loop: one line repeated %d times in a row, %d of %d segments",
+		e.run, e.count, e.total)
 }
 
 // detectLoop reports a transcript stuck repeating one line: some line
@@ -62,7 +57,7 @@ func detectLoop(segs []api.Segment) *errLoop {
 	for line, n := range counts {
 		looped := runs[line] > loopMaxRun || n > loopMinCount && float64(n) > loopMaxShare*float64(total)
 		if looped && (worst == nil || n > worst.count) {
-			worst = &errLoop{line: line, run: runs[line], count: n, total: total}
+			worst = &errLoop{run: runs[line], count: n, total: total}
 		}
 	}
 	return worst

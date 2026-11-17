@@ -77,7 +77,7 @@ Both return `409` with problem type `not-done` until the job is `done`. For a fa
 
 Whisper output is good but not perfect: names are often misspelled (the prompt helps), and occasionally a phrase repeats or a passage is dropped. Check against the audio before quoting someone.
 
-Whisper can also get stuck repeating one line for many minutes. The server catches a part of the transcript that does this and transcribes that part again on another worker, this time without your prompt. If that run loops too, the job fails, and its `error` names the repeated line.
+Whisper can also get stuck repeating one line for many minutes. The server catches a part of the transcript that does this and transcribes that part again on another worker, this time without your prompt. If that run loops too, the job fails, and its `error` starts `repetition loop:` (it gives counts, not the repeated text).
 
 ## Clean up
 
