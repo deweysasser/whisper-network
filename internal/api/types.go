@@ -387,20 +387,25 @@ type ClaimRequest struct {
 
 // Lease is the claim response (201).
 type Lease struct {
-	ID                 string    `json:"id"`
-	Kind               TaskKind  `json:"kind"`
-	Job                string    `json:"job"`
-	Seq                int       `json:"seq"`
-	InputURL           string    `json:"input_url"`
-	InputBytes         int64     `json:"input_bytes,omitempty"`  // prepare: original size
-	InputSHA256        string    `json:"input_sha256,omitempty"` // prepare: original hash
-	AudioSamples       int64     `json:"audio_samples,omitempty"`
-	Model              string    `json:"model,omitempty"`
-	ModelSHA256        string    `json:"model_sha256,omitempty"`
-	VADModel           string    `json:"vad_model,omitempty"`
-	VADModelSHA256     string    `json:"vad_model_sha256,omitempty"`
-	Language           string    `json:"language,omitempty"`
-	Prompt             string    `json:"prompt,omitempty"`
+	ID             string   `json:"id"`
+	Kind           TaskKind `json:"kind"`
+	Job            string   `json:"job"`
+	Seq            int      `json:"seq"`
+	InputURL       string   `json:"input_url"`
+	InputBytes     int64    `json:"input_bytes,omitempty"`  // prepare: original size
+	InputSHA256    string   `json:"input_sha256,omitempty"` // prepare: original hash
+	AudioSamples   int64    `json:"audio_samples,omitempty"`
+	Model          string   `json:"model,omitempty"`
+	ModelSHA256    string   `json:"model_sha256,omitempty"`
+	VADModel       string   `json:"vad_model,omitempty"`
+	VADModelSHA256 string   `json:"vad_model_sha256,omitempty"`
+	Language       string   `json:"language,omitempty"`
+	Prompt         string   `json:"prompt,omitempty"`
+	// NoContext is set on the retry of a transcribe task whose result was
+	// refused as a repetition loop: the worker runs whisper-cli without
+	// conditioning on previous text (-mc 0). Such a lease never carries a
+	// prompt.
+	NoContext          bool      `json:"no_context,omitempty"`
 	HeartbeatIntervalS int       `json:"heartbeat_interval_s"`
 	ExpiresAt          time.Time `json:"expires_at"`
 }
@@ -500,6 +505,11 @@ const (
 	// StageChild is while running ffmpeg or whisper-cli, or handling
 	// their output.
 	StageChild FailureStage = "child"
+	// StageLoop is assigned by the server, never reported by a worker:
+	// the worker's transcript was refused as a repetition loop (issue #99).
+	// It counts as an attempt but not toward the worker's failure streak,
+	// and the task's next lease carries NoContext.
+	StageLoop FailureStage = "loop"
 )
 
 // Valid reports whether s is a known stage.

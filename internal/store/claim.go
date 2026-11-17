@@ -44,6 +44,10 @@ type Lease struct {
 	// Prepare input.
 	OriginalBytes  int64
 	OriginalSHA256 string
+	// NoContext is set when an earlier lease on the task (since the job was
+	// last retried) was refused as a repetition loop: this one runs without
+	// previous-text conditioning or a prompt (issue #99).
+	NoContext bool
 	// Attempt is the task's attempt count including this lease.
 	Attempt   int
 	Cost      float64
@@ -72,6 +76,11 @@ func (l *Lease) API(heartbeatInterval time.Duration) api.Lease {
 	case api.KindTranscribe:
 		out.AudioSamples = l.EndSample - l.StartSample
 		out.Model, out.Language, out.Prompt = l.Model, l.Language, l.Prompt
+		if l.NoContext {
+			// The server drops the prompt itself, so even a worker that
+			// predates no_context retries without it.
+			out.NoContext, out.Prompt = true, ""
+		}
 	}
 	return out
 }
@@ -233,7 +242,9 @@ func candidates(ctx context.Context, tx *sql.Tx, where string, args []any) ([]sc
 
 const leaseSelect = `SELECT l.id, l.job_id, l.seq, t.kind, l.worker_id, j.queue_id, q.name, j.weight, j.model,
 	j.language, j.prompt, COALESCE(t.start_sample, 0), COALESCE(t.end_sample, 0), j.original_bytes,
-	j.original_sha256, t.attempts, t.cost, l.created_at, l.expires_at, l.ended_at, COALESCE(l.outcome, '')
+	j.original_sha256, t.attempts, t.cost, l.created_at, l.expires_at, l.ended_at, COALESCE(l.outcome, ''),
+	EXISTS (SELECT 1 FROM leases x WHERE x.job_id = l.job_id AND x.seq = l.seq AND x.outcome = 'failed' AND x.stage = 'loop'
+		AND x.retry = j.retries AND x.created_at <= l.created_at AND x.id != l.id)
 	FROM leases l JOIN tasks t ON t.job_id = l.job_id AND t.seq = l.seq
 	JOIN jobs j ON j.id = l.job_id JOIN queues q ON q.id = j.queue_id`
 
@@ -243,7 +254,8 @@ func (s *Store) loadLease(ctx context.Context, q querier, id string) (*Lease, er
 	var ended sql.NullInt64
 	err := q.QueryRowContext(ctx, leaseSelect+` WHERE l.id = ?`, id).Scan(&l.ID, &l.JobID, &l.Seq, &l.Kind,
 		&l.WorkerID, &l.QueueID, &l.QueueName, &l.Weight, &l.Model, &l.Language, &l.Prompt, &l.StartSample,
-		&l.EndSample, &l.OriginalBytes, &l.OriginalSHA256, &l.Attempt, &l.Cost, &created, &expires, &ended, &l.Outcome)
+		&l.EndSample, &l.OriginalBytes, &l.OriginalSHA256, &l.Attempt, &l.Cost, &created, &expires, &ended, &l.Outcome,
+		&l.NoContext)
 	if err != nil {
 		return nil, err
 	}

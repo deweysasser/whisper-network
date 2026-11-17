@@ -25,6 +25,7 @@ type TranscribeParams struct {
 	Threads               int
 	Prompt                string
 	VADModel              string // path; "" disables VAD
+	NoContext             bool   // loop retry: -mc 0 and no prompt
 }
 
 // TranscribeArgs returns whisper-cli's arguments (without argv[0]), one per
@@ -35,7 +36,11 @@ type TranscribeParams struct {
 func TranscribeArgs(p TranscribeParams) []string {
 	args := []string{"-m", p.Model, "-f", p.Input, "-l", p.Language,
 		"-t", strconv.Itoa(p.Threads), "-oj", "-of", p.OutBase, "-np"}
-	if p.Prompt != "" {
+	if p.NoContext {
+		// A repetition-loop retry: -mc 0 stops conditioning on previous
+		// text, and the prompt, which feeds the same context, is dropped.
+		args = append(args, "-mc", "0")
+	} else if p.Prompt != "" {
 		args = append(args, "--prompt", oneLine(p.Prompt))
 	}
 	if p.VADModel != "" {
@@ -126,7 +131,7 @@ func (w *Worker) transcribeChild(ctx context.Context, l *api.Lease, dir, in stri
 	outBase := filepath.Join(dir, "out")
 	rsp := filepath.Join(dir, "args.rsp")
 	args := TranscribeArgs(TranscribeParams{Model: modelPath, Input: in, OutBase: outBase, Language: lang,
-		Threads: w.cfg.ThreadsPerSlot, Prompt: l.Prompt, VADModel: vadPath})
+		Threads: w.cfg.ThreadsPerSlot, Prompt: l.Prompt, VADModel: vadPath, NoContext: l.NoContext})
 	if err := w.writeForChild(rsp, responseFile(args)); err != nil {
 		return taskStats{}, retryableErr("writing arguments", err)
 	}

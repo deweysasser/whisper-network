@@ -167,6 +167,25 @@ func (s *Server) rejectResult(ctx context.Context, l *store.Lease, status int, r
 	return newProblem(status, typ, reason)
 }
 
+// rejectLoop refuses a transcript stuck repeating one line (issue #99).
+// The task is retried on another worker with no_context and no prompt;
+// the worker's breaker is not charged.
+func (s *Server) rejectLoop(ctx context.Context, l *store.Lease, loop *errLoop) error {
+	reason := loop.Error()
+	if l.Live {
+		end, err := s.st.FailStage(ctx, l.ID, l.WorkerID, reason, true, api.StageLoop)
+		if err != nil {
+			return err
+		}
+		obs.Warn(&s.log, obs.EventTaskFailed).Str(obs.FieldLeaseID, l.ID).Str(obs.FieldJobID, l.JobID).
+			Int(obs.FieldTaskSeq, l.Seq).Str(obs.FieldTaskKind, string(l.Kind)).Str(obs.FieldWorkerID, l.WorkerID).
+			Int(obs.FieldAttempt, end.Attempt).Str("stage", string(api.StageLoop)).Bool("no_context", l.NoContext).
+			Str(obs.FieldError, reason).Msg("result rejected: repetition loop")
+		s.leaseEnded(ctx, end)
+	}
+	return newProblem(http.StatusUnprocessableEntity, api.ProblemResultInvalid, reason)
+}
+
 // maxCanonicalBytes bounds a prepare result: verbatim FLAC of the longest
 // accepted audio plus generous frame overhead.
 func (s *Server) maxCanonicalBytes() int64 {
@@ -386,6 +405,9 @@ func (s *Server) transcribeResult(w http.ResponseWriter, r *http.Request, p *Pri
 	}
 	if err := s.validateTranscribe(&res, l); err != nil {
 		return s.rejectResult(ctx, l, http.StatusUnprocessableEntity, err.Error())
+	}
+	if loop := detectLoop(res.Segments); loop != nil {
+		return s.rejectLoop(ctx, l, loop)
 	}
 	stored, err := json.Marshal(storedResult{Model: res.Model, ModelSHA256: res.ModelSHA256, VAD: res.VAD,
 		Language: res.Language, Segments: nonNilSegments(res.Segments)})

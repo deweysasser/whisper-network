@@ -136,9 +136,13 @@ func (s *Store) checkLive(l leaseRow, now time.Time) error {
 // if the lease had already ended.
 func (s *Store) endLease(ctx context.Context, tx *sql.Tx, l leaseRow, outcome api.LeaseOutcome,
 	retryable bool, reason string, stage api.FailureStage, now time.Time) (*LeaseEnd, error) {
-	if outcome != api.OutcomeFailed || !stage.Valid() || stage == api.StagePreWork && !s.preWorkRefund() {
+	if outcome != api.OutcomeFailed || !stage.Valid() && stage != api.StageLoop ||
+		stage == api.StagePreWork && !s.preWorkRefund() {
 		stage = "" // a pre-work failure then counts as an ordinary one
 	}
+	// A loop is the model's failure, not the worker's: it counts as an
+	// attempt but not toward the worker's breaker.
+	loop := stage == api.StageLoop
 	stageCol := sql.NullString{String: string(stage), Valid: stage != ""}
 	res, err := tx.ExecContext(ctx, `UPDATE leases SET ended_at = ?, outcome = ?, stage = ?
 		WHERE id = ? AND ended_at IS NULL`, toMS(now), string(outcome), stageCol, l.ID)
@@ -152,7 +156,7 @@ func (s *Store) endLease(ctx context.Context, tx *sql.Tx, l leaseRow, outcome ap
 	if err := countLeaseEnd(ctx, tx, l.WorkerID, outcome); err != nil {
 		return nil, err
 	}
-	pause, err := s.trackFailureStreak(ctx, tx, l, outcome, retryable || preWork, preWork, now)
+	pause, err := s.trackFailureStreak(ctx, tx, l, outcome, (retryable || preWork) && !loop, preWork, now)
 	if err != nil {
 		return nil, err
 	}

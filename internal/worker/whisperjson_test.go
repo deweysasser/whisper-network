@@ -68,4 +68,14 @@ func TestTranscribeArgs(t *testing.T) {
 		"--prompt", "line one line two", "--vad", "-vm", "/vad.bin"}, args)
 	assert.Equal(t, "-m\n/m.bin\n", string(responseFile(args[:2])))
 	assert.NotContains(t, TranscribeArgs(TranscribeParams{Threads: 1}), "--prompt")
+	assert.NotContains(t, TranscribeArgs(TranscribeParams{Threads: 1}), "-mc")
+}
+
+// TestTranscribeArgsNoContext: a loop retry runs with no previous-text
+// conditioning (-mc 0) and no prompt, even if the lease carried one (#99).
+func TestTranscribeArgsNoContext(t *testing.T) {
+	args := TranscribeArgs(TranscribeParams{Model: "/m.bin", Input: "/in.wav", OutBase: "/out", Language: "en",
+		Threads: 2, Prompt: "names", NoContext: true})
+	assert.Equal(t, []string{"-m", "/m.bin", "-f", "/in.wav", "-l", "en", "-t", "2", "-oj", "-of", "/out", "-np",
+		"-mc", "0"}, args)
 }
