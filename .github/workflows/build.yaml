@@ -1,7 +1,10 @@
 on:
+  # main runs on push (and publishes images); everything else runs as a PR.
+  # pull_request (not push) is what reports checks on PRs from forks, and
+  # using only one trigger per commit avoids duplicate runs on our own PRs.
   push:
-    branches:
-      - "**"
+    branches: [main]
+  pull_request:
 
 name: Build
 
