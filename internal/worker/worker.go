@@ -52,6 +52,10 @@ type Worker struct {
 	busy     atomic.Int32
 
 	pollInterval time.Duration
+	// serverOutCap is the server's bound on a prepare result
+	// (api.Worker.MaxPrepareOutputBytes, refreshed from each prepare
+	// lease); 0 until the server has said.
+	serverOutCap atomic.Int64
 	fatal        context.CancelCauseFunc
 }
 

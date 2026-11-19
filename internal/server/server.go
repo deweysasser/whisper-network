@@ -622,4 +622,5 @@ func (s *Server) publicURL(path string) string { return s.cfg.PublicURL + path }
 func (s *Server) workerHints(w *api.Worker) {
 	w.HeartbeatIntervalS = s.heartbeatSeconds()
 	w.PollIntervalS = int(s.cfg.PollInterval / time.Second)
+	w.MaxPrepareOutputBytes = s.maxCanonicalBytes()
 }

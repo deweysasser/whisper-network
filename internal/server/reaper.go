@@ -57,6 +57,19 @@ func (s *Server) reapOnce(ctx context.Context) {
 	}
 	counts["tasks_stranded"] = len(stranded)
 
+	unplaceable, err := s.st.FailUnplaceable(ctx, s.cfg.RetryWaitLimit, eligibleWindow)
+	fail("fail unplaceable tasks", err)
+	for i := range unplaceable {
+		st := &unplaceable[i]
+		obs.Warn(&s.log, obs.EventTaskFailed).Str(obs.FieldJobID, st.JobID).Int(obs.FieldTaskSeq, st.Seq).
+			Str(obs.FieldTaskKind, string(st.Kind)).Bool("retryable", false).
+			Str(obs.FieldError, st.Reason).Msg("task failed: no worker has room for its input")
+		if st.JobFailed {
+			s.jobFinished(ctx, st.JobID)
+		}
+	}
+	counts["tasks_unplaceable"] = len(unplaceable)
+
 	// Lease ends settle a failing job themselves; this is the backstop.
 	settled, err := s.st.SettleFailingJobs(ctx)
 	fail("settle failing jobs", err)

@@ -76,6 +76,9 @@ func (w *Worker) awaitActive(ctx context.Context) error {
 		if st.PollIntervalS > 0 {
 			w.pollInterval = time.Duration(st.PollIntervalS) * time.Second
 		}
+		if st.MaxPrepareOutputBytes > 0 {
+			w.serverOutCap.Store(st.MaxPrepareOutputBytes)
+		}
 		if !patched {
 			patched = true
 			if err := w.patchFacts(ctx, st.Facts); err != nil {

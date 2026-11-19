@@ -142,6 +142,29 @@ func TestDiskGateAdmission(t *testing.T) {
 	assert.True(t, ok)
 }
 
+func TestPrepareFit(t *testing.T) {
+	t.Parallel()
+	const outCap = 2 * gib
+	cases := []struct {
+		name  string
+		avail int64
+		want  int64
+	}{
+		{"no space", 0, 0},
+		{"only the slack", diskSlack, 0},
+		{"small: input and an equal output", diskSlack + 2*gib, gib},
+		{"large: input and the capped output", diskSlack + 14*gib, 12 * gib},
+		{"exactly two caps", diskSlack + 2*outCap, outCap},
+	}
+	for _, c := range cases {
+		got := prepareFit(c.avail, outCap)
+		assert.Equal(t, c.want, got, c.name)
+		if got > 0 {
+			assert.LessOrEqual(t, got+min(got, outCap)+diskSlack, c.avail, "%s: the fit is admitted", c.name)
+		}
+	}
+}
+
 func TestLeaseDisk(t *testing.T) {
 	h := newHarness(t)
 	w, err := New(h.cfg)
@@ -149,7 +172,16 @@ func TestLeaseDisk(t *testing.T) {
 	tiny, vad := testCatalog()[0], testCatalog()[2]
 	w.cache = NewModelCache(t.Context(), filepath.Join(h.cfg.StateDir, "models"), nil)
 
-	assert.Equal(t, 2*int64(1000)+diskSlack, w.leaseDisk(&api.Lease{Kind: api.KindPrepare, InputBytes: 1000}))
+	assert.Equal(t, 2*int64(1000)+diskSlack, w.leaseDisk(&api.Lease{Kind: api.KindPrepare, InputBytes: 1000}),
+		"a small original: its output is at most its size")
+	assert.Equal(t, 12*gib+4*gib+diskSlack, w.leaseDisk(&api.Lease{Kind: api.KindPrepare, InputBytes: 12 * gib}),
+		"a large original: the output is at most the child's file-size limit, not the original's size")
+	assert.Equal(t, 12*gib+1536*mib+diskSlack,
+		w.leaseDisk(&api.Lease{Kind: api.KindPrepare, InputBytes: 12 * gib, MaxOutputBytes: 1536 * mib}),
+		"the server's bound on the result lowers it further")
+	w.serverOutCap.Store(2 * gib)
+	assert.Equal(t, 12*gib+2*gib+diskSlack, w.leaseDisk(&api.Lease{Kind: api.KindPrepare, InputBytes: 12 * gib}),
+		"a lease without the bound uses the last one the server gave")
 
 	wav := int64(len(media.WAVHeader(0))) + 2*16000
 	l := &api.Lease{Kind: api.KindTranscribe, AudioSamples: 16000, Model: tiny.Name, VADModel: vad.Name}
@@ -214,6 +246,10 @@ func TestClaimsAndHeartbeatsCarryDiskGauges(t *testing.T) {
 	assert.Equal(t, ptr(int64(1<<40)), g.StateFreeBytes)
 	assert.Equal(t, ptr(int64(0)), g.WorkBytes)
 	assert.Equal(t, ptr(int64(0)), g.ModelsBytes)
+	// Idle, with 1 TiB free, a 1 GiB reserve and the default 4 GiB output cap.
+	fit := int64(1<<40) - gib - diskSlack - 4*gib
+	assert.Equal(t, ptr(fit), g.PrepareMaxInputBytes)
+	assert.Equal(t, ptr(fit), g.PrepareCapacityBytes)
 
 	task := h.srv.AddTask(workertest.Task{Kind: api.KindTranscribe, Input: workertest.WAV(2), Model: "tiny.test"})
 	h.eventually(h.taskState(task, api.TaskDone), "task never finished")

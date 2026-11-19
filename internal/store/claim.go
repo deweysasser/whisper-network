@@ -26,6 +26,11 @@ type Eligibility struct {
 	// SandboxLevel is the worker's sandbox level; prepare tasks are offered
 	// only if it meets Config.PrepareMinSandbox.
 	SandboxLevel api.SandboxLevel
+	// PrepareBounded limits prepare tasks to originals of at most
+	// PrepareMaxInput bytes: the worker reported how large an input its
+	// disk can take now. Unbounded when the worker did not say.
+	PrepareBounded  bool
+	PrepareMaxInput int64
 }
 
 // Lease is a lease together with what a worker needs to run its task.
@@ -121,7 +126,12 @@ func (s *Store) eligibilitySQL(workerID string, el Eligibility) (where string, a
 		}
 	}
 	if slices.Contains(el.Kinds, api.KindPrepare) && el.SandboxLevel.Rank() >= s.cfg.PrepareMinSandbox.Rank() {
-		kinds = append(kinds, "t.kind = 'prepare'")
+		if el.PrepareBounded {
+			kinds = append(kinds, "(t.kind = 'prepare' AND j.original_bytes <= ?)")
+			args = append(args, el.PrepareMaxInput)
+		} else {
+			kinds = append(kinds, "t.kind = 'prepare'")
+		}
 	}
 	if len(kinds) == 0 {
 		return "", nil, false

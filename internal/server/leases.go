@@ -50,7 +50,14 @@ func (s *Server) eligibility(wk *store.Worker, req api.ClaimRequest) store.Eligi
 			ms = append(ms, m)
 		}
 	}
-	return store.Eligibility{Kinds: kinds, Models: ms, SandboxLevel: wk.Facts.SandboxLevel}
+	el := store.Eligibility{Kinds: kinds, Models: ms, SandboxLevel: wk.Facts.SandboxLevel}
+	if g := req.Gauges; g != nil && g.PrepareMaxInputBytes != nil {
+		// Only offer prepare tasks the worker has room for; a worker that
+		// cannot fit even the smallest gets none (a bound of 0 or less).
+		el.PrepareMaxInput = max(*g.PrepareMaxInputBytes, 0)
+		el.PrepareBounded = true
+	}
+	return el
 }
 
 // handleClaim is POST /worker/{id}/leases?wait=30s: lease one task, long
@@ -155,6 +162,9 @@ func (s *Server) leased(l *store.Lease) {
 // this absolute would break every such worker (issue #29).
 func (s *Server) leaseAPI(l *store.Lease) api.Lease {
 	out := l.API(s.cfg.HeartbeatInterval)
+	if l.Kind == api.KindPrepare {
+		out.MaxOutputBytes = s.maxCanonicalBytes()
+	}
 	if l.Kind == api.KindTranscribe {
 		if m, err := s.lookupModel(l.Model); err == nil {
 			out.ModelSHA256 = m.SHA256

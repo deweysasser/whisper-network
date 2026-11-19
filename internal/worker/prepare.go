@@ -8,8 +8,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
+	"time"
 
 	"github.com/rs/zerolog"
 
@@ -58,11 +61,15 @@ func (w *Worker) prepareChild(ctx context.Context, l *api.Lease, dir, in string,
 
 	out := filepath.Join(dir, "out.flac")
 	lim := w.cfg.Limits
+	if l.MaxOutputBytes > 0 {
+		w.serverOutCap.Store(l.MaxOutputBytes)
+	}
+	outCap := w.prepareOutputCap(l)
 	spec := sandbox.Spec{
 		ReadOnly:  slices.Concat(systemReadOnly, childSystemFiles, w.tools.ffmpegRO),
 		ReadWrite: []string{dir},
 		DenyNet:   true,
-		FileSize:  uint64(lim.PrepareFileSize),
+		FileSize:  uint64(outCap),
 		OpenFiles: uint64(lim.OpenFiles),
 		UID:       w.cfg.ChildUID,
 		GID:       w.cfg.ChildGID,
@@ -71,11 +78,16 @@ func (w *Worker) prepareChild(ctx context.Context, l *api.Lease, dir, in string,
 	if !lim.NoAddressSpaceLimit {
 		spec.AddressSpace = uint64(lim.PrepareAddressSpace)
 	}
-	res, err := w.runChild(ctx, childRun{argv: PrepareArgs(w.tools.ffmpeg, in, out), spec: spec, dir: dir, timeout: lim.PrepareTimeout})
+	res, err := w.runChild(ctx, childRun{argv: PrepareArgs(w.tools.ffmpeg, in, out), spec: spec, dir: dir,
+		timeout: prepareTimeout(lim, l.InputBytes)})
 	if err != nil {
+		if outputLimitHit(res, err) {
+			return taskStats{}, &taskError{reason: fmt.Sprintf("the converted audio exceeds the %d-byte limit: "+
+				"the media is longer than the server accepts (--max-audio)", outCap), stderr: res.stderr}
+		}
 		return taskStats{}, childFailure("ffmpeg", res, err, ffmpegInputError)
 	}
-	f, size, err := openOutput(out, lim.PrepareFileSize)
+	f, size, err := openOutput(out, outCap)
 	switch {
 	case errors.Is(err, errBadOutput):
 		return taskStats{}, &taskError{reason: "ffmpeg output refused", stderr: res.stderr, err: err}
@@ -119,4 +131,27 @@ func checkInput(path string, n int64, l *api.Lease) error {
 		return &taskError{reason: "input sha256 " + got + " does not match the lease", retryable: true}
 	}
 	return nil
+}
+
+// prepareTimeout is the time limit of one ffmpeg run on an input of n
+// bytes: PrepareTimeout, or longer for an input that would need more than
+// that at PrepareMinRate.
+func prepareTimeout(lim Limits, n int64) time.Duration {
+	t := lim.PrepareTimeout
+	if lim.PrepareMinRate > 0 && n > 0 {
+		t = max(t, time.Duration(float64(n)/float64(lim.PrepareMinRate)*float64(time.Second)))
+	}
+	return t
+}
+
+// outputLimitHit reports whether ffmpeg was stopped by its file-size limit
+// (RLIMIT_FSIZE): killed by SIGXFSZ, or, where the signal is ignored, a
+// write refused with EFBIG. Every worker would hit the same limit, so it
+// is not retryable.
+func outputLimitHit(res childResult, err error) bool {
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) {
+		return false
+	}
+	return killedByFSZ(ee.ProcessState) || strings.Contains(res.stderr, "File too large")
 }

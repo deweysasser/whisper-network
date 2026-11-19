@@ -483,7 +483,7 @@ for the authoritative list.
 | `--class-weights` | `low=1,medium=2,high=4` | `WHISPER_CLASS_WEIGHTS` | Job weight-class shares |
 | `--model-factors` | `small.en=1,large-v3-turbo=3` | `WHISPER_MODEL_FACTORS` | Scheduling cost factor per model |
 | `--prepare-min-sandbox` | `full` | `WHISPER_PREPARE_MIN_SANDBOX` | `full`, `fs-only` or `none`: least sandbox level for prepare tasks |
-| `--max-upload-bytes` | `2GiB` | `WHISPER_MAX_UPLOAD_BYTES` | Default upload cap (per-queue override) |
+| `--max-upload-bytes` | `2GiB` | `WHISPER_MAX_UPLOAD_BYTES` | Default upload cap (a queue may set a lower one). Raise it for large media, e.g. `13GiB` for 12 GB videos; a file is prepared only on a worker with room for it, and fails after `--retry-wait-limit` if no worker has |
 | `--min-free-bytes` | `1GiB` | `WHISPER_MIN_FREE_BYTES` | Refuse uploads below this much free disk |
 | `--audio-retention` | `24h` | `WHISPER_AUDIO_RETENTION` | Keep canonical audio this long after a job is done |
 | `--failed-retention` | `24h` | `WHISPER_FAILED_RETENTION` | Keep a failed job's media at least this long after it failed, so it can be retried |
@@ -510,7 +510,7 @@ for the authoritative list.
 | `--slots` | derived | `WHISPER_SLOTS` | Override the derived slot count (min of cores / threads and memory / model peak RSS) |
 | `--memory-reserve` | `1GiB` | `WHISPER_MEMORY_RESERVE` | Memory kept free for the system |
 | `--memory` | probed | `WHISPER_MEMORY` | Override the probed memory limit; required where it cannot be probed |
-| `--disk-reserve` | `1GiB` | `WHISPER_DISK_RESERVE` | Disk kept free on the `--state` filesystem; a task whose input and expected output would not fit above it is handed back unrun |
+| `--disk-reserve` | `1GiB` | `WHISPER_DISK_RESERVE` | Disk kept free on the `--state` filesystem. The worker tells the server how large a file it has room to prepare, and is only given files that fit (about the file's size plus 1.6 GiB); a task that no longer fits when it arrives is handed back unrun |
 | `--model-cache-max` | `0` (unlimited) | `WHISPER_MODEL_CACHE_MAX` | Cap on the model cache; least recently used models not in use are evicted |
 | `--max-host-load` | `70` | `WHISPER_MAX_HOST_LOAD` | Stop claiming new tasks while the host's CPU use by other processes (percent, 1-minute average, excluding this worker and its children) is above this; running tasks continue. `0` disables. Linux only |
 | `--max-host-load-resume` | `60` | `WHISPER_MAX_HOST_LOAD_RESUME` | Resume claiming once that load falls below this (at most `--max-host-load`) |
@@ -520,6 +520,8 @@ for the authoritative list.
 | `--engine-version` | probed | `WHISPER_ENGINE_VERSION` | Override the reported engine version |
 | `--drain` | off | `WHISPER_DRAIN` | On shutdown, finish running tasks instead of releasing them |
 | `--child-timeout` | `4` | `WHISPER_CHILD_TIMEOUT_FACTOR` | whisper-cli time limit as a multiple of audio duration, plus 10 min |
+| `--prepare-timeout` | `2h` | `WHISPER_PREPARE_TIMEOUT` | Least time limit of one ffmpeg (prepare) run |
+| `--prepare-min-rate` | `1MiB` | `WHISPER_PREPARE_MIN_RATE` | An ffmpeg run gets at least its input's size divided by this per second (12 GiB: 3.4 h) |
 | `--child-uid` | | `WHISPER_CHILD_UID` | Dedicated unprivileged uid for ffmpeg and whisper-cli; required (and only allowed) when the worker runs as root |
 | `--child-gid` | | `WHISPER_CHILD_GID` | Group for the children; required with `--child-uid` |
 | `--metrics-listen` | | `WHISPER_METRICS_LISTEN` | Serve `/metrics` on this address |

@@ -125,9 +125,13 @@ type Limits struct {
 	// (defaults 4 and 10 min).
 	TimeoutFactor float64
 	TimeoutBase   time.Duration
-	// PrepareTimeout bounds one ffmpeg run, whose duration is unknown in
-	// advance (default 2 h).
+	// PrepareTimeout is the least time one ffmpeg run gets (default 2 h).
+	// Its duration is unknown in advance, so a larger input gets
+	// input_bytes / PrepareMinRate if that is longer.
 	PrepareTimeout time.Duration
+	// PrepareMinRate is the slowest input rate, in bytes per second, a
+	// prepare run is allowed before it times out (default 1 MiB/s).
+	PrepareMinRate int64
 	// AddressSpaceHeadroom is added to 2 × model peak RSS + model size for
 	// whisper-cli's RLIMIT_AS (default 1 GiB).
 	AddressSpaceHeadroom int64
@@ -137,7 +141,8 @@ type Limits struct {
 	// binaries reserve terabytes of address space).
 	NoAddressSpaceLimit bool
 	// TranscribeFileSize and PrepareFileSize are RLIMIT_FSIZE (defaults
-	// 256 MiB and 4 GiB).
+	// 256 MiB and 4 GiB). A prepare child gets the lower of PrepareFileSize
+	// and the server's bound on the result (prepareOutputCap).
 	TranscribeFileSize, PrepareFileSize int64
 	// OpenFiles is RLIMIT_NOFILE (default 256).
 	OpenFiles int64
@@ -237,6 +242,7 @@ func (c *Config) setDefaults() error {
 	}
 	defDur(&l.TimeoutBase, 10*time.Minute)
 	defDur(&l.PrepareTimeout, 2*time.Hour)
+	def64(&l.PrepareMinRate, mib)
 	def64(&l.AddressSpaceHeadroom, gib)
 	def64(&l.PrepareAddressSpace, 4*gib)
 	def64(&l.TranscribeFileSize, 256*mib)

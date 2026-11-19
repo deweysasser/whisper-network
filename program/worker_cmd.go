@@ -37,6 +37,8 @@ type WorkerCmd struct {
 	MaxHostLoad    float64       `default:"70" env:"WHISPER_MAX_HOST_LOAD" help:"Stop claiming new tasks while the host's CPU use by other processes (percent, 1-minute average) is above this; running tasks continue (0: disabled; Linux only)"`
 	HostLoadResume float64       `name:"max-host-load-resume" default:"60" env:"WHISPER_MAX_HOST_LOAD_RESUME" help:"Resume claiming once the host's CPU use by other processes falls below this (percent)"`
 	ChildTimeout   float64       `default:"4" env:"WHISPER_CHILD_TIMEOUT_FACTOR" help:"whisper-cli time limit as a multiple of the audio duration (plus 10 min)"`
+	PrepareTimeout time.Duration `default:"2h" env:"WHISPER_PREPARE_TIMEOUT" help:"Least time limit of one ffmpeg (prepare) run; larger inputs get more (see --prepare-min-rate)"`
+	PrepareMinRate ByteSize      `default:"1MiB" env:"WHISPER_PREPARE_MIN_RATE" help:"Slowest input rate, per second, a prepare run may take before it times out: an input gets at least its size divided by this"`
 	ChildUID       int           `name:"child-uid" env:"WHISPER_CHILD_UID" help:"Unprivileged uid, dedicated to whisper-network, to run ffmpeg and whisper-cli as. Required when the worker runs as root; nothing else may run as it."`
 	ChildGID       int           `name:"child-gid" env:"WHISPER_CHILD_GID" help:"Unprivileged gid to run ffmpeg and whisper-cli as. Required when the worker runs as root."`
 	MetricsListen  string        `env:"WHISPER_METRICS_LISTEN" help:"Serve /metrics on this address (optional; e.g. 127.0.0.1:9091 — the endpoint is unauthenticated)"`
@@ -80,7 +82,8 @@ func (c *WorkerCmd) Run(ctx context.Context, logger zerolog.Logger) error {
 		WhisperCLI: c.WhisperCLI, FFmpeg: c.FFmpeg, EngineVersion: c.EngineVersion, Drain: c.Drain,
 		ChildUID: c.ChildUID, ChildGID: c.ChildGID,
 		Version: Version, Logger: log, Metrics: m,
-		Limits: worker.Limits{TimeoutFactor: c.ChildTimeout},
+		Limits: worker.Limits{TimeoutFactor: c.ChildTimeout, PrepareTimeout: c.PrepareTimeout,
+			PrepareMinRate: int64(c.PrepareMinRate)},
 	})
 	if err != nil {
 		return err

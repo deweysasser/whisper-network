@@ -5,6 +5,7 @@ package worker
 import (
 	"errors"
 	"io/fs"
+	"os"
 	"syscall"
 )
 
@@ -27,4 +28,11 @@ func linkCount(fi fs.FileInfo) uint64 {
 		return uint64(st.Nlink)
 	}
 	return 1
+}
+
+// killedByFSZ reports whether ps ended on SIGXFSZ (the signal's name
+// differs between Linux and Darwin, so compare the number).
+func killedByFSZ(ps *os.ProcessState) bool {
+	ws, ok := ps.Sys().(syscall.WaitStatus)
+	return ok && ws.Signaled() && ws.Signal() == syscall.SIGXFSZ
 }

@@ -374,6 +374,11 @@ type Worker struct {
 	// Hints from the server.
 	HeartbeatIntervalS int `json:"heartbeat_interval_s"`
 	PollIntervalS      int `json:"poll_interval_s"`
+	// MaxPrepareOutputBytes bounds the canonical FLAC the server accepts
+	// from a prepare task (verbatim FLAC of --max-audio, plus overhead).
+	// The worker sizes its disk admission and the prepare child's file-size
+	// limit by it before it has seen a prepare lease.
+	MaxPrepareOutputBytes int64 `json:"max_prepare_output_bytes,omitempty"`
 }
 
 // ClaimRequest is the body of POST /worker/{id}/leases.
@@ -387,20 +392,23 @@ type ClaimRequest struct {
 
 // Lease is the claim response (201).
 type Lease struct {
-	ID             string   `json:"id"`
-	Kind           TaskKind `json:"kind"`
-	Job            string   `json:"job"`
-	Seq            int      `json:"seq"`
-	InputURL       string   `json:"input_url"`
-	InputBytes     int64    `json:"input_bytes,omitempty"`  // prepare: original size
-	InputSHA256    string   `json:"input_sha256,omitempty"` // prepare: original hash
-	AudioSamples   int64    `json:"audio_samples,omitempty"`
-	Model          string   `json:"model,omitempty"`
-	ModelSHA256    string   `json:"model_sha256,omitempty"`
-	VADModel       string   `json:"vad_model,omitempty"`
-	VADModelSHA256 string   `json:"vad_model_sha256,omitempty"`
-	Language       string   `json:"language,omitempty"`
-	Prompt         string   `json:"prompt,omitempty"`
+	ID          string   `json:"id"`
+	Kind        TaskKind `json:"kind"`
+	Job         string   `json:"job"`
+	Seq         int      `json:"seq"`
+	InputURL    string   `json:"input_url"`
+	InputBytes  int64    `json:"input_bytes,omitempty"`  // prepare: original size
+	InputSHA256 string   `json:"input_sha256,omitempty"` // prepare: original hash
+	// MaxOutputBytes (prepare) is the largest canonical FLAC the server
+	// will accept, as in Worker.MaxPrepareOutputBytes.
+	MaxOutputBytes int64  `json:"max_output_bytes,omitempty"`
+	AudioSamples   int64  `json:"audio_samples,omitempty"`
+	Model          string `json:"model,omitempty"`
+	ModelSHA256    string `json:"model_sha256,omitempty"`
+	VADModel       string `json:"vad_model,omitempty"`
+	VADModelSHA256 string `json:"vad_model_sha256,omitempty"`
+	Language       string `json:"language,omitempty"`
+	Prompt         string `json:"prompt,omitempty"`
 	// NoContext is set on the retry of a transcribe task whose result was
 	// refused as a repetition loop: the worker runs whisper-cli without
 	// conditioning on previous text (-mc 0). Such a lease never carries a
@@ -430,6 +438,16 @@ type Gauges struct {
 	StateFreeBytes *int64 `json:"state_free_bytes,omitempty"`
 	// CachedModels lists the complete model files in the cache.
 	CachedModels []CachedModel `json:"cached_models,omitempty"`
+	// PrepareMaxInputBytes is the largest prepare input (original media
+	// size) the worker could admit now, given free disk, its reserve and its
+	// running leases. On a claim the server offers no prepare task with a
+	// larger original. Nil when unknown (no free-space reading, or an older
+	// worker): no prepare task is held back.
+	PrepareMaxInputBytes *int64 `json:"prepare_max_input_bytes,omitempty"`
+	// PrepareCapacityBytes is the same bound if the worker were idle: what
+	// its disk could take at best. A prepare task larger than every
+	// worker's capacity is failed after --retry-wait-limit (DESIGN.md §7.2).
+	PrepareCapacityBytes *int64 `json:"prepare_capacity_bytes,omitempty"`
 
 	// HostLoad is the host's CPU utilisation in percent over the last
 	// minute, excluding the worker's own processes; nil if not measured.

@@ -248,16 +248,19 @@ const diskSlack = 16 * mib
 // leaseDisk is the disk a lease is expected to need: its input, its output
 // and any model it must download first.
 //
-//   - prepare: the original (input_bytes) plus the canonical FLAC, estimated
-//     at the original's size. Media containers usually hold compressed audio
-//     at or above FLAC's 16 kHz mono rate, or video; RLIMIT_FSIZE still caps
-//     the output if the estimate is wrong.
+//   - prepare: the original (input_bytes) plus the canonical FLAC, which is
+//     at most the original's size (media containers hold compressed audio at
+//     or above FLAC's 16 kHz mono rate, or video) and at most
+//     prepareOutputCap, the child's RLIMIT_FSIZE. The cap is what keeps a
+//     large video from being charged twice its size: 12 GiB of video
+//     needs 12 GiB plus about 1.6 GiB, not 24 GiB.
 //   - transcribe: the WAV (44 + 2 × audio_samples) plus diskSlack, plus the
 //     model and VAD model if not cached.
 func (w *Worker) leaseDisk(l *api.Lease) int64 {
 	switch l.Kind {
 	case api.KindPrepare:
-		return 2*max(l.InputBytes, 0) + diskSlack
+		in := max(l.InputBytes, 0)
+		return in + min(in, w.prepareOutputCap(l)) + diskSlack
 	case api.KindTranscribe:
 		need := int64(len(media.WAVHeader(0))) + max(l.AudioSamples, 0)*media.BytesPerSample + diskSlack
 		for _, name := range []string{l.Model, l.VADModel} {
@@ -268,4 +271,50 @@ func (w *Worker) leaseDisk(l *api.Lease) int64 {
 		return need
 	}
 	return diskSlack
+}
+
+// prepareOutputCap is the most a prepare child may write: the worker's
+// PrepareFileSize, lowered to the server's bound on the result (from the
+// lease, else the last bound the server gave). Output beyond the server's
+// bound would be refused anyway, so the child is stopped there.
+func (w *Worker) prepareOutputCap(l *api.Lease) int64 {
+	c := w.cfg.Limits.PrepareFileSize
+	srv := w.serverOutCap.Load()
+	if l != nil && l.MaxOutputBytes > 0 {
+		srv = l.MaxOutputBytes
+	}
+	if srv > 0 {
+		c = min(c, srv)
+	}
+	return c
+}
+
+// prepareFit is the largest prepare input whose footprint (see leaseDisk)
+// fits in avail bytes, given the output cap; 0 if none does.
+func prepareFit(avail, outCap int64) int64 {
+	a := avail - diskSlack
+	switch {
+	case a <= 0:
+		return 0
+	case a >= 2*outCap:
+		return a - outCap
+	}
+	return a / 2
+}
+
+// prepareBounds sets the gauges telling the server which prepare tasks fit:
+// PrepareMaxInputBytes for the space available to a new lease now, and
+// PrepareCapacityBytes for the space the worker would have idle (its work
+// directories empty, nothing committed). Without a free-space reading
+// neither is set, and the server holds nothing back.
+func (g *diskGate) prepareBounds(r diskReading, outCap int64, gs *api.Gauges) {
+	if !r.freeOK {
+		return
+	}
+	g.mu.Lock()
+	now := g.availableLocked(r)
+	g.mu.Unlock()
+	fitNow := prepareFit(now, outCap)
+	fitIdle := prepareFit(r.free+r.work-g.reserve, outCap)
+	gs.PrepareMaxInputBytes, gs.PrepareCapacityBytes = &fitNow, &fitIdle
 }

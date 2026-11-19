@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"errors"
+	"slices"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -77,7 +78,11 @@ func (w *Worker) gauges() api.Gauges {
 		CPUThrottledSecs: w.sys.CPUThrottled().Seconds(),
 	}
 	if w.disk != nil {
-		w.disk.read().gauges(&g)
+		r := w.disk.read()
+		r.gauges(&g)
+		if w.gate != nil && slices.Contains(w.facts.Kinds, api.KindPrepare) {
+			w.gate.prepareBounds(r, w.prepareOutputCap(nil), &g)
+		}
 	}
 	w.load.gauges(&g)
 	return g
