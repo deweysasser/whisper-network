@@ -361,3 +361,11 @@ func TestCanManageFetchPolicy(t *testing.T) {
 	assert.False(t, Can(user(waAll), ActManageFetchPolicy, Resource{}))
 	assert.False(t, Can(worker(), ActManageFetchPolicy, Resource{}))
 }
+
+func TestLeaseTaskFetchOrProcess(t *testing.T) {
+	r := Resource{Queue: "A"}
+	assert.True(t, Can(worker(g(api.RoleFetch, "queue:A")), ActLeaseTask, r))
+	assert.True(t, Can(worker(g(api.RoleProcess, "queue:A")), ActLeaseTask, r))
+	assert.False(t, Can(worker(g(api.RoleFetch, "queue:B")), ActLeaseTask, r))
+	assert.False(t, Can(worker(), ActLeaseTask, r))
+}

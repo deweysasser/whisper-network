@@ -428,7 +428,8 @@ type Lease struct {
 	InputBytes  int64    `json:"input_bytes,omitempty"`  // prepare: original size
 	InputSHA256 string   `json:"input_sha256,omitempty"` // prepare: original hash
 	// MaxOutputBytes (prepare) is the largest canonical FLAC the server
-	// will accept, as in Worker.MaxPrepareOutputBytes.
+	// will accept, as in Worker.MaxPrepareOutputBytes. For a fetch lease it
+	// is the byte cap on the download.
 	MaxOutputBytes int64 `json:"max_output_bytes,omitempty"`
 	AudioSamples   int64 `json:"audio_samples,omitempty"`
 	// URL and Site (fetch) are the URL to download and its policy site key;

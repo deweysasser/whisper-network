@@ -63,7 +63,9 @@ func Can(p Principal, a Action, r Resource) bool {
 func canWorker(p Principal, a Action, r Resource) bool {
 	switch a {
 	case ActLeaseTask:
-		return p.onQueue(api.RoleProcess, r.Queue)
+		// Per-kind eligibility (fetch only to downloaders, process only to
+		// processing workers) is enforced by the claim, not here.
+		return p.onQueue(api.RoleProcess, r.Queue) || p.onQueue(api.RoleFetch, r.Queue)
 	case ActViewWorker, ActUpdateWorker:
 		return p.ID != "" && p.ID == r.WorkerID
 	case ActFetchModel:
@@ -92,7 +94,7 @@ const (
 
 // VisibilityOn returns which jobs of queue p may list (DESIGN.md §5.3): all
 // for admin, queue_admin, view_all or read_all (a reader may see what it may
-// read); its own for submit; otherwise none. Workers never see jobs.
+// read); its own for submit or submit_url; otherwise none. Workers never see jobs.
 func VisibilityOn(p Principal, queue string) Visibility {
 	if p.Kind != KindUser && p.Kind != KindClient {
 		return SeesNone
