@@ -332,3 +332,159 @@ func TestListJobsStateOrderUsesIndex(t *testing.T) {
 	assert.Contains(t, joined, "jobs_queue_state_order", joined)
 	assert.NotContains(t, joined, "TEMP B-TREE", joined)
 }
+
+// failedURLJob makes a URL job failed at its fetch (never fetched).
+func (f *fixture) failedURLJob(d string) *Job {
+	f.t.Helper()
+	j := f.urlJob(f.pubID, "example.com")
+	l := f.claimFetch(d)
+	require.NotNil(f.t, l)
+	require.True(f.t, f.fail(l, false).JobFailed)
+	got, err := f.s.Job(f.ctx, j.ID)
+	require.NoError(f.t, err)
+	require.Equal(f.t, api.JobFailed, got.State)
+	return got
+}
+
+// fastURLJob makes a URL job that fetched canonical audio (two transcribe
+// tasks), finished one and failed the other.
+func (f *fixture) fastURLJob(d string) *Job {
+	f.t.Helper()
+	j := f.urlJob(f.pubID, "example.com")
+	l := f.claimFetch(d)
+	require.NoError(f.t, f.s.AcceptFetch(f.ctx, l.ID, d, FetchCompletion{
+		Original:  Media{Bytes: 100, SHA256: "o", Type: "audio/flac"},
+		Canonical: &Canonical{Bytes: 100, SHA256: "o", Samples: 32000},
+		Ranges:    []SampleRange{{0, 16000}, {16000, 32000}}}))
+	w := f.worker(api.SandboxFull, f.pubID)
+	f.complete(f.claim(w))
+	require.True(f.t, f.fail(f.claim(w), false).JobFailed)
+	got, err := f.s.Job(f.ctx, j.ID)
+	require.NoError(f.t, err)
+	require.Equal(f.t, api.JobFailed, got.State)
+	return got
+}
+
+func (f *fixture) count(q string, args ...any) int {
+	f.t.Helper()
+	var n int
+	require.NoError(f.t, f.s.r.QueryRowContext(f.ctx, q, args...).Scan(&n))
+	return n
+}
+
+func TestRetryURLJobFetchNeverSucceeded(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, maxAttempts(1))
+	d := f.downloader(api.SandboxFull, "e1", f.pubID)
+	j := f.failedURLJob(d)
+	assert.True(t, j.Retryable())
+	f.clk.Advance(time.Minute)
+
+	r, err := f.s.RetryJob(f.ctx, j.ID)
+	require.NoError(t, err)
+	assert.Equal(t, &Retried{PreviousError: j.Error, State: api.JobFetching, Tasks: 1, Retries: 1, Refetch: true}, r)
+	got, err := f.s.Job(f.ctx, j.ID)
+	require.NoError(t, err)
+	assert.Equal(t, api.JobFetching, got.State)
+	assert.Empty(t, got.Error)
+	assert.Nil(t, got.CompletedAt)
+	assert.Equal(t, 1, got.Retries)
+	assert.Equal(t, j.FetchURL, got.FetchURL)
+	assert.Equal(t, "example.com", got.FetchSite)
+	st, att := f.task(j.ID, FetchSeq)
+	assert.Equal(t, [2]any{"pending", 0}, [2]any{st, att})
+
+	// A downloader can claim it again.
+	l := f.claimFetch(d)
+	require.NotNil(t, l)
+	assert.Equal(t, j.ID, l.JobID)
+}
+
+func TestRetryURLJobAudioPurgedRefetches(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, maxAttempts(1))
+	d := f.downloader(api.SandboxFull, "e1", f.pubID)
+	j := f.fastURLJob(d)
+	require.NoError(t, f.s.MarkOriginalPurged(f.ctx, j.ID))
+	require.NoError(t, f.s.MarkCanonicalPurged(f.ctx, j.ID))
+	got, err := f.s.Job(f.ctx, j.ID)
+	require.NoError(t, err)
+	assert.True(t, got.Retryable(), "a URL job is retryable after purge")
+	assert.Equal(t, 1, f.count(`SELECT COUNT(*) FROM tasks WHERE job_id = ? AND result IS NOT NULL`, j.ID))
+	f.clk.Advance(time.Minute)
+
+	r, err := f.s.RetryJob(f.ctx, j.ID)
+	require.NoError(t, err)
+	assert.True(t, r.Refetch)
+	assert.Equal(t, api.JobFetching, r.State)
+	assert.Equal(t, 1, r.Retries)
+	got, err = f.s.Job(f.ctx, j.ID)
+	require.NoError(t, err)
+	assert.Equal(t, api.JobFetching, got.State)
+	assert.Nil(t, got.Canonical)
+	assert.Nil(t, got.CanonicalPurgedAt)
+	assert.Nil(t, got.OriginalPurgedAt)
+	assert.Zero(t, got.Original)
+	assert.Equal(t, api.TaskCounts{Total: 1, Pending: 1}, got.Tasks)
+	assert.Equal(t, 1, f.count(`SELECT COUNT(*) FROM tasks WHERE job_id = ?`, j.ID))
+	assert.Equal(t, 0, f.count(`SELECT COUNT(*) FROM tasks WHERE job_id = ? AND result IS NOT NULL`, j.ID))
+	st, att := f.task(j.ID, FetchSeq)
+	assert.Equal(t, [2]any{"pending", 0}, [2]any{st, att})
+
+	// The re-fetch runs to completion.
+	l := f.claimFetch(d)
+	require.NotNil(t, l)
+	f.acceptFetch(l, "sha2")
+	got, err = f.s.Job(f.ctx, j.ID)
+	require.NoError(t, err)
+	assert.Equal(t, api.JobPreparing, got.State)
+}
+
+func TestRetryURLJobWithMediaReuses(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, maxAttempts(1))
+	d := f.downloader(api.SandboxFull, "e1", f.pubID)
+	j := f.fastURLJob(d)
+	f.clk.Advance(time.Minute)
+
+	r, err := f.s.RetryJob(f.ctx, j.ID)
+	require.NoError(t, err)
+	assert.False(t, r.Refetch)
+	assert.Equal(t, api.JobQueued, r.State)
+	got, err := f.s.Job(f.ctx, j.ID)
+	require.NoError(t, err)
+	assert.Equal(t, api.TaskCounts{Total: 3, Pending: 1, Done: 2}, got.Tasks, "fetch and transcribe 1 stay done")
+	assert.Equal(t, 1, f.count(`SELECT COUNT(*) FROM tasks WHERE job_id = ? AND result IS NOT NULL`, j.ID))
+
+	// Prepare failed with the original present: back to preparing.
+	f = newFixture(t, maxAttempts(1))
+	d = f.downloader(api.SandboxFull, "e1", f.pubID)
+	j2 := f.urlJob(f.pubID, "example.com")
+	l := f.claimFetch(d)
+	require.Equal(t, j2.ID, l.JobID)
+	f.acceptFetch(l, "sha")
+	w := f.worker(api.SandboxFull, f.pubID)
+	require.True(t, f.fail(f.claim(w), false).JobFailed)
+	r, err = f.s.RetryJob(f.ctx, j2.ID)
+	require.NoError(t, err)
+	assert.False(t, r.Refetch)
+	assert.Equal(t, api.JobPreparing, r.State)
+}
+
+func TestURLJobRetryableAfterPurge(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, maxAttempts(1))
+	d := f.downloader(api.SandboxFull, "e1", f.pubID)
+	j := f.fastURLJob(d)
+	require.NoError(t, f.s.MarkCanonicalPurged(f.ctx, j.ID))
+	got, err := f.s.Job(f.ctx, j.ID)
+	require.NoError(t, err)
+	assert.Empty(t, got.retryBlocker())
+	assert.True(t, got.Retryable())
+
+	// Not failed is still not retryable.
+	live := f.urlJob(f.pubID, "example.com")
+	_, err = f.s.RetryJob(f.ctx, live.ID)
+	_, ok := IsNotRetryable(err)
+	assert.True(t, ok)
+}

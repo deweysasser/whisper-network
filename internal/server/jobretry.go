@@ -46,8 +46,18 @@ func (s *Server) retryJob(ctx context.Context, actor Actor, jobID string) error 
 	if err != nil {
 		return err
 	}
+	if r.Refetch {
+		// The media is gone and will be fetched again: drop whatever is
+		// left of the old run, after the store commit (a crash in between
+		// leaves files the sweep or the next accept overwrites). Under the
+		// job lock, so no accept or assembly writes into the directory.
+		if err := s.blobs.RemoveJob(jobID); err != nil {
+			s.log.Warn().Err(err).Str(obs.FieldJobID, jobID).Msg("removing stale job blobs failed")
+		}
+	}
 	obs.Info(&s.log, obs.EventJobRetried).Str(obs.FieldJobID, jobID).Str(obs.FieldActor, actor.Name).
 		Str("state", string(r.State)).Int("tasks", r.Tasks).Int("retries", r.Retries).
+		Bool("refetch", r.Refetch).
 		Str("previous_error", r.PreviousError).Msg("job retried")
 	return nil
 }
