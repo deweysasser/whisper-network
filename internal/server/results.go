@@ -70,6 +70,9 @@ func (s *Server) handleInput(w http.ResponseWriter, r *http.Request, p *Principa
 	if err != nil {
 		return err
 	}
+	if l.Kind == api.KindFetch {
+		return notFound() // a fetch lease's input is its URL
+	}
 	cw := &countingWriter{ResponseWriter: w}
 	defer func() { s.metrics.InputServed(l.Kind, cw.n) }()
 	if l.Kind == api.KindPrepare {
@@ -136,10 +139,15 @@ func (s *Server) handleLeaseResult(w http.ResponseWriter, r *http.Request, p *Pr
 	if err != nil {
 		return err
 	}
-	if l.Kind == api.KindPrepare {
+	switch l.Kind {
+	case api.KindPrepare:
 		return s.prepareResult(w, r, p, l)
+	case api.KindTranscribe:
+		return s.transcribeResult(w, r, p, l)
+	case api.KindFetch:
+		return s.fetchResult(w, r, p, l)
 	}
-	return s.transcribeResult(w, r, p, l)
+	return badRequest("unknown task kind " + string(l.Kind))
 }
 
 type resultAck struct {

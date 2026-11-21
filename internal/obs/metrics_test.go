@@ -320,3 +320,26 @@ func TestServerInfo(t *testing.T) {
 	m.SetSnapshot(fixtureSnapshot())
 	assert.Contains(t, scrape(t, m), `whisper_server_info{version="v0.5.0-dev+7.g420d428"} 1`)
 }
+
+func TestFetchMetrics(t *testing.T) {
+	m := newTestMetrics()
+	assert.NotContains(t, scrape(t, m), "whisper_fetch_invalid_policies", "not until set")
+	m.FetchResult("youtube.com", "done")
+	m.FetchResult("other", "rate_limited")
+	m.FetchBytes("youtube.com", 4096)
+	m.SetFetchInvalidPolicies(2)
+	m.SetSnapshot(Snapshot{FetchCooldowns: []SiteCount{{Site: "youtube.com", N: 2}, {Site: "other", N: 1}},
+		FetchBlocked: []SiteCount{{Site: "youtube.com", N: 5}}})
+	out := scrape(t, m)
+	for _, want := range []string{
+		`whisper_fetch_total{site="youtube.com",outcome="done"} 1`,
+		`whisper_fetch_total{site="other",outcome="rate_limited"} 1`,
+		`whisper_fetch_bytes_total{site="youtube.com"} 4096`,
+		`whisper_fetch_invalid_policies 2`,
+		`whisper_fetch_cooldowns{site="other"} 1`,
+		`whisper_fetch_cooldowns{site="youtube.com"} 2`,
+		`whisper_fetch_blocked_tasks{site="youtube.com"} 5`,
+	} {
+		assert.Contains(t, out, want)
+	}
+}

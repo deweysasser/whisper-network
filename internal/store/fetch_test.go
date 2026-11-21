@@ -706,6 +706,29 @@ func TestNextFetchEligible(t *testing.T) {
 	assert.False(t, ok)
 }
 
+func TestFetchBlockedTasks(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	blocked := func() map[string]int {
+		m, err := f.s.FetchBlockedTasks(f.ctx, f.clk.Now())
+		require.NoError(t, err)
+		return m
+	}
+	f.urlJob(f.pubID, "youtube.com")
+	assert.Empty(t, blocked(), "no downloader: waiting for one, not for pacing")
+	d := f.downloader(api.SandboxFull, "e1", f.pubID)
+	f.urlJob(f.pubID, "youtube.com")
+	f.urlJob(f.pubID, "example.com")
+	assert.Empty(t, blocked())
+	l := f.claimFetch(d)
+	require.NotNil(t, l)
+	f.acceptFetch(l, "a")
+	// youtube.com: 1 per 3m from e1; example.com (the * policy) is free.
+	assert.Equal(t, map[string]int{"youtube.com": 1}, blocked())
+	f.downloader(api.SandboxFull, "e2", f.pubID)
+	assert.Empty(t, blocked(), "e2 may fetch it")
+}
+
 func TestFleetCapacityDownloadersDoNotProcess(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
@@ -716,4 +739,17 @@ func TestFleetCapacityDownloadersDoNotProcess(t *testing.T) {
 	assert.Zero(t, c.Transcribe.Total)
 	assert.Zero(t, c.Prepare.Total)
 	assert.False(t, CanPrepare(f, api.SandboxNone))
+}
+
+// TestHeartbeatFetchLease: a fetch lease is kept alive by the fetch grant
+// (a downloader holds no process grant).
+func TestHeartbeatFetchLease(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	d := f.downloader(api.SandboxFull, "e1", f.pubID)
+	f.urlJob(f.pubID, "example.com")
+	l := f.claimFetch(d)
+	require.NotNil(t, l)
+	_, err := f.s.Heartbeat(f.ctx, l.ID, d, ttl, LeaseAgeLimit{})
+	require.NoError(t, err)
 }

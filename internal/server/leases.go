@@ -40,6 +40,9 @@ func (s *Server) eligibility(wk *store.Worker, req api.ClaimRequest) store.Eligi
 	if len(kinds) == 0 {
 		kinds = wk.Facts.Kinds
 	}
+	if len(kinds) == 0 && wk.Kind == api.WorkerDownloader {
+		kinds = []api.TaskKind{api.KindFetch}
+	}
 	offered := req.Models
 	if len(offered) == 0 {
 		offered = wk.Facts.Models
@@ -76,12 +79,15 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request, p *Principa
 	if err := decodeWorkerJSON(w, r, &req, true, maxJSONBody); err != nil {
 		return err
 	}
+	wk := p.Worker
+	downloader := wk.Kind == api.WorkerDownloader
+	// The worker kind is enforced here as well as by the store: a
+	// downloader claims only fetch tasks, a processing worker never.
 	for _, k := range req.Kinds {
-		if k != api.KindPrepare && k != api.KindTranscribe {
-			return badRequest("unknown task kind " + string(k))
+		if err := kindAllowed(wk.Kind, k); err != nil {
+			return err
 		}
 	}
-	wk := p.Worker
 	if prob := claimState(wk.State); prob != nil {
 		return prob
 	}
@@ -94,7 +100,19 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request, p *Principa
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
 	el := s.eligibility(wk, req)
+	if downloader {
+		if err := s.downloaderEligibility(r, wk, &el); err != nil {
+			return err
+		}
+		if wait > 0 {
+			defer s.waiters.add(el.EgressKey)()
+		}
+	}
+	rescheduled := false
 	for {
+		if downloader {
+			el.WaitingGroups = s.waiters.keys()
+		}
 		// Take the wake-up channel before claiming so a notification that
 		// races with an empty claim is not lost.
 		woke := s.disp.Wait()
@@ -112,6 +130,10 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request, p *Principa
 		if lease != nil {
 			s.metrics.ClaimWait(time.Since(start))
 			s.leased(lease)
+			if lease.Kind == api.KindFetch {
+				// The start may close a rate window: when does it reopen?
+				s.reschedulePacing()
+			}
 			if s.afterClaim != nil {
 				s.afterClaim(ctx)
 			}
@@ -128,6 +150,12 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request, p *Principa
 		}
 		if wait == 0 {
 			break
+		}
+		if downloader && !rescheduled {
+			// About to wait: make sure pacing will wake us when a fetch
+			// task it holds back frees up.
+			s.reschedulePacing()
+			rescheduled = true
 		}
 		select {
 		case <-woke:
@@ -162,8 +190,13 @@ func (s *Server) leased(l *store.Lease) {
 // this absolute would break every such worker (issue #29).
 func (s *Server) leaseAPI(l *store.Lease) api.Lease {
 	out := l.API(s.cfg.HeartbeatInterval)
-	if l.Kind == api.KindPrepare {
+	switch l.Kind {
+	case api.KindPrepare:
 		out.MaxOutputBytes = s.maxCanonicalBytes()
+	case api.KindFetch:
+		// What fetchResult enforces: the store's cap (the queue's), never
+		// above the server's.
+		out.MaxOutputBytes = s.fetchLimit(l)
 	}
 	if l.Kind == api.KindTranscribe {
 		if m, err := s.lookupModel(l.Model); err == nil {
@@ -234,6 +267,17 @@ func (s *Server) handleFailure(w http.ResponseWriter, r *http.Request, p *Princi
 	if err := decodeWorkerJSON(w, r, &rep, false, 64<<10); err != nil {
 		return err
 	}
+	var fetch *store.Lease
+	if p.Worker != nil && p.Worker.Kind == api.WorkerDownloader {
+		l, err := s.st.Lease(r.Context(), r.PathValue("id"), p.ID)
+		if err != nil {
+			return err
+		}
+		if l.Kind == api.KindFetch {
+			fetch = l
+			rep.Reason, rep.StderrTail = redactURLs(rep.Reason, l.URL), redactURLs(rep.StderrTail, l.URL)
+		}
+	}
 	reason := strings.TrimSpace(rep.Reason)
 	if reason == "" {
 		reason = "worker reported failure"
@@ -254,6 +298,9 @@ func (s *Server) handleFailure(w http.ResponseWriter, r *http.Request, p *Princi
 		Int(obs.FieldAttempt, end.Attempt).Bool("retryable", rep.Retryable).Str("stage", string(stage)).
 		Str(obs.FieldError, reason).
 		Str(obs.FieldStderrTail, obs.StderrTail(rep.StderrTail)).Msg("task failed")
+	if fetch != nil {
+		s.fetchFailed(r.Context(), fetch, stage)
+	}
 	s.leaseEnded(r.Context(), end)
 	w.WriteHeader(http.StatusNoContent)
 	return nil
@@ -308,6 +355,10 @@ func (s *Server) leaseEnded(ctx context.Context, end *store.LeaseEnd) {
 	}
 	if end.Requeued {
 		s.disp.Notify()
+	}
+	if end.Kind == api.KindFetch {
+		// A cooldown may have started, or a paced task requeued.
+		s.reschedulePacing()
 	}
 	if end.JobFailed {
 		s.jobFinished(ctx, end.JobID)

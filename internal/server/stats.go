@@ -80,7 +80,41 @@ func (s *Server) refreshStats(ctx context.Context) {
 	} else if ctx.Err() == nil {
 		s.log.Warn().Err(err).Msg("stats refresh: failed job stats failed")
 	}
+	s.fetchStats(ctx, &snap)
 	s.metrics.SetSnapshot(snap)
+}
+
+// fetchStats adds the fetch pacing gauges to snap, and re-checks the fetch
+// policies (whisper_fetch_invalid_policies).
+func (s *Server) fetchStats(ctx context.Context, snap *obs.Snapshot) {
+	s.checkFetchPolicies(ctx)
+	label := s.fetchSiteLabels(ctx)
+	now := s.now()
+	bySite := func(m map[string]int) []obs.SiteCount {
+		agg := map[string]int{}
+		for site, n := range m {
+			agg[label(site)] += n
+		}
+		out := make([]obs.SiteCount, 0, len(agg))
+		for site, n := range agg {
+			out = append(out, obs.SiteCount{Site: site, N: n})
+		}
+		return out
+	}
+	if cds, err := s.st.FetchCooldowns(ctx, now); err == nil {
+		m := map[string]int{}
+		for _, c := range cds {
+			m[c.Site]++
+		}
+		snap.FetchCooldowns = bySite(m)
+	} else if ctx.Err() == nil {
+		s.log.Warn().Err(err).Msg("stats refresh: fetch cooldowns failed")
+	}
+	if b, err := s.st.FetchBlockedTasks(ctx, now); err == nil {
+		snap.FetchBlocked = bySite(b)
+	} else if ctx.Err() == nil {
+		s.log.Warn().Err(err).Msg("stats refresh: blocked fetch tasks failed")
+	}
 }
 
 // fleetSlots is the whisper_fleet_slots series of c: in use, available and

@@ -397,7 +397,7 @@ type Worker struct {
 	ID         string      `json:"id"`
 	State      WorkerState `json:"state"`
 	Facts      WorkerFacts `json:"facts"`
-	Queues     []string    `json:"queues"` // queues this worker may process
+	Queues     []string    `json:"queues"` // queues this worker may process (a downloader: fetch for)
 	LastSeenAt *time.Time  `json:"last_seen_at,omitempty"`
 	// Hints from the server.
 	HeartbeatIntervalS int `json:"heartbeat_interval_s"`
@@ -525,10 +525,20 @@ type TranscribeResult struct {
 	Segments      []Segment `json:"segments"`
 }
 
-// Prepare result headers (PUT /lease/{id}/result with Content-Type audio/flac).
+// Result headers: prepare (PUT /lease/{id}/result with Content-Type
+// audio/flac) and fetch.
 const (
 	HeaderComputeMS     = "X-Compute-Ms"
 	HeaderFFmpegVersion = "X-Ffmpeg-Version"
+	// HeaderFetchMethod on a fetch result says how the media was fetched:
+	// FetchMethodYtDlp or FetchMethodHTTP (optional; for logs only).
+	HeaderFetchMethod = "X-Fetch-Method"
+)
+
+// Values of HeaderFetchMethod.
+const (
+	FetchMethodYtDlp = "yt-dlp"
+	FetchMethodHTTP  = "http"
 )
 
 // FailureReport is the body of POST /lease/{id}/failure.

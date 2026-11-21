@@ -333,6 +333,10 @@ type Deps struct {
 	// so it can use the session helpers, Store, Ops and Notify (session.go).
 	// Without it /ui/ serves a placeholder page.
 	UI func(*Server) http.Handler
+	// AfterFunc schedules f after d (time.AfterFunc) and returns its stop
+	// function; it drives the fetch pacing wake-up. Tests pass a fake
+	// clock's.
+	AfterFunc func(d time.Duration, f func()) (stop func() bool)
 }
 
 // Ticker is the part of *time.Ticker the background loops use.
@@ -389,6 +393,12 @@ type Server struct {
 	disk       diskBudget   // free space promised to in-flight uploads
 	uploads    inflightJobs // job ids whose upload is still being received
 
+	// Fetch pacing (fetch.go): downloaders' claims waiting now, by egress
+	// key, and the timer that wakes claims when pacing frees a task.
+	waiters   fetchWaiters
+	pacing    pacingTimer
+	afterFunc func(time.Duration, func()) func() bool
+
 	// bg is the server's lifetime context for detached work (model
 	// fetches); Close cancels it. loops tracks the background loops.
 	bg       context.Context
@@ -409,7 +419,7 @@ func New(cfg Config, deps Deps) (*Server, error) {
 	s := &Server{
 		cfg: cfg, st: deps.Store, blobs: deps.Blobs, log: deps.Logger, metrics: deps.Metrics,
 		now: deps.Now, freeBytes: deps.FreeBytes, totalBytes: deps.TotalBytes, httpClient: deps.HTTPClient,
-		lookupModel: deps.LookupModel, newTicker: deps.NewTicker,
+		lookupModel: deps.LookupModel, newTicker: deps.NewTicker, afterFunc: deps.AfterFunc,
 		disp: newDispatcher(), locks: newJobLocks(), bulkLimit: api.MaxBulkJobs,
 	}
 	if s.metrics == nil {
@@ -439,6 +449,9 @@ func New(cfg Config, deps Deps) (*Server, error) {
 	}
 	if s.lookupModel == nil {
 		s.lookupModel = models.Lookup
+	}
+	if s.afterFunc == nil {
+		s.afterFunc = func(d time.Duration, f func()) func() bool { return time.AfterFunc(d, f).Stop }
 	}
 	if s.newTicker == nil {
 		s.newTicker = func(d time.Duration) Ticker { return realTicker{time.NewTicker(d)} }
@@ -499,6 +512,7 @@ func (s *Server) Metrics() *obs.Metrics { return s.metrics }
 // safely afterwards. Serve calls it on return; tests that use Handler
 // directly should call it themselves. It is idempotent.
 func (s *Server) Close() {
+	s.closePacing()
 	s.disp.Close()
 	s.bgCancel()
 	s.loops.Wait()
@@ -526,6 +540,7 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 	s.sweep(ctx)
 	s.refreshStats(ctx)
+	s.reschedulePacing()
 	// The loops stop when ctx is cancelled or the server is closed,
 	// whichever comes first; Close waits for them.
 	ctx, cancel := context.WithCancel(ctx)

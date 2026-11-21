@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/netip"
+	"regexp"
 	"strconv"
 	"unicode/utf8"
 
@@ -23,6 +25,7 @@ func validateFacts(f *api.WorkerFacts) error {
 	for name, v := range map[string]string{
 		"hostname": f.Hostname, "cpu_model": f.CPUModel, "os": f.OS, "arch": f.Arch,
 		"engine_version": f.EngineVersion, "ffmpeg_version": f.FFmpegVersion, "version": f.Version,
+		"yt_dlp_version": f.YtDlpVersion,
 	} {
 		if len(v) > 200 || !utf8.ValidString(v) {
 			return badRequest(name + " must be valid UTF-8 of at most 200 bytes")
@@ -43,9 +46,25 @@ func validateFacts(f *api.WorkerFacts) error {
 	if len(f.Models) > 64 || len(f.Kinds) > 2 {
 		return badRequest("too many models or kinds")
 	}
+	switch f.Kind {
+	case "", api.WorkerProcessing, api.WorkerDownloader:
+	default:
+		return badRequest("kind must be processing or downloader")
+	}
 	for _, k := range f.Kinds {
-		if k != api.KindPrepare && k != api.KindTranscribe {
-			return badRequest("unknown task kind " + string(k))
+		if err := kindAllowed(f.Kind, k); err != nil {
+			return err
+		}
+	}
+	if f.Kind != api.WorkerDownloader && (f.EgressGroup != "" || f.EgressIP != "" || f.YtDlpVersion != "") {
+		return badRequest("egress_group, egress_ip and yt_dlp_version are for downloaders")
+	}
+	if f.EgressGroup != "" && !egressGroupRE.MatchString(f.EgressGroup) {
+		return badRequest("egress_group must be 1-64 letters, digits, '.', '_' or '-'")
+	}
+	if f.EgressIP != "" {
+		if _, err := netip.ParseAddr(f.EgressIP); err != nil {
+			return badRequest("egress_ip must be an IP address")
 		}
 	}
 	for _, m := range f.Models {
@@ -57,6 +76,28 @@ func validateFacts(f *api.WorkerFacts) error {
 		return badRequest("cores, mem_bytes and slots must be sensible")
 	}
 	return nil
+}
+
+// egressGroupRE bounds a downloader's --egress-group: it becomes the egress
+// key label:<name>, which appears in fetch policy keys (site@label:<name>),
+// logs and the UI.
+var egressGroupRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+
+// kindAllowed checks that a worker of kind wk may run (list, or claim) task
+// kind k: a downloader runs only fetch tasks, a processing worker only
+// prepare and transcribe.
+func kindAllowed(wk api.WorkerKind, k api.TaskKind) error {
+	switch {
+	case wk == api.WorkerDownloader && k == api.KindFetch:
+		return nil
+	case wk == api.WorkerDownloader:
+		return badRequest("a downloader runs only fetch tasks, not " + string(k))
+	case k == api.KindPrepare || k == api.KindTranscribe:
+		return nil
+	case k == api.KindFetch:
+		return badRequest("only a downloader runs fetch tasks")
+	}
+	return badRequest("unknown task kind " + string(k))
 }
 
 // handleRegister is POST /worker (unauthenticated). Registration grants
@@ -111,8 +152,9 @@ func (s *Server) workerAPI(ctx context.Context, wk *store.Worker) (*api.Worker, 
 		return nil, err
 	}
 	out := &api.Worker{ID: wk.ID, State: wk.State, Facts: wk.Facts, Queues: []string{}, LastSeenAt: wk.LastSeenAt}
+	role := workerRole(wk.Kind) // process, or fetch for a downloader
 	for _, g := range gs {
-		if g.Role == api.RoleProcess {
+		if g.Role == role {
 			out.Queues = append(out.Queues, g.Scope[len("queue:"):])
 		}
 	}

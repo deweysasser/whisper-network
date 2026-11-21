@@ -18,6 +18,7 @@ func (s *Server) routes() http.Handler {
 
 	// Client API (§6.1).
 	mux.Handle("POST /queue/{q}", s.authed(anyHuman, s.handleUpload))
+	mux.Handle("POST /queue/{q}/fetch", s.authed(anyHuman, s.handleFetchSubmit))
 	mux.Handle("GET /queue/{q}", s.authed(anyHuman, s.handleListJobs))
 	mux.Handle("PATCH /queue/{q}", s.authed(anyHuman, s.handlePatchQueue))
 	mux.Handle("GET /job/{id}", s.authed(anyHuman, s.handleGetJob))

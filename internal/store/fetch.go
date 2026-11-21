@@ -622,6 +622,62 @@ func (s *Store) NextFetchEligible(ctx context.Context, now time.Time) (time.Time
 	return best, !best.IsZero(), nil
 }
 
+// FetchBlockedTasks counts, per site, the pending fetch tasks that pacing
+// holds back at now from every egress key of an active downloader (see
+// pacer.decide: cooldown, concurrency, rate rules, or no valid policy).
+// Sites some active downloader's group may fetch now are left out, and so
+// is everything when no downloader is active (the tasks then wait for a
+// downloader, not for pacing).
+func (s *Store) FetchBlockedTasks(ctx context.Context, now time.Time) (map[string]int, error) {
+	rows, err := s.r.QueryContext(ctx, `SELECT COALESCE(j.fetch_site, ''), COUNT(*) FROM tasks t
+		JOIN jobs j ON j.id = t.job_id WHERE t.kind = 'fetch' AND t.state = 'pending' GROUP BY 1 ORDER BY 1`)
+	if err != nil {
+		return nil, fmt.Errorf("fetch blocked tasks: %w", err)
+	}
+	pending := map[string]int{}
+	for rows.Next() {
+		var site string
+		var n int
+		if err := rows.Scan(&site, &n); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("fetch blocked tasks: %w", err)
+		}
+		pending[site] = n
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil || len(pending) == 0 {
+		return nil, err
+	}
+	keys, err := queryStrings(ctx, s.r, `SELECT DISTINCT egress_key FROM workers
+		WHERE kind = 'downloader' AND state = 'active' ORDER BY 1`)
+	if err != nil || len(keys) == 0 {
+		return nil, err
+	}
+	fp, err := loadFetchPolicies(ctx, s.r)
+	if err != nil {
+		return nil, err
+	}
+	p := &pacer{q: s.r, fp: fp, minSandbox: s.cfg.FetchMinSandbox, now: now}
+	out := map[string]int{}
+	for site, n := range pending {
+		blocked := true
+		for _, k := range keys {
+			ok, _, err := p.decide(ctx, k, site)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				blocked = false
+				break
+			}
+		}
+		if blocked {
+			out[site] = n
+		}
+	}
+	return out, nil
+}
+
 // fallbackBackoff is the cooldown backoff when neither the governing policy
 // nor the '*' policy is usable (see rateLimitBackoff).
 var fallbackBackoff = fetchpolicy.Policy{BackoffInitial: 12 * time.Hour, BackoffCap: 24 * time.Hour}

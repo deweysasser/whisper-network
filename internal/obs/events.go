@@ -29,6 +29,10 @@ const (
 	EventAuthDenied       Event = "auth.denied"
 	EventAdminChange      Event = "admin.change"
 	EventReaperRun        Event = "reaper.run"
+	EventFetchSubmitted   Event = "fetch.submitted"
+	EventFetchDone        Event = "fetch.done"
+	EventFetchRateLimited Event = "fetch.rate_limited"
+	EventFetchCooldown    Event = "fetch.cooldown"
 )
 
 // Event field names. They are flat (no nesting) and identical on server and
@@ -83,4 +87,9 @@ const (
 	FieldLandlockABI    = "landlock_abi"
 	FieldFailures       = "failures"
 	FieldJobs           = "jobs"
+	// FieldSite is a fetch's policy site key (never its URL).
+	FieldSite        = "site"
+	FieldEgressKey   = "egress_key"
+	FieldFetchMethod = "fetch_method"
+	FieldUntil       = "until"
 )

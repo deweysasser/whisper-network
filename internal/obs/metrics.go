@@ -41,6 +41,9 @@ type Metrics struct {
 	// version is the server's own version, for whisper_server_info; nil
 	// until SetServerVersion.
 	version atomic.Pointer[string]
+	// invalidPolicies is whisper_fetch_invalid_policies; nil until
+	// SetFetchInvalidPolicies.
+	invalidPolicies atomic.Pointer[int]
 }
 
 // NewMetrics registers the catalog's snapshot gauges on set and returns the
@@ -143,3 +146,21 @@ func (m *Metrics) InputServed(kind api.TaskKind, n int64) {
 func (m *Metrics) DBTx(op string, d time.Duration) {
 	m.hist("whisper_db_tx_seconds", dbBuckets, "op", op).Update(d.Seconds())
 }
+
+// FetchResult counts a fetch lease's outcome ("done", "failed",
+// "rate_limited", "not_media", "too_large", "invalid") by site label: a
+// policy site key or "other", never a URL.
+func (m *Metrics) FetchResult(site, outcome string) {
+	m.counter("whisper_fetch_total", "site", site, "outcome", outcome).Inc()
+}
+
+// FetchBytes adds bytes of fetched media accepted from downloaders, by site
+// label (see FetchResult).
+func (m *Metrics) FetchBytes(site string, n int64) {
+	m.counter("whisper_fetch_bytes_total", "site", site).AddInt64(n)
+}
+
+// SetFetchInvalidPolicies sets whisper_fetch_invalid_policies, the number of
+// stored fetch policies that do not parse or validate (each blocks what it
+// governs).
+func (m *Metrics) SetFetchInvalidPolicies(n int) { m.invalidPolicies.Store(&n) }

@@ -51,6 +51,7 @@ type ServerCmd struct {
 	ClassWeights      string        `default:"low=1,medium=2,high=4" env:"WHISPER_CLASS_WEIGHTS" help:"Job weight-class shares"`
 	ModelFactors      string        `default:"small.en=1,large-v3-turbo=3" env:"WHISPER_MODEL_FACTORS" help:"Scheduling cost factor per model"`
 	PrepareMinSandbox string        `default:"full" enum:"full,fs-only,none" env:"WHISPER_PREPARE_MIN_SANDBOX" help:"Least sandbox level that may run prepare tasks"`
+	FetchMinSandbox   string        `default:"full" enum:"full,fs-only,none" env:"WHISPER_FETCH_MIN_SANDBOX" help:"Least sandbox level a downloader needs to fetch URLs (full: filesystem restricted and TCP connect limited to its egress proxy)"`
 	MaxUploadBytes    string        `default:"2GiB" env:"WHISPER_MAX_UPLOAD_BYTES" help:"Default upload size cap (queues may override)"`
 	MinFreeBytes      string        `default:"1GiB" env:"WHISPER_MIN_FREE_BYTES" help:"Refuse uploads below this much free disk"`
 	AudioRetention    time.Duration `default:"24h" env:"WHISPER_AUDIO_RETENTION" help:"Keep canonical audio this long after a job is done"`
@@ -141,10 +142,18 @@ func (c *ServerCmd) storeConfig() (store.Config, error) {
 	if err != nil {
 		return store.Config{}, err
 	}
+	maxUpload, err := server.ParseByteSize(c.MaxUploadBytes)
+	if err != nil {
+		return store.Config{}, fmt.Errorf("--max-upload-bytes: %w", err)
+	}
 	return store.Config{
 		Path: server.DBPath(c.Data), ClassWeights: weights, ModelFactors: factors,
 		MaxAttempts: c.MaxAttempts, WorkerFailureLimit: c.WorkerFailLimit,
 		PrepareMinSandbox: api.SandboxLevel(c.PrepareMinSandbox),
+		FetchMinSandbox:   api.SandboxLevel(c.FetchMinSandbox),
+		// A fetch lease's byte cap: the queue's upload cap, never above the
+		// server's.
+		FetchMaxBytes: maxUpload,
 	}, nil
 }
 

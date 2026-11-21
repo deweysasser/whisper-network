@@ -294,7 +294,8 @@ func (a LeaseAgeLimit) of(cost float64) time.Duration {
 // Heartbeat extends a live lease to now+ttl and returns the new expiry.
 // ErrLeaseGone if the lease is no longer live, or may no longer be kept
 // alive: its worker is neither active nor paused, the worker no longer
-// holds process on the lease's queue, or the lease is older than age
+// holds process (fetch, for a fetch lease) on the lease's queue, or the
+// lease is older than age
 // allows. The worker must stop; the lease then expires within ttl.
 func (s *Store) Heartbeat(ctx context.Context, leaseID, workerID string, ttl time.Duration, age LeaseAgeLimit) (time.Time, error) {
 	now := s.now()
@@ -308,17 +309,23 @@ func (s *Store) Heartbeat(ctx context.Context, leaseID, workerID string, ttl tim
 		var granted bool
 		var created int64
 		var cost float64
-		if err := tx.QueryRowContext(ctx, `SELECT w.state, `+processGrantSQL+`, l.created_at, t.cost
+		// A fetch lease needs fetch on its queue, any other process.
+		if err := tx.QueryRowContext(ctx, `SELECT w.state, CASE WHEN t.kind = 'fetch' THEN `+fetchGrantSQL+`
+			ELSE `+processGrantSQL+` END, l.created_at, t.cost
 			FROM leases l JOIN workers w ON w.id = l.worker_id JOIN jobs j ON j.id = l.job_id
 			JOIN tasks t ON t.job_id = l.job_id AND t.seq = l.seq WHERE l.id = ?`,
-			WorkerPrincipal(workerID), leaseID).Scan(&state, &granted, &created, &cost); err != nil {
+			WorkerPrincipal(workerID), WorkerPrincipal(workerID), leaseID).Scan(&state, &granted, &created, &cost); err != nil {
 			return fmt.Errorf("heartbeat: %w", err)
+		}
+		role := api.RoleProcess
+		if l.Kind == api.KindFetch {
+			role = api.RoleFetch
 		}
 		switch {
 		case state != api.WorkerActive && state != api.WorkerPaused:
 			return fmt.Errorf("lease %s: worker is %s: %w", l.ID, state, ErrLeaseGone)
 		case !granted:
-			return fmt.Errorf("lease %s: process no longer granted on its queue: %w", l.ID, ErrLeaseGone)
+			return fmt.Errorf("lease %s: %s no longer granted on its queue: %w", l.ID, role, ErrLeaseGone)
 		}
 		if limit := age.of(cost); limit > 0 && now.Sub(fromMS(created)) >= limit {
 			return fmt.Errorf("lease %s: older than its %v limit: %w", l.ID, limit, ErrLeaseGone)
