@@ -90,14 +90,15 @@ func (b *syncBuffer) events(t *testing.T, ev obs.Event) []map[string]any {
 // env is a real server with the UI on a temp data dir behind httptest,
 // with a fake clock and captured logs.
 type env struct {
-	t     *testing.T
-	ctx   context.Context
-	clk   *fakeClock
-	st    *store.Store
-	srv   *server.Server
-	ts    *httptest.Server
-	logs  *syncBuffer
-	admin string // API client token with admin on *
+	t      *testing.T
+	ctx    context.Context
+	clk    *fakeClock
+	st     *store.Store
+	srv    *server.Server
+	ts     *httptest.Server
+	logs   *syncBuffer
+	admin  string // API client token with admin on *
+	dbPath string
 }
 
 func newEnv(t *testing.T, opts ...func(*server.Config)) *env {
@@ -119,7 +120,8 @@ func newEnvStore(t *testing.T, sc store.Config, opts ...func(*server.Config)) *e
 		o(&cfg)
 	}
 	var err error
-	sc.Path, sc.Now = filepath.Join(dir, "wn.db"), e.clk.Now
+	e.dbPath = filepath.Join(dir, "wn.db")
+	sc.Path, sc.Now = e.dbPath, e.clk.Now
 	e.st, err = store.Open(e.ctx, sc)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = e.st.Close() })

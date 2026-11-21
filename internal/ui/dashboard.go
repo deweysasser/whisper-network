@@ -100,13 +100,13 @@ func countVersions(workers []store.Worker, server string) fleetVersions {
 
 // queueStatRow is one queue on the dashboard.
 type queueStatRow struct {
-	Name                                     string
-	Weight                                   int
-	Preparing, Queued, Running, Done, Failed int
-	PendingTasks, LeasedTasks                int
-	BacklogCost                              float64
-	OldestPending                            time.Duration
-	EligibleWorkers                          int
+	Name                                               string
+	Weight                                             int
+	Fetching, Preparing, Queued, Running, Done, Failed int
+	PendingTasks, LeasedTasks                          int
+	BacklogCost                                        float64
+	OldestPending                                      time.Duration
+	EligibleWorkers                                    int
 	// EligibleSlots and EligibleBusy are the slots of the eligible workers
 	// and how many are in use (#81).
 	EligibleSlots, EligibleBusy int
@@ -181,6 +181,8 @@ func (u *UI) stats(ctx context.Context) (*statsView, error) {
 			continue
 		}
 		switch j.State {
+		case api.JobFetching:
+			row.Fetching = j.Count
 		case api.JobPreparing:
 			row.Preparing = j.Count
 		case api.JobQueued:

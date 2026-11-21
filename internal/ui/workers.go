@@ -39,19 +39,24 @@ type workersView struct {
 // realtime factor, failure rate) are such columns; busy slots come from the
 // last heartbeat, and the leases themselves are on the worker's page.
 type workerRow struct {
-	CSRF       string
-	ID         string
-	Ref        ref    // the worker as a ref: Name and the short id (#57)
-	Name       string // description, else hostname, else the short id
-	Hostname   string // shown under Name when Name is the description
-	State      api.WorkerState
-	Queues     []string // queues it may process
-	Sandbox    api.SandboxLevel
-	Slots      int
-	SlotsBusy  *int // from the last heartbeat's gauges; nil before one
-	LastSeenAt *time.Time
-	Online     bool
-	Stats      workStats // work counters; the table shows a summary, the page all
+	CSRF     string
+	ID       string
+	Ref      ref    // the worker as a ref: Name and the short id (#57)
+	Name     string // description, else hostname, else the short id
+	Hostname string // shown under Name when Name is the description
+	State    api.WorkerState
+	Queues   []string // queues it may process
+	Sandbox  api.SandboxLevel
+	// Kind is processing or downloader; a downloader also has its egress
+	// key and yt-dlp version.
+	Kind         api.WorkerKind
+	EgressKey    string
+	YtDlpVersion string
+	Slots        int
+	SlotsBusy    *int // from the last heartbeat's gauges; nil before one
+	LastSeenAt   *time.Time
+	Online       bool
+	Stats        workStats // work counters; the table shows a summary, the page all
 	// PauseReason is why the circuit breaker paused the worker (empty if
 	// it did not); FailureStreak and StreakJobs are its current streak.
 	PauseReason               string
@@ -82,7 +87,8 @@ type workerDetail struct {
 	DecidedAt    *time.Time
 	Gauges       *api.Gauges
 	QueueGrants  []workerQueue
-	Back         string // this page, for forms that return here
+	Back         string   // this page, for forms that return here
+	GrantRole    api.Role // the role granting the worker a queue: process, or fetch for a downloader
 	// Leases are the worker's live leases on jobs the principal may view;
 	// OtherLeases counts the rest.
 	Leases      []workerLease
@@ -211,13 +217,24 @@ func (u *UI) handleWorker(w http.ResponseWriter, r *http.Request, rc *reqCtx) er
 	return nil
 }
 
-// processGrants returns the worker's process grants.
+// workerGrantRole is the role that lets the worker work for a queue: fetch
+// for a downloader, process otherwise.
+func workerGrantRole(k api.WorkerKind) api.Role {
+	if k == api.WorkerDownloader {
+		return api.RoleFetch
+	}
+	return api.RoleProcess
+}
+
+// processGrants returns the worker's grants of its working role (process, or
+// fetch for a downloader).
 func (u *UI) processGrants(ctx context.Context, wk *store.Worker) ([]api.Grant, error) {
 	grants, err := u.srv.Ops().WireGrants(ctx, wk.Principal())
 	if err != nil {
 		return nil, err
 	}
-	return slices.DeleteFunc(grants, func(g api.Grant) bool { return g.Role != api.RoleProcess }), nil
+	role := workerGrantRole(wk.Kind)
+	return slices.DeleteFunc(grants, func(g api.Grant) bool { return g.Role != role }), nil
 }
 
 // workerName is how the UI names a worker: its description, else its
@@ -248,7 +265,7 @@ func workerGauges(wk *store.Worker) *api.Gauges {
 func (u *UI) workerRowFor(rc *reqCtx, wk *store.Worker, process []api.Grant) workerRow {
 	res := auth.Resource{WorkerID: wk.ID}
 	row := workerRow{CSRF: rc.CSRF, ID: wk.ID, Name: workerName(wk), State: wk.State,
-		Sandbox: wk.Facts.SandboxLevel, Slots: wk.Facts.Slots, LastSeenAt: wk.LastSeenAt,
+		Sandbox: wk.Facts.SandboxLevel, Kind: wk.Kind, EgressKey: wk.EgressKey, YtDlpVersion: wk.Facts.YtDlpVersion, Slots: wk.Facts.Slots, LastSeenAt: wk.LastSeenAt,
 		Online: isOnline(wk, u.srv.Now()), Stats: newWorkStats(wk.Stats), PauseReason: wk.PauseReason,
 		FailureStreak: wk.FailureStreak, StreakJobs: wk.StreakJobs,
 		Version: wk.Facts.Version, EngineVersion: wk.Facts.EngineVersion, FFmpegVersion: wk.Facts.FFmpegVersion,
@@ -278,7 +295,7 @@ func (u *UI) workerDetailFor(ctx context.Context, rc *reqCtx, wk *store.Worker, 
 	}
 	v := &workerDetail{workerRow: u.workerRowFor(rc, wk, process), Facts: wk.Facts,
 		RegisteredAt: wk.RegisteredAt, DecidedBy: wk.DecidedBy, DecidedAt: wk.DecidedAt,
-		Gauges: workerGauges(wk), Back: workerPath(wk.ID)}
+		Gauges: workerGauges(wk), Back: workerPath(wk.ID), GrantRole: workerGrantRole(wk.Kind)}
 	held := map[string]bool{}
 	for _, g := range process {
 		name := strings.TrimPrefix(g.Scope, "queue:")
@@ -288,7 +305,7 @@ func (u *UI) workerDetailFor(ctx context.Context, rc *reqCtx, wk *store.Worker, 
 	}
 	var grantable []string
 	for _, q := range queues {
-		if rc.can(auth.ActGrantProcess, auth.Resource{Queue: q}) {
+		if rc.can(workerGrantAction(wk.Kind), auth.Resource{Queue: q}) {
 			grantable = append(grantable, q)
 		}
 	}
@@ -308,6 +325,10 @@ func (u *UI) workerDetailFor(ctx context.Context, rc *reqCtx, wk *store.Worker, 
 	v.CanDelete = mayDeleteWorker(rc, wk)
 	return v, nil
 }
+
+// workerGrantAction is the action that grants a worker its working role
+// (process or fetch; both are queue_admin acts, see auth.CanApproveWorker).
+func workerGrantAction(api.WorkerKind) auth.Action { return auth.ActGrantProcess }
 
 // mayDeleteWorker reports whether the principal may delete wk now: it is
 // rejected and the principal holds the right that rejects it.

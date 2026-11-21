@@ -391,8 +391,17 @@ func policyFromRequest(key string, req api.FetchPolicy) (fetchpolicy.Policy, err
 	if req.EgressKey != "" && req.EgressKey != egress {
 		return fetchpolicy.Policy{}, badRequest("body egress_key " + strconv.Quote(req.EgressKey) + " contradicts the key")
 	}
-	fp := fetchpolicy.Policy{Key: key, Site: site, EgressKey: egress, Concurrency: req.Concurrency}
-	for _, rs := range req.Rules {
+	return ParseFetchPolicy(key, req.Rules, req.Concurrency, req.BackoffInitial, req.BackoffCap)
+}
+
+// ParseFetchPolicy builds a store policy from its wire fields: rules as
+// "N/DUR" strings, durations as Go duration strings; site and egress come
+// from key (split on the first '@'). Errors are 400s whose detail is safe to
+// show; the policy's own invariants are checked when it is stored.
+func ParseFetchPolicy(key string, rules []string, concurrency int, backoffInitial, backoffCap string) (fetchpolicy.Policy, error) {
+	site, egress, _ := strings.Cut(key, "@")
+	fp := fetchpolicy.Policy{Key: key, Site: site, EgressKey: egress, Concurrency: concurrency}
+	for _, rs := range rules {
 		ru, err := fetchpolicy.ParseRule(rs)
 		if err != nil {
 			return fp, badRequest("rule " + strconv.Quote(rs) + ": " + err.Error())
@@ -400,10 +409,10 @@ func policyFromRequest(key string, req api.FetchPolicy) (fetchpolicy.Policy, err
 		fp.Rules = append(fp.Rules, ru)
 	}
 	var err error
-	if fp.BackoffInitial, err = time.ParseDuration(req.BackoffInitial); err != nil {
+	if fp.BackoffInitial, err = time.ParseDuration(backoffInitial); err != nil {
 		return fp, badRequest("backoff_initial: " + err.Error())
 	}
-	if fp.BackoffCap, err = time.ParseDuration(req.BackoffCap); err != nil {
+	if fp.BackoffCap, err = time.ParseDuration(backoffCap); err != nil {
 		return fp, badRequest("backoff_cap: " + err.Error())
 	}
 	return fp, nil
@@ -476,6 +485,19 @@ func (s *Server) handleAdminListCooldowns(w http.ResponseWriter, r *http.Request
 // maxCooldown caps a manual cooldown (the longest rate window).
 const maxCooldown = 168 * time.Hour
 
+// ParseCooldownDuration parses a manual cooldown's Go duration: positive and
+// at most maxCooldown. Errors are 400s.
+func ParseCooldownDuration(s string) (time.Duration, error) {
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, badRequest("duration: " + err.Error())
+	}
+	if d <= 0 || d > maxCooldown {
+		return 0, badRequest("duration must be positive and at most " + maxCooldown.String())
+	}
+	return d, nil
+}
+
 func (s *Server) handleAdminSetCooldown(w http.ResponseWriter, r *http.Request, p *Principal) error {
 	if !auth.Can(p.Principal, auth.ActManageFetchPolicy, auth.Resource{}) {
 		return s.deny(r, p, "admin required")
@@ -484,12 +506,9 @@ func (s *Server) handleAdminSetCooldown(w http.ResponseWriter, r *http.Request, 
 	if err := decodeJSON(w, r, &req, false); err != nil {
 		return err
 	}
-	d, err := time.ParseDuration(req.Duration)
+	d, err := ParseCooldownDuration(req.Duration)
 	if err != nil {
-		return badRequest("duration: " + err.Error())
-	}
-	if d <= 0 || d > maxCooldown {
-		return badRequest("duration must be positive and at most " + maxCooldown.String())
+		return err
 	}
 	until := s.now().Add(d)
 	if err := s.ops.SetCooldown(r.Context(), p.Actor(), req.EgressKey, req.Site, until, req.Reason); err != nil {

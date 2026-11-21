@@ -257,7 +257,7 @@ func TestPutFetchPolicyValidates(t *testing.T) {
 	var rules, by string
 	require.NoError(t, f.s.r.QueryRowContext(f.ctx, `SELECT rules, updated_by FROM fetch_policies WHERE key = 'example.com'`).
 		Scan(&rules, &by))
-	assert.Equal(t, `["2/1m0s"]`, rules)
+	assert.Equal(t, `["2/1m"]`, rules)
 	assert.Equal(t, "user:1", by)
 
 	ok.Concurrency = 1

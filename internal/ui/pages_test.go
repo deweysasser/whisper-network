@@ -63,6 +63,7 @@ func TestPagesByPrincipal(t *testing.T) {
 			"/ui/users":                  {200, []string{"Create a user", "qa", "plain"}, nil},
 			"/ui/clients":                {200, []string{"Mint a client token"}, nil},
 			"/ui/audit":                  {200, []string{"user.create"}, nil},
+			"/ui/fetch":                  {200, []string{"Policies", "Set a cooldown", "youtube.com", `name="rules"`, `href="/ui/fetch"`}, []string{"1/3m0s"}},
 			"/ui/password":               {200, []string{"Change password"}, nil},
 			"/ui/jobs/no-such-job":       {404, nil, nil},
 			"/ui/queues/no-such-q":       {404, nil, nil},
@@ -79,6 +80,7 @@ func TestPagesByPrincipal(t *testing.T) {
 			"/ui/users":         {403, nil, nil},
 			"/ui/clients":       {403, nil, nil},
 			"/ui/audit":         {403, nil, nil},
+			"/ui/fetch":         {403, nil, nil},
 		},
 		"wa": { // worker_admin on w1 only
 			"/ui/":              {200, []string{"audio-hours"}, nil},
@@ -90,6 +92,7 @@ func TestPagesByPrincipal(t *testing.T) {
 			"/ui/users":         {403, nil, nil},
 			"/ui/clients":       {403, nil, nil},
 			"/ui/audit":         {403, nil, nil},
+			"/ui/fetch":         {403, nil, nil},
 		},
 		"plain": { // no roles at all
 			"/ui/":                {200, []string{"no access to any queue"}, []string{"audio-hours", `href="/ui/workers"`}},
@@ -102,6 +105,7 @@ func TestPagesByPrincipal(t *testing.T) {
 			"/ui/users":           {403, nil, nil},
 			"/ui/clients":         {403, nil, nil},
 			"/ui/audit":           {403, nil, nil},
+			"/ui/fetch":           {403, nil, nil},
 		},
 	}
 	for user, cases := range pages {

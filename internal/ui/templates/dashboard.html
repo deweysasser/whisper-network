@@ -52,14 +52,14 @@
   <div class="scroll">
   <table class="data">
     <thead><tr>
-      {{template "th" (col "dash.queue")}}{{template "th" (col "dash.preparing" "n")}}{{template "th" (col "dash.queued" "n")}}{{template "th" (col "dash.running" "n")}}{{template "th" (col "dash.done" "n")}}{{template "th" (col "dash.failed" "n")}}
+      {{template "th" (col "dash.queue")}}{{template "th" (col "dash.fetching" "n")}}{{template "th" (col "dash.preparing" "n")}}{{template "th" (col "dash.queued" "n")}}{{template "th" (col "dash.running" "n")}}{{template "th" (col "dash.done" "n")}}{{template "th" (col "dash.failed" "n")}}
       {{template "th" (col "dash.pending" "n")}}{{template "th" (col "dash.leased" "n")}}{{template "th" (col "dash.oldest" "n")}}{{template "th" (col "dash.eligible" "n")}}{{template "th" (col "dash.slots" "n")}}
     </tr></thead>
     <tbody>
     {{range .Queues}}
     <tr>
       <td><a href="/ui/queues/{{.Name}}">{{.Name}}</a></td>
-      <td class="n">{{.Preparing}}</td><td class="n">{{.Queued}}</td><td class="n">{{.Running}}</td><td class="n">{{.Done}}</td><td class="n">{{.Failed}}</td>
+      <td class="n">{{.Fetching}}</td><td class="n">{{.Preparing}}</td><td class="n">{{.Queued}}</td><td class="n">{{.Running}}</td><td class="n">{{.Done}}</td><td class="n">{{.Failed}}</td>
       <td class="n">{{.PendingTasks}}</td><td class="n">{{.LeasedTasks}}</td>
       <td class="n">{{if .PendingTasks}}{{dur .OldestPending}}{{else}}—{{end}}</td>
       <td class="n{{if and .PendingTasks (not .EligibleWorkers)}} warn{{end}}">{{.EligibleWorkers}}</td>

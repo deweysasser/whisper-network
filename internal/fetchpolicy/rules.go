@@ -50,8 +50,25 @@ func (r Rule) validate() error {
 	return nil
 }
 
-// String formats the rule so ParseRule round-trips it.
-func (r Rule) String() string { return fmt.Sprintf("%d/%s", r.N, r.Window) }
+// String formats the rule compactly ("1/3m", "30/1h", "1/90s", "2/1h30m"),
+// so ParseRule round-trips it.
+func (r Rule) String() string { return fmt.Sprintf("%d/%s", r.N, CompactDuration(r.Window)) }
+
+// CompactDuration is Duration.String without zero trailing units ("3m", not
+// "3m0s"). Under two minutes a part-minute window reads as seconds ("90s").
+func CompactDuration(d time.Duration) string {
+	if d > 0 && d < 2*time.Minute && d%time.Minute != 0 && d%time.Second == 0 {
+		return strconv.FormatInt(int64(d/time.Second), 10) + "s"
+	}
+	s := d.String()
+	if strings.HasSuffix(s, "m0s") {
+		s = s[:len(s)-2]
+	}
+	if strings.HasSuffix(s, "h0m") {
+		s = s[:len(s)-2]
+	}
+	return s
+}
 
 // Policy is one stored pacing policy. Key is Site, or Site+"@"+EgressKey when
 // EgressKey is set. Site "*" matches any site.

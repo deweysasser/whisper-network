@@ -16,6 +16,11 @@
     {{template "dt" (col "workerfact.id")}}<dd><code>{{$w.ID}}</code></dd>
     {{template "dt" (col "workerfact.host")}}<dd>{{$w.Facts.Hostname}}</dd>
     {{template "dt" (col "workerfact.desc")}}<dd>{{with $w.Facts.Description}}{{.}}{{else}}<span class="muted">none</span>{{end}}</dd>
+    {{template "dt" (col "workerfact.kind")}}<dd><span class="badge kind-{{$w.Kind}}" title="{{vhelp "worker" (or $w.Kind "processing")}}">{{or $w.Kind "processing"}}</span></dd>
+    {{if eq (print $w.Kind) "downloader"}}
+    {{template "dt" (col "workerfact.egress")}}<dd><code>{{$w.EgressKey}}</code>{{with $w.Facts.EgressGroup}} · group {{.}}{{end}}{{with $w.Facts.EgressIP}} · reported {{.}}{{end}}</dd>
+    {{template "dt" (col "workerfact.ytdlp")}}<dd>{{with $w.Facts.YtDlpVersion}}{{.}}{{else}}<span class="muted">unknown</span>{{end}}</dd>
+    {{end}}
     {{template "dt" (col "workerfact.cpu")}}<dd>{{with $w.Facts.CPUModel}}{{.}} · {{end}}{{$w.Facts.Cores}} cores</dd>
     {{template "dt" (col "workerfact.mem")}}<dd>{{bytes $w.Facts.MemBytes}}</dd>
     {{template "dt" (col "workerfact.platform")}}<dd>{{$w.Facts.OS}}/{{$w.Facts.Arch}}</dd>
@@ -47,18 +52,18 @@
       <form method="post" action="/ui/grants/revoke" class="inline">
         {{template "csrf" $w.CSRF}}
         <input type="hidden" name="principal" value="worker:{{$w.ID}}">
-        <input type="hidden" name="role" value="process">
+        <input type="hidden" name="role" value="{{$w.GrantRole}}">
         <input type="hidden" name="scope" value="queue:{{.Name}}">
         <input type="hidden" name="back" value="{{$w.Back}}">
         <button type="submit" class="link" title="Stop this worker processing {{.Name}}" aria-label="Revoke {{.Name}}">×</button>
       </form>{{end}}</span>
-    {{else}}<span class="muted">This worker may not process any queue.</span>{{end}}
+    {{else}}<span class="muted">This worker may not {{if eq (print $w.Kind) "downloader"}}download for{{else}}process{{end}} any queue.</span>{{end}}
   </p>
   {{if $w.AddQueues}}
   <form method="post" action="/ui/grants" class="row">
     {{template "csrf" $w.CSRF}}
     <input type="hidden" name="principal" value="worker:{{$w.ID}}">
-    <input type="hidden" name="role" value="process">
+    <input type="hidden" name="role" value="{{$w.GrantRole}}">
     <input type="hidden" name="back" value="{{$w.Back}}">
     <label>Add queue
       <select name="scope">{{range $w.AddQueues}}<option value="queue:{{.}}">{{.}}</option>{{end}}</select>
@@ -74,7 +79,7 @@
   <form method="post" action="/ui/workers/{{$w.ID}}/approve" class="stack">
     {{template "csrf" $w.CSRF}}
     <fieldset>
-      <legend>Approve for queues (sandbox: {{$w.Facts.SandboxLevel}})</legend>
+      <legend>{{if eq (print $w.Kind) "downloader"}}Approve to download for queues{{else}}Approve for queues{{end}} (sandbox: {{$w.Facts.SandboxLevel}})</legend>
       {{range $w.ApproveQueues}}<label class="check"><input type="checkbox" name="queue" value="{{.}}"> {{.}}</label>{{else}}<span class="muted">You are not queue_admin on any queue; the worker will be active but idle.</span>{{end}}
     </fieldset>
     <div><button type="submit">Approve</button></div>

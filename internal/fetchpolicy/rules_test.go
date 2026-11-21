@@ -10,7 +10,7 @@ func TestParseRule(t *testing.T) {
 	if err != nil || r != (Rule{1, 3 * time.Minute}) {
 		t.Fatalf("got %v, %v", r, err)
 	}
-	if r.String() != "1/3m0s" {
+	if r.String() != "1/3m" {
 		t.Errorf("String = %q", r.String())
 	}
 	if r2, err := ParseRule(r.String()); err != nil || r2 != r {
@@ -22,6 +22,25 @@ func TestParseRule(t *testing.T) {
 	for _, s := range []string{"0/1m", "1/500ms", "1/200h", "x/1m", "1", "1/", "/1m", "-1/1m", "1/x"} {
 		if _, err := ParseRule(s); err == nil {
 			t.Errorf("ParseRule(%q) want error", s)
+		}
+	}
+}
+
+func TestRuleStringCompact(t *testing.T) {
+	for want, r := range map[string]Rule{
+		"1/3m": {1, 3 * time.Minute}, "30/1h": {30, time.Hour}, "1/90s": {1, 90 * time.Second},
+		"2/1h30m": {2, 90 * time.Minute}, "1/30s": {1, 30 * time.Second}, "5/168h": {5, 168 * time.Hour},
+	} {
+		if got := r.String(); got != want {
+			t.Errorf("String() = %q, want %q", got, want)
+		}
+		if r2, err := ParseRule(want); err != nil || r2 != r {
+			t.Errorf("ParseRule(%q) = %v, %v", want, r2, err)
+		}
+	}
+	for _, s := range []string{"1/3m0s", "2/1h0m0s", "2/1h30m0s"} {
+		if _, err := ParseRule(s); err != nil {
+			t.Errorf("ParseRule(%q): %v", s, err)
 		}
 	}
 }

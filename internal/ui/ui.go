@@ -117,6 +117,12 @@ func (u *UI) routes() *http.ServeMux {
 	m.Handle("POST /ui/grants", u.authed(u.handleGrant))
 	m.Handle("POST /ui/grants/revoke", u.authed(u.handleRevoke))
 
+	m.Handle("GET /ui/fetch", u.authed(u.handleFetch))
+	m.Handle("POST /ui/fetch/policies", u.authed(u.handlePutFetchPolicy))
+	m.Handle("POST /ui/fetch/policies/{key}/delete", u.authed(u.handleDeleteFetchPolicy))
+	m.Handle("POST /ui/fetch/cooldowns", u.authed(u.handleSetCooldown))
+	m.Handle("POST /ui/fetch/cooldowns/clear", u.authed(u.handleClearCooldown))
+
 	m.Handle("GET /ui/audit", u.authed(u.handleAudit))
 	// No catch-all: unknown paths get the mux's 404, and a known path with
 	// the wrong method gets 405 (a GET can never reach a mutation).
@@ -328,7 +334,7 @@ type view struct {
 
 // navLinks says which sections the principal may open.
 type navLinks struct {
-	Workers, Users, Clients, Audit bool
+	Workers, Users, Clients, Fetch, Audit bool
 }
 
 func (rc *reqCtx) nav() navLinks {
@@ -339,6 +345,7 @@ func (rc *reqCtx) nav() navLinks {
 		Workers: mayListWorkers(rc.P),
 		Users:   rc.can(auth.ActCreateUser, auth.Resource{}),
 		Clients: rc.can(auth.ActCreateClient, auth.Resource{}),
+		Fetch:   rc.can(auth.ActManageFetchPolicy, auth.Resource{}),
 		Audit:   rc.can(auth.ActViewAudit, auth.Resource{}),
 	}
 }
