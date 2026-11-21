@@ -642,6 +642,10 @@ func (fp *fetchPolicies) rateLimitBackoff(site, egress string) fetchpolicy.Polic
 	return fallbackBackoff
 }
 
+// rateLimitBurst is how recently an automatic cooldown must have been set
+// for a further rate_limited report to count as the same burst.
+const rateLimitBurst = time.Minute
+
 // startRateLimitCooldown, in the transaction that ended l with stage
 // rate_limited, cools down l's (egress key, site): until = now +
 // Backoff(policy, level) with the row's level before it is incremented.
@@ -649,6 +653,8 @@ func (fp *fetchPolicies) rateLimitBackoff(site, egress string) fetchpolicy.Polic
 // An existing manual row whose until is later than that is left unchanged
 // (a rate limit never shortens a manual cooldown). Otherwise the row becomes
 // automatic with the new until and level+1, replacing a shorter manual one.
+// A report that falls in the burst of the cooldown just set (see
+// rateLimitBurst) changes nothing.
 func (s *Store) startRateLimitCooldown(ctx context.Context, tx *sql.Tx, l leaseRow, now time.Time) error {
 	var egress, site string
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(l.egress_key, ''), COALESCE(j.fetch_site, '')
@@ -667,9 +673,20 @@ func (s *Store) startRateLimitCooldown(ctx context.Context, tx *sql.Tx, l leaseR
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("rate limit cooldown: %w", err)
 	}
-	next := toMS(now.Add(fetchpolicy.Backoff(fp.rateLimitBackoff(site, egress), level)))
+	pol := fp.rateLimitBackoff(site, egress)
+	next := toMS(now.Add(fetchpolicy.Backoff(pol, level)))
 	if manual && until > next {
 		return nil
+	}
+	// Leases of one burst hit the same refusal together: an automatic row
+	// still in force that was set within rateLimitBurst of now (until is
+	// still within rateLimitBurst of now + the backoff that set it) is
+	// that burst's own, and is not escalated again.
+	if !manual && level > 0 && until > toMS(now) {
+		b := fetchpolicy.Backoff(pol, level-1)
+		if until >= toMS(now.Add(b-min(rateLimitBurst, b/2))) {
+			return nil
+		}
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO fetch_cooldowns (egress_key, site, until, level, manual, set_by, reason)
 		VALUES (?, ?, ?, ?, 0, ?, 'rate limited')
@@ -699,18 +716,15 @@ func (s *Store) FetchPolicies(ctx context.Context) ([]fetchpolicy.Policy, error)
 }
 
 // PutFetchPolicy inserts or replaces a fetch policy, recording by as the
-// editor. It is ErrInvalid unless the policy validates, every rule parses
-// and Key is the Site or Site@EgressKey. created reports an insert.
+// editor. It is ErrInvalid unless the policy validates (which includes Key
+// being Site or Site@EgressKey), every rule parses and the backoffs are
+// whole seconds. created reports an insert.
 func (t *Tx) PutFetchPolicy(ctx context.Context, p fetchpolicy.Policy, by string) (created bool, err error) {
 	if err := p.Validate(); err != nil {
 		return false, fmt.Errorf("%w: %v", ErrInvalid, err)
 	}
-	want := p.Site
-	if p.EgressKey != "" {
-		want += "@" + p.EgressKey
-	}
-	if p.Key != want {
-		return false, fmt.Errorf("%w: policy key %q must be %q", ErrInvalid, p.Key, want)
+	if p.BackoffInitial%time.Second != 0 || p.BackoffCap%time.Second != 0 {
+		return false, fmt.Errorf("%w: backoff must be whole seconds", ErrInvalid)
 	}
 	rules := make([]string, 0, len(p.Rules))
 	for _, r := range p.Rules {
@@ -784,9 +798,16 @@ func (s *Store) FetchCooldowns(ctx context.Context, now time.Time) ([]api.FetchC
 }
 
 // SetCooldown manually cools (egressKey, site) down until until, replacing
-// any existing row. An existing row's level is kept (so the automatic
+// any existing row (ErrInvalid for an empty key or site or an until that is
+// not in the future). An existing row's level is kept (so the automatic
 // backoff resumes where it was); a new row starts at 0.
 func (t *Tx) SetCooldown(ctx context.Context, egressKey, site string, until time.Time, by, reason string) error {
+	if egressKey == "" || site == "" {
+		return fmt.Errorf("%w: cooldown needs an egress key and a site", ErrInvalid)
+	}
+	if !until.After(t.s.now()) {
+		return fmt.Errorf("%w: cooldown must end in the future", ErrInvalid)
+	}
 	if _, err := t.tx.ExecContext(ctx, `INSERT INTO fetch_cooldowns (egress_key, site, until, level, manual, set_by, reason)
 		VALUES (?, ?, ?, 0, 1, ?, ?)
 		ON CONFLICT (egress_key, site) DO UPDATE SET until = excluded.until, manual = 1,

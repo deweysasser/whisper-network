@@ -31,10 +31,10 @@ type StrandedTask struct {
 // it (DESIGN.md §8.2). Each such task fails for good and makes its job
 // failing, with a reason naming the workers that failed it. The reaper calls it; limit must be positive.
 //
-// It also fails a pending fetch task that has been pending for limit (since
-// the task first became pending: a rate-limited requeue does not restart
-// the wait) and has a rate_limited lease in the job's current retry: every
-// downloader that tried the site was refused. Its job error is
+// It also fails a pending fetch task that has been rate limited for limit (since
+// the task first was refused: the first rate_limited lease end of the job's
+// current retry, so a task that merely waited its turn for pacing is not
+// failed by one refusal): every downloader that tried the site was refused. Its job error is
 // "rate limited by <site> on every downloader for <limit>".
 func (s *Store) FailStranded(ctx context.Context, limit time.Duration) ([]StrandedTask, error) {
 	if limit <= 0 {
@@ -53,10 +53,9 @@ func (s *Store) FailStranded(ctx context.Context, limit time.Duration) ([]Strand
 		// the second, which looks at leases ended since the cutoff.
 		//
 		// The rate-limited branch needs no attempts: such a lease is
-		// refunded, and the task keeps its pending_since.
-		const rateLimitedSQL = `(t.kind = 'fetch' AND t.pending_since <= ?
-			AND EXISTS (SELECT 1 FROM leases r WHERE r.job_id = t.job_id AND r.seq = t.seq
-				AND r.stage = 'rate_limited' AND r.retry = j.retries))`
+		// refunded.
+		const rateLimitedSQL = `(t.kind = 'fetch' AND (SELECT MIN(r.ended_at) FROM leases r
+			WHERE r.job_id = t.job_id AND r.seq = t.seq AND r.stage = 'rate_limited' AND r.retry = j.retries) <= ?)`
 		rows, err := tx.QueryContext(ctx, `SELECT t.job_id, t.seq, t.kind, COALESCE(t.error, ''),
 			COALESCE(j.fetch_site, ''), `+rateLimitedSQL+` FROM tasks t JOIN jobs j ON j.id = t.job_id
 			WHERE t.state = 'pending' AND (`+rateLimitedSQL+` OR t.attempts > 0

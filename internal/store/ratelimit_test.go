@@ -141,7 +141,7 @@ func TestManualCooldownNotShortened(t *testing.T) {
 		return tx.SetCooldown(f.ctx, "e1", "example.com", long, "user:1", "manual")
 	}))
 	f.clk.Advance(48*time.Hour - 10*time.Minute)
-	f.cooldownBypassClaimAndRateLimit(d)
+	f.fetchingJobLease(d, "example.com")
 	c, ok := f.cooldown("e1", "example.com")
 	require.True(t, ok)
 	assert.True(t, c.Manual)
@@ -150,17 +150,12 @@ func TestManualCooldownNotShortened(t *testing.T) {
 
 	// A shorter manual cooldown is replaced by the automatic one.
 	f.clk.Advance(9 * time.Minute)
-	f.cooldownBypassClaimAndRateLimit(d)
+	f.fetchingJobLease(d, "example.com")
 	c, ok = f.cooldown("e1", "example.com")
 	require.True(t, ok)
 	assert.False(t, c.Manual)
 	assert.Equal(t, f.clk.Now().Add(5*time.Minute), c.Until)
 	assert.Equal(t, 1, c.Level)
-}
-
-func (f *fixture) cooldownBypassClaimAndRateLimit(d string) {
-	f.t.Helper()
-	f.fetchingJobLease(d, "example.com")
 }
 
 func TestAcceptFetchResetsAutoLevel(t *testing.T) {
@@ -288,6 +283,10 @@ func TestPutFetchPolicyValidates(t *testing.T) {
 		_, err := put(p)
 		assert.True(t, errors.Is(err, ErrInvalid), "%s: %v", name, err)
 	}
+	frac := ok
+	frac.BackoffInitial = 1500 * time.Millisecond
+	_, err = put(frac)
+	assert.ErrorIs(t, err, ErrInvalid, "fractional backoff")
 	bad, err := f.s.InvalidFetchPolicies(f.ctx)
 	require.NoError(t, err)
 	assert.Empty(t, bad)
@@ -318,8 +317,19 @@ func TestClearCooldown(t *testing.T) {
 		if err := tx.SetCooldown(f.ctx, "e1", "b.com", now.Add(time.Hour), "user:2", ""); err != nil {
 			return err
 		}
-		return tx.SetCooldown(f.ctx, "e1", "old.com", now.Add(-time.Hour), "user:2", "")
+		return nil
 	}))
+	_, err := f.s.w.ExecContext(f.ctx, `INSERT INTO fetch_cooldowns (egress_key, site, until, level, manual, set_by)
+		VALUES ('e1', 'old.com', ?, 0, 1, 'user:2')`, toMS(now.Add(-time.Hour)))
+	require.NoError(t, err)
+	for _, c := range []struct {
+		e, s string
+		u    time.Time
+	}{{"", "a.com", now.Add(time.Hour)}, {"e1", "", now.Add(time.Hour)},
+		{"e1", "a.com", now}, {"e1", "a.com", now.Add(-time.Hour)}} {
+		err := f.s.InTx(f.ctx, func(tx *Tx) error { return tx.SetCooldown(f.ctx, c.e, c.s, c.u, "u", "") })
+		assert.ErrorIs(t, err, ErrInvalid)
+	}
 	cs, err := f.s.FetchCooldowns(f.ctx, now)
 	require.NoError(t, err)
 	require.Len(t, cs, 2, "active only")
@@ -341,4 +351,71 @@ func TestClearCooldown(t *testing.T) {
 	cs, _ = f.s.FetchCooldowns(f.ctx, now)
 	require.Len(t, cs, 1)
 	assert.Equal(t, "b.com", cs[0].Site)
+}
+
+func TestRateLimitedBurstEscalatesOnce(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	d := f.downloader(api.SandboxFull, "e1", f.pubID)
+	f.fetchingJobLease(d, "example.com")
+	f.fetchingJobLease(d, "example.com")
+	f.clk.Advance(10 * time.Second)
+	f.fetchingJobLease(d, "example.com")
+	c, ok := f.cooldown("e1", "example.com")
+	require.True(t, ok)
+	assert.Equal(t, 1, c.Level)
+	assert.Equal(t, f.clk.Now().Add(5*time.Minute-10*time.Second), c.Until)
+
+	// Past the burst window a further refusal escalates.
+	f.clk.Advance(time.Minute)
+	f.fetchingJobLease(d, "example.com")
+	c, _ = f.cooldown("e1", "example.com")
+	assert.Equal(t, 2, c.Level)
+	assert.Equal(t, f.clk.Now().Add(10*time.Minute), c.Until)
+}
+
+func TestFailStrandedRateLimitWaitFromFirstRefusal(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	d := f.downloader(api.SandboxFull, "e1", f.pubID)
+	j := f.urlJob(f.pubID, "example.com")
+	limit := 24 * time.Hour
+	// Paced for longer than the limit, then refused once: not stranded.
+	f.clk.Advance(2 * limit)
+	f.rateLimit(d)
+	out, err := f.s.FailStranded(f.ctx, limit)
+	require.NoError(t, err)
+	assert.Empty(t, out)
+	f.clk.Advance(limit)
+	out, err = f.s.FailStranded(f.ctx, limit)
+	require.NoError(t, err)
+	require.Len(t, out, 1)
+	assert.Equal(t, j.ID, out[0].JobID)
+
+	// A refusal from an earlier retry does not count.
+	g := f.urlJob(f.pubID, "other.com")
+	f.rateLimit(d)
+	_, err = f.s.w.ExecContext(f.ctx, `UPDATE jobs SET retries = retries + 1 WHERE id = ?`, g.ID)
+	require.NoError(t, err)
+	f.clk.Advance(2 * limit)
+	out, err = f.s.FailStranded(f.ctx, limit)
+	require.NoError(t, err)
+	assert.Empty(t, out)
+}
+
+func TestRateLimitedOnFailingJobCancelsTaskSetsCooldown(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	d := f.downloader(api.SandboxFull, "e1", f.pubID)
+	f.fetchingJob(f.pubID, "j1")
+	_, err := f.s.w.ExecContext(f.ctx, `INSERT INTO tasks (job_id, seq, kind, cost, state) VALUES ('j1', 0, 'prepare', 1, 'failed')`)
+	require.NoError(t, err)
+	lid := f.fetchLease("j1", d)
+	end, err := f.s.FailStage(f.ctx, lid, d, "429", true, api.StageRateLimited)
+	require.NoError(t, err)
+	assert.False(t, end.Requeued)
+	state, _ := f.task("j1", FetchSeq)
+	assert.Equal(t, string(taskCancelled), state)
+	_, ok := f.cooldown("e1", "x")
+	assert.True(t, ok)
 }
