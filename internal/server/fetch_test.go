@@ -484,6 +484,15 @@ func TestFetchSubmitURLNotLoggedOrAudited(t *testing.T) {
 	require.Equal(t, http.StatusCreated, resp.StatusCode, string(b))
 	var job api.Job
 	require.NoError(t, json.Unmarshal(b, &job))
+	// With no source given, the source defaults to the URL: that must not
+	// reach the logs, metrics or audit either.
+	const token2 = "hushhush"
+	bareURL := "https://media.example.com/bare-clip.wav?token=" + token2
+	resp, b = h.fetchCall(client, "public", api.FetchRequest{JobParams: api.JobParams{Model: "small.en"}, URL: bareURL}, "")
+	require.Equal(t, http.StatusCreated, resp.StatusCode, string(b))
+	var bare api.Job
+	require.NoError(t, json.Unmarshal(b, &bare))
+	assert.Equal(t, bareURL, bare.Source, "the submitter sees the defaulted source")
 	// Bad submissions must not echo it into logs either.
 	h.fetchCall(client, "public", api.FetchRequest{JobParams: api.JobParams{Model: "nope"}, URL: secretURL}, "")
 	h.fetchCall(client, "public", api.FetchRequest{JobParams: api.JobParams{Model: "small.en"},
@@ -507,7 +516,7 @@ func TestFetchSubmitURLNotLoggedOrAudited(t *testing.T) {
 	h.srv.refreshStats(h.ctx)
 
 	logs := string(h.logs.Bytes())
-	for _, leak := range []string{token, "media.example.com", "my talk.wav", "my%20talk"} {
+	for _, leak := range []string{token, "media.example.com", "my talk.wav", "my%20talk", token2, "bare-clip"} {
 		assert.NotContains(t, logs, leak)
 		assert.NotContains(t, h.metricsText(), leak)
 	}
@@ -520,6 +529,8 @@ func TestFetchSubmitURLNotLoggedOrAudited(t *testing.T) {
 	var found bool
 	for _, e := range es {
 		assert.NotContains(t, e.Detail, token, e.Action)
+		assert.NotContains(t, e.Detail, token2, e.Action)
+		assert.NotContains(t, e.Detail, "bare-clip", e.Action)
 		assert.NotContains(t, e.Detail, "media.example.com", e.Action)
 		if e.Action == "job.create" {
 			found = true
@@ -579,33 +590,6 @@ func TestFetchLeaseEndOutcomesCounted(t *testing.T) {
 	h.clk.Advance(time.Hour)
 	h.srv.reapOnce(h.ctx)
 	assert.Contains(t, h.metricsText(), `whisper_fetch_total{site="other",outcome="expired"} 1`)
-}
-
-func TestNotMediaAllowsKnownMedia(t *testing.T) {
-	t.Parallel()
-	pad := func(b []byte) []byte { return append(b, bytes.Repeat([]byte("plain text "), 40)...) }
-	for name, head := range map[string][]byte{
-		"mpeg layer I": pad([]byte{0xFF, 0xFE, 0x90, 0x00}), // FF FE also reads as a UTF-16 BOM
-		"mp3 frame":    pad([]byte{0xFF, 0xFB, 0x90, 0x00}),
-		"id3":          pad([]byte("ID3\x04\x00")),
-		"ogg":          pad([]byte("OggS\x00")),
-		"mp4":          pad([]byte("\x00\x00\x00\x20ftypisom")),
-		"webm":         pad([]byte{0x1A, 0x45, 0xDF, 0xA3}),
-		"wav":          canonicalWAV(speech(0.01, media.SampleRate)),
-		"flac":         pad([]byte("fLaC")),
-	} {
-		_, bad := notMedia(head)
-		assert.False(t, bad, name)
-	}
-	for name, head := range map[string][]byte{
-		"html": []byte("<!doctype html><html></html>"),
-		"json": []byte(`  {"a":1}`),
-		"xml":  []byte(`<?xml version="1.0"?><a/>`),
-		"text": []byte("Too many requests, slow down"),
-	} {
-		_, bad := notMedia(head)
-		assert.True(t, bad, name)
-	}
 }
 
 // TestPacingTimerGenerations: a timer that fires after it was replaced

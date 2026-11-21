@@ -356,3 +356,20 @@ const undo0012 = `
 	ALTER TABLE jobs DROP COLUMN fetch_url;
 	ALTER TABLE jobs DROP COLUMN fetch_site;
 `
+
+// TestRestoreForeignKeys: enforcement comes back on, and a connection on
+// which it cannot is reported (and discarded) rather than reused silently.
+func TestRestoreForeignKeys(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	conn, err := f.s.w.Conn(f.ctx)
+	require.NoError(t, err)
+	_, err = conn.ExecContext(f.ctx, "PRAGMA foreign_keys=OFF")
+	require.NoError(t, err)
+	require.NoError(t, restoreForeignKeys(conn))
+	var on int
+	require.NoError(t, conn.QueryRowContext(f.ctx, "PRAGMA foreign_keys").Scan(&on))
+	assert.Equal(t, 1, on)
+	require.NoError(t, conn.Close())
+	assert.ErrorContains(t, restoreForeignKeys(conn), "connection discarded")
+}

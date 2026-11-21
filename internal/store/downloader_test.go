@@ -189,7 +189,8 @@ func TestRejectLastDownloaderFailsFetchingJobs(t *testing.T) {
 	f.fetchingJob(f.pubID, "j2")
 	var ids []string
 	require.NoError(t, f.s.InTx(f.ctx, func(tx *Tx) (err error) {
-		ids, err = tx.FailOrphanedFetchJobs(f.ctx, f.pubID, api.SandboxFull)
+		o, err := tx.failOrphanedFetchJobs(f.ctx, f.pubID, api.SandboxFull)
+		ids = o.Jobs
 		return
 	}))
 	assert.Equal(t, []string{"j2"}, ids)

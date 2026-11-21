@@ -335,7 +335,9 @@ type Deps struct {
 	UI func(*Server) http.Handler
 	// AfterFunc schedules f after d (time.AfterFunc) and returns its stop
 	// function; it drives the fetch pacing wake-up. Tests pass a fake
-	// clock's.
+	// clock's. f must run asynchronously, on its own goroutine, never
+	// inside the AfterFunc call or the stop call: the pacing timer calls
+	// both while holding its lock, and f takes that lock.
 	AfterFunc func(d time.Duration, f func()) (stop func() bool)
 }
 

@@ -129,8 +129,7 @@ const processGrantSQL = `EXISTS (SELECT 1 FROM grants g WHERE g.principal = ? AN
 // leased), so it is 0 for a pending task with none.
 func failedHereFor(worker string) string {
 	return `(t.attempts > 0 AND EXISTS (SELECT 1 FROM leases x WHERE x.job_id = t.job_id AND x.seq = t.seq
-	AND x.worker_id = ` + worker + ` AND x.outcome IN ('failed','expired') AND x.stage IS NOT 'pre-work'
-	AND x.stage IS NOT 'rate_limited' AND x.retry = j.retries))`
+	AND x.worker_id = ` + worker + ` AND ` + countedStageSQL("x") + ` AND x.retry = j.retries))`
 }
 
 // claimant is what Claim reads about the claiming worker in its
@@ -357,7 +356,7 @@ func (s *Store) loadLease(ctx context.Context, q querier, id string) (*Lease, er
 		return nil, err
 	}
 	if l.Kind == api.KindFetch {
-		l.MaxBytes = fetchMaxBytes(queueMax, s.cfg.FetchMaxBytes)
+		l.MaxBytes = ByteCap(queueMax, s.cfg.FetchMaxBytes)
 	}
 	l.CreatedAt = fromMS(created)
 	l.ExpiresAt = fromMS(expires)

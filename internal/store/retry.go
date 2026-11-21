@@ -60,8 +60,7 @@ func (s *Store) FailStranded(ctx context.Context, limit time.Duration) ([]Strand
 			COALESCE(j.fetch_site, ''), `+rateLimitedSQL+` FROM tasks t JOIN jobs j ON j.id = t.job_id
 			WHERE t.state = 'pending' AND (`+rateLimitedSQL+` OR t.attempts > 0
 			AND (SELECT MAX(x.ended_at) FROM leases x WHERE x.job_id = t.job_id AND x.seq = t.seq
-				AND x.outcome IN ('failed','expired') AND x.stage IS NOT 'pre-work' AND x.stage IS NOT 'rate_limited'
-				AND x.retry = j.retries) <= ?
+				AND `+countedStageSQL("x")+` AND x.retry = j.retries) <= ?
 			AND NOT EXISTS (SELECT 1 FROM leases y WHERE y.job_id = t.job_id AND y.seq = t.seq
 				AND (y.ended_at IS NULL OR y.ended_at > ?)))
 			ORDER BY t.job_id, t.seq`, cutoff, cutoff, cutoff, cutoff)

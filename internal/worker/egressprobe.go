@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/deweysasser/whisper-network/internal/egress"
+	"github.com/deweysasser/whisper-network/internal/obs"
 )
 
 const (
@@ -70,7 +71,7 @@ func (w *Worker) startEgress(ctx context.Context) (func(), error) {
 		w.log.Warn().Msg("--allow-private-egress: this downloader may reach loopback, private and link-local " +
 			"addresses; fetch URLs can then probe the local network")
 	}
-	w.log.Info().Uint16("proxy_port", p.Port()).Msg("egress proxy started")
+	w.log.Info().Uint16(obs.FieldProxyPort, p.Port()).Msg("egress proxy started")
 	return func() { _ = p.Close() }, nil
 }
 
@@ -105,7 +106,7 @@ func (w *Worker) initialEgressIP(ctx context.Context) string {
 	}
 	ip, err := w.probeEgressIP(ctx)
 	if err != nil {
-		w.log.Warn().Str("error_class", errClass(err)).Msg("egress probe failed; egress IP unknown")
+		w.log.Warn().Str(obs.FieldErrorClass, errClass(err)).Msg("egress probe failed; egress IP unknown")
 		return ""
 	}
 	return ip
@@ -210,7 +211,7 @@ func (w *Worker) runEgressProbe(ctx context.Context) {
 		ip, err := w.probeEgressIP(ctx)
 		if err != nil {
 			if ctx.Err() == nil {
-				w.log.Warn().Str("error_class", errClass(err)).Msg("egress probe failed; keeping the last known IP")
+				w.log.Warn().Str(obs.FieldErrorClass, errClass(err)).Msg("egress probe failed; keeping the last known IP")
 			}
 			continue
 		}

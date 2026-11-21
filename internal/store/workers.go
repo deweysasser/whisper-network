@@ -195,8 +195,9 @@ func (s *Store) ListWorkers(ctx context.Context) ([]Worker, error) {
 }
 
 // UpdateWorkerFacts replaces a worker's reported facts. The worker kind is
-// fixed at registration: facts naming another kind are ErrConflict. Callers
-// that must report the fetching jobs this can fail use Tx.UpdateWorkerFacts.
+// fixed at registration: facts naming another kind are ErrConflict. It is a
+// convenience for tests and tools: it drops the fetching jobs the change can
+// fail, which the server reports through Tx.UpdateWorkerFacts.
 func (s *Store) UpdateWorkerFacts(ctx context.Context, id string, facts api.WorkerFacts) error {
 	return s.InTx(ctx, func(tx *Tx) error { _, err := tx.UpdateWorkerFacts(ctx, id, facts); return err })
 }
@@ -272,16 +273,15 @@ func canTransition(from, to api.WorkerState) bool {
 // reason, and making the worker active (resume, approval) also clears its
 // failure streak. Rejecting a worker cancels its live leases, whose tasks
 // return to pending without consuming an attempt; their ids are returned.
+//
+// It is a convenience for tests and tools: it does not report the fetching
+// jobs a rejection fails for want of a downloader. The server changes state
+// through Tx.ChangeWorkerState, which does.
 func (s *Store) SetWorkerState(ctx context.Context, id string, state api.WorkerState, decidedBy string) (cancelled []string, err error) {
-	return inTx1(ctx, s, func(tx *Tx) ([]string, error) { return tx.SetWorkerState(ctx, id, state, decidedBy) })
-}
-
-// SetWorkerState is Store.SetWorkerState inside the transaction. It returns
-// only the worker's own cancelled leases; ChangeWorkerState also reports the
-// fetching jobs failed because rejecting the worker orphaned them.
-func (t *Tx) SetWorkerState(ctx context.Context, id string, state api.WorkerState, decidedBy string) ([]string, error) {
-	c, err := t.ChangeWorkerState(ctx, id, state, decidedBy)
-	return c.Cancelled, err
+	return inTx1(ctx, s, func(tx *Tx) ([]string, error) {
+		c, err := tx.ChangeWorkerState(ctx, id, state, decidedBy)
+		return c.Cancelled, err
+	})
 }
 
 // WorkerStateChange is the effect of a worker state change.

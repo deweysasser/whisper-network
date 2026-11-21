@@ -50,16 +50,15 @@ func addGrant(ctx context.Context, tx *sql.Tx, principal string, role api.Role, 
 // access to a queue's media takes effect at once rather than when the
 // running task ends. The cancelled leases' ids are returned; the caller
 // should wake waiting claims if there are any.
+//
+// It is a convenience for tests and tools: it does not report the fetching
+// jobs the revocation fails for want of a downloader. The server revokes
+// through Tx.RevokeGrant, which does.
 func (s *Store) RemoveGrant(ctx context.Context, principal string, role api.Role, scope string) ([]string, error) {
-	return inTx1(ctx, s, func(tx *Tx) ([]string, error) { return tx.RemoveGrant(ctx, principal, role, scope) })
-}
-
-// RemoveGrant is Store.RemoveGrant inside the transaction. It returns only
-// the revoked worker's own cancelled leases; RevokeGrant also reports the
-// fetching jobs failed because the revocation orphaned them.
-func (t *Tx) RemoveGrant(ctx context.Context, principal string, role api.Role, scope string) ([]string, error) {
-	r, err := t.RevokeGrant(ctx, principal, role, scope)
-	return r.Cancelled, err
+	return inTx1(ctx, s, func(tx *Tx) ([]string, error) {
+		r, err := tx.RevokeGrant(ctx, principal, role, scope)
+		return r.Cancelled, err
+	})
 }
 
 // Revocation is the effect of removing a grant.

@@ -428,7 +428,7 @@ func (u *fetchUpload) startLocked() {
 func (u *fetchUpload) finish(prodErr error) (int64, error) {
 	defer u.stopAbort()
 	u.mu.Lock()
-	started, n := u.started, u.n
+	started := u.started
 	u.finishing = true
 	u.mu.Unlock()
 	if !started {

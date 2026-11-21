@@ -115,7 +115,8 @@ func TestE2ENoDownloader409(t *testing.T) {
 }
 
 // TestE2EPacingTwoJobsOneGroup: with a 1/3s rule on the site, two jobs
-// through one egress group fetch at least 3 s apart.
+// through one egress group start fetching at least 3 s apart (server-side
+// lease creation times).
 func TestE2EPacingTwoJobsOneGroup(t *testing.T) {
 	t.Parallel()
 	e := fetchEnv(t)
@@ -127,22 +128,20 @@ func TestE2EPacingTwoJobsOneGroup(t *testing.T) {
 	j1 := submitURL(t, sub, "http://127.0.0.1:1/one")
 	j2 := submitURL(t, sub, "http://127.0.0.1:1/two")
 
-	// Wall-clock first sighting of each fetch lease (server log times have
-	// one-second resolution).
-	seen := map[string]time.Time{}
+	// The server's own lease creation times (millisecond resolution), not
+	// when the test happened to see the leases.
+	var created []time.Time
 	e.Eventually(func() bool {
-		for _, j := range []*api.Job{j1, j2} {
-			if _, ok := seen[j.ID]; !ok && len(fetchLeases(t, e, j.ID)) > 0 {
-				seen[j.ID] = time.Now()
-			}
-		}
-		return len(seen) == 2
+		return len(fetchLeases(t, e, j1.ID)) > 0 && len(fetchLeases(t, e, j2.ID)) > 0
 	}, "both fetches never leased")
-	first, second := seen[j1.ID], seen[j2.ID]
-	if second.Before(first) {
-		first, second = second, first
+	for _, j := range []*api.Job{j1, j2} {
+		ev := fetchLeases(t, e, j.ID)[0]
+		l, err := e.Server().Store().Lease(context.Background(), ev[obs.FieldLeaseID].(string), ev[obs.FieldWorkerID].(string))
+		require.NoError(t, err)
+		created = append(created, l.CreatedAt)
 	}
-	assert.GreaterOrEqual(t, second.Sub(first), 3*time.Second-200*time.Millisecond)
+	gap := created[1].Sub(created[0]).Abs()
+	assert.GreaterOrEqual(t, gap, 3*time.Second, "the 1/3s rule spaces the two fetch starts")
 	e.WaitJob(j1.ID, api.JobDone)
 	e.WaitJob(j2.ID, api.JobDone)
 }

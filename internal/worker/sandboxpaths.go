@@ -24,15 +24,15 @@ var childSystemFiles = []string{"/proc/cpuinfo", "/sys/devices/system/cpu", "/de
 // work) or lies under the home directory is refused, as is a state
 // directory under any read-only path.
 func toolReadOnly(tool, stateDir, home string) ([]string, error) {
-	real, err := filepath.EvalSymlinks(tool)
+	resolved, err := filepath.EvalSymlinks(tool)
 	if err != nil {
 		return nil, fmt.Errorf("resolving %s: %w", tool, err)
 	}
-	ro := []string{real}
-	if tool != real {
+	ro := []string{resolved}
+	if tool != resolved {
 		ro = append(ro, tool)
 	}
-	dir := filepath.Dir(real)
+	dir := filepath.Dir(resolved)
 	if !underAny(dir, systemReadOnly) {
 		home = canonical(home)
 		switch {
@@ -114,8 +114,8 @@ func ytdlpReadOnly(ytdlp, stateDir, home string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	real := ro[0]
-	if root := filepath.Dir(filepath.Dir(real)); root != "/" {
+	resolved := ro[0]
+	if root := filepath.Dir(filepath.Dir(resolved)); root != "/" {
 		if _, err := os.Stat(filepath.Join(root, "pyvenv.cfg")); err == nil {
 			if h := canonical(home); h != "" && h != "/" && within(root, h) {
 				return nil, fmt.Errorf("%s: the sandbox grants read access to its virtualenv %s, which is under the home directory %s; install it in a dedicated directory such as /opt/yt-dlp", ytdlp, root, h)
@@ -123,7 +123,7 @@ func ytdlpReadOnly(ytdlp, stateDir, home string) ([]string, error) {
 			ro = append(ro, root)
 		}
 	}
-	if interp := shebang(real); interp != "" && filepath.IsAbs(interp) {
+	if interp := shebang(resolved); interp != "" && filepath.IsAbs(interp) {
 		if r, err := filepath.EvalSymlinks(interp); err == nil && !underAny(r, systemReadOnly) && !underAny(r, ro) {
 			iro, err := toolReadOnly(interp, stateDir, home)
 			if err != nil {

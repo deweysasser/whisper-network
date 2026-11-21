@@ -1,12 +1,12 @@
 package worker
 
 import (
-	"bytes"
 	"errors"
 	"io"
 	"mime"
-	"net/http"
 	"strings"
+
+	"github.com/deweysasser/whisper-network/internal/media"
 )
 
 // sniffLen is what http.DetectContentType looks at.
@@ -31,11 +31,8 @@ type mediaGuard struct {
 }
 
 // newMediaGuard returns a reader of r's bytes that fails with errNotMedia
-// before passing any if the first 512 (or all, if fewer) sniff as HTML,
-// XML, JSON or text: http.DetectContentType reports text/*,
-// application/json, application/xml or application/xhtml+xml, or the first
-// non-whitespace byte is '<' or '{'. Known audio and video signatures pass
-// whatever the sniffer says, as on the server.
+// before passing any if the first 512 (or all, if fewer) are not media by
+// media.NotMedia, the check the server repeats on receipt.
 func newMediaGuard(r io.Reader) io.Reader { return &mediaGuard{r: r} }
 
 func (g *mediaGuard) Read(p []byte) (int, error) {
@@ -54,7 +51,7 @@ func (g *mediaGuard) Read(p []byte) (int, error) {
 			g.err = err
 			return 0, err
 		}
-		if kind, bad := notMediaHead(g.head); bad {
+		if kind, bad := media.NotMedia(g.head); bad {
 			g.err = errNotMedia{kind: kind}
 			return 0, g.err
 		}
@@ -71,26 +68,9 @@ type eofReader struct{}
 
 func (eofReader) Read([]byte) (int, error) { return 0, io.EOF }
 
-// notMediaHead reports whether head, the start of a fetched body, is not
-// media, and what it is instead.
-func notMediaHead(head []byte) (string, bool) {
-	if len(head) == 0 || knownMediaHead(head) {
-		return "", false
-	}
-	switch t := bytes.TrimLeft(head, " \t\r\n\f"); {
-	case len(t) > 0 && t[0] == '<':
-		return "markup", true
-	case len(t) > 0 && t[0] == '{':
-		return "json", true
-	}
-	if mt, bad := notMediaType(http.DetectContentType(head)); bad {
-		return mt, true
-	}
-	return "", false
-}
-
-// notMediaType reports whether a Content-Type (sniffed or sent) names a
-// page or document rather than media, and its media type.
+// notMediaType reports whether the Content-Type a server sent names a page
+// or document rather than media, and its media type. (The sniffed bytes are
+// media.NotMedia's.)
 func notMediaType(ct string) (string, bool) {
 	mt, _, err := mime.ParseMediaType(ct)
 	if err != nil {
@@ -104,22 +84,6 @@ func notMediaType(ct string) (string, bool) {
 		return mt, true
 	}
 	return mt, false
-}
-
-// knownMediaHead reports whether head starts with the signature of a
-// common audio or video container (the server's knownMedia).
-func knownMediaHead(head []byte) bool {
-	switch {
-	case len(head) >= 12 && string(head[:4]) == "RIFF" && string(head[8:12]) == "WAVE",
-		bytes.HasPrefix(head, []byte("fLaC")),
-		bytes.HasPrefix(head, []byte("OggS")),
-		bytes.HasPrefix(head, []byte("ID3")),
-		bytes.HasPrefix(head, []byte{0x1A, 0x45, 0xDF, 0xA3}),     // EBML: Matroska, WebM
-		len(head) >= 8 && string(head[4:8]) == "ftyp",             // ISO BMFF: MP4, M4A
-		len(head) >= 2 && head[0] == 0xFF && head[1]&0xE0 == 0xE0: // MPEG audio frame sync, ADTS
-		return true
-	}
-	return false
 }
 
 // capReader fails with errTooLarge once more than max bytes have passed.

@@ -28,6 +28,7 @@ func TestFetchPolicyAPIAdminOnly(t *testing.T) {
 		body         any
 	}{
 		{"GET", "/admin/fetch-policies", nil},
+		{"GET", "/admin/fetch-policies/youtube.com", nil},
 		{"PUT", "/admin/fetch-policies/example.com", goodPolicy()},
 		{"DELETE", "/admin/fetch-policies/example.com", nil},
 		{"GET", "/admin/fetch-cooldowns", nil},
@@ -72,7 +73,7 @@ func TestFetchPolicyRoundTrip(t *testing.T) {
 	assert.Equal(t, "*", seeded[0].Key)
 	assert.Equal(t, "youtube.com", seeded[1].Key)
 	assert.Equal(t, []string{"1/3m"}, seeded[1].Rules)
-	assert.Equal(t, "12h0m0s", seeded[1].BackoffInitial)
+	assert.Equal(t, "12h", seeded[1].BackoffInitial, "durations in compact form")
 
 	// The path key wins; site and egress derive from it.
 	mark := h.auditMark()
@@ -81,14 +82,29 @@ func TestFetchPolicyRoundTrip(t *testing.T) {
 	assert.Equal(t, "example.com", got.Site)
 	assert.Equal(t, "label:home", got.EgressKey)
 	assert.NotEmpty(t, got.UpdatedBy)
+	assert.Equal(t, "10m", got.BackoffInitial)
 	e := h.expectOneAudit(mark, "fetch_policy.put", later, "fetch_policy:example.com@label:home")
 	assert.Contains(t, e.Detail, `"concurrency":3`)
+	assert.Contains(t, e.Detail, `"backoff_cap":"2h"`)
 	assert.NotContains(t, e.Detail, "http")
 
+	// The echo is the stored policy, not the request: a client's invalid
+	// flag is not repeated, durations come back compact.
 	p := goodPolicy()
 	p.Concurrency = 5
+	p.BackoffInitial = "600s"
+	p.Invalid, p.InvalidReason = true, "client says so"
 	h.expect("PUT", "/admin/fetch-policies/example.com@label:home", h.admin, p, http.StatusOK, &got)
 	assert.Equal(t, 5, got.Concurrency)
+	assert.Equal(t, "10m", got.BackoffInitial)
+	assert.False(t, got.Invalid)
+	assert.Empty(t, got.InvalidReason)
+
+	var one api.FetchPolicy
+	h.expect("GET", "/admin/fetch-policies/example.com@label:home", h.admin, nil, http.StatusOK, &one)
+	assert.Equal(t, got, one, "GET of one key is the PUT's echo")
+	resp, b := h.call("GET", "/admin/fetch-policies/nosuch.example", h.admin, nil)
+	h.expectProblem(resp, b, http.StatusNotFound, api.ProblemNotFound)
 
 	var ps []api.FetchPolicy
 	h.expect("GET", "/admin/fetch-policies", h.admin, nil, 200, &ps)
@@ -102,8 +118,37 @@ func TestFetchPolicyRoundTrip(t *testing.T) {
 	mark = h.auditMark()
 	h.expect("DELETE", "/admin/fetch-policies/example.com@label:home", h.admin, nil, http.StatusNoContent, nil)
 	h.expectOneAudit(mark, "fetch_policy.delete", later, "fetch_policy:example.com@label:home")
-	resp, b := h.call("DELETE", "/admin/fetch-policies/example.com@label:home", h.admin, nil)
+	resp, b = h.call("DELETE", "/admin/fetch-policies/example.com@label:home", h.admin, nil)
 	h.expectProblem(resp, b, http.StatusNotFound, api.ProblemNotFound)
+}
+
+// TestGetInvalidFetchPolicy: an invalid stored row reads back raw, with why.
+func TestGetInvalidFetchPolicy(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.corruptPolicy("youtube.com", `rules = '["nonsense"]'`)
+	var got api.FetchPolicy
+	h.expect("GET", "/admin/fetch-policies/youtube.com", h.admin, nil, http.StatusOK, &got)
+	assert.True(t, got.Invalid)
+	assert.NotEmpty(t, got.InvalidReason)
+	assert.Equal(t, []string{"nonsense"}, got.Rules)
+}
+
+// TestSetCooldownEchoesStoredRow: a manual cooldown over an automatic one
+// keeps its level, and the response says so.
+func TestSetCooldownEchoesStoredRow(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.execDB(`INSERT INTO fetch_cooldowns (egress_key, site, until, level, manual, set_by, reason)
+		VALUES ('label:home', 'example.com', 1, 3, 0, 'system', 'rate limited')`)
+	var cd api.FetchCooldown
+	h.expect("POST", "/admin/fetch-cooldowns", h.admin, api.SetCooldownRequest{EgressKey: "label:home",
+		Site: "example.com", Duration: "1h", Reason: "blocked"}, http.StatusCreated, &cd)
+	assert.Equal(t, 3, cd.Level, "the stored level")
+	assert.True(t, cd.Manual)
+	assert.Equal(t, "blocked", cd.Reason)
+	assert.Equal(t, h.clk.Now().Add(time.Hour).Unix(), cd.Until.Unix())
+	assert.NotEmpty(t, cd.SetBy)
 }
 
 func TestPutSeededPolicies(t *testing.T) {
@@ -126,6 +171,16 @@ func (h *harness) corruptPolicy(key, set string) {
 	require.NoError(h.t, err)
 	defer db.Close()
 	_, err = db.Exec(`UPDATE fetch_policies SET `+set+` WHERE key = ?`, key)
+	require.NoError(h.t, err)
+}
+
+// execDB runs a statement on the server's database behind its back.
+func (h *harness) execDB(stmt string) {
+	h.t.Helper()
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(h.dir, "wn.db")+"?_pragma=busy_timeout(5000)")
+	require.NoError(h.t, err)
+	defer db.Close()
+	_, err = db.Exec(stmt)
 	require.NoError(h.t, err)
 }
 

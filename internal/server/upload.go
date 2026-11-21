@@ -231,14 +231,12 @@ func (s *Server) validateParams(p *api.JobParams) error {
 	return nil
 }
 
-// uploadLimit is the media size cap on q: the queue's override if it has
-// one, but never above the server's --max-upload-bytes, which bounds what a
-// queue administrator can make the server accept (and the disk reserve).
+// uploadLimit is the media size cap on q (store.ByteCap): the queue's
+// override if it has one, but never above the server's --max-upload-bytes,
+// which bounds what a queue administrator can make the server accept (and
+// the disk reserve).
 func (s *Server) uploadLimit(q *store.Queue) int64 {
-	if q.MaxUploadBytes > 0 {
-		return min(q.MaxUploadBytes, s.cfg.MaxUploadBytes)
-	}
-	return s.cfg.MaxUploadBytes
+	return store.ByteCap(q.MaxUploadBytes, s.cfg.MaxUploadBytes)
 }
 
 // receiveOriginal streams the media part to blobs/{job}/original, hashing

@@ -139,7 +139,10 @@ func (s *Store) endLease(ctx context.Context, tx *sql.Tx, l leaseRow, outcome ap
 	if outcome != api.OutcomeFailed || !stage.Valid() && stage != api.StageLoop ||
 		stage == api.StagePreWork && !s.preWorkRefund() ||
 		stage == api.StageRateLimited && l.Kind != api.KindFetch {
-		stage = "" // a pre-work failure then counts as an ordinary one
+		// Not a stage to honour: a pre-work failure then counts as an
+		// ordinary one, and so does a rate_limited report from anything
+		// but a fetch (only a site can rate-limit).
+		stage = ""
 	}
 	// A loop is the model's failure, not the worker's: it counts as an
 	// attempt but not toward the worker's breaker.
@@ -189,8 +192,10 @@ func (s *Store) endLease(ctx context.Context, tx *sql.Tx, l leaseRow, outcome ap
 		if err := reactivate(ctx, tx, l.QueueID, l.Weight); err != nil {
 			return nil, err
 		}
-		// A rate-limited task keeps its pending_since, so FailStranded
-		// measures the wait from when it first became pending.
+		// A rate-limited task keeps its pending_since, so the queue
+		// view shows how long it has waited since it first became
+		// pending. (FailStranded measures a rate-limited fetch's wait
+		// from its first rate-limited lease end, MIN(ended_at).)
 		pendingSince := sql.NullInt64{Int64: toMS(now), Valid: !rateLimited}
 		if _, err := tx.ExecContext(ctx, `UPDATE tasks SET state = 'pending', attempts = ?,
 			error = COALESCE(?, error), pending_since = COALESCE(?, pending_since)
@@ -248,11 +253,22 @@ func failedAttempts(kind api.TaskKind, seq int, workers []string) string {
 	return msg
 }
 
+// countedStageSQL is a condition (over the leases table, aliased as alias,
+// or unqualified for "") that a lease's end counts against its task: it
+// failed or expired, and not before work started (pre-work) or because the
+// site refused (rate_limited), which are refunded.
+func countedStageSQL(alias string) string {
+	if alias != "" {
+		alias += "."
+	}
+	return alias + `outcome IN ('failed','expired') AND ` + alias + `stage IS NOT 'pre-work' AND ` +
+		alias + `stage IS NOT 'rate_limited'`
+}
+
 // countedFailureSQL is a condition (over leases, unqualified) that a lease
-// counts as a failed attempt: it failed, other than before work started, or
-// expired, since the job was last retried (leases.retry, DESIGN.md §4.2).
-const countedFailureSQL = `outcome IN ('failed','expired') AND stage IS NOT 'pre-work' AND stage IS NOT 'rate_limited'
-	AND retry = (SELECT retries FROM jobs WHERE jobs.id = leases.job_id)`
+// counts as a failed attempt (countedStageSQL) since the job was last
+// retried (leases.retry, DESIGN.md §4.2).
+var countedFailureSQL = countedStageSQL("") + ` AND retry = (SELECT retries FROM jobs WHERE jobs.id = leases.job_id)`
 
 // failedOn returns the distinct workers that failed a task (not counting
 // pre-work failures) or let a lease on it expire, in the order of their first such lease. Their number is the

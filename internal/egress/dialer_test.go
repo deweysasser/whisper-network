@@ -79,7 +79,7 @@ func TestDialerRedirectToPrivateRefused(t *testing.T) {
 	d := &Dialer{Resolver: r, AllowPorts: []uint16{80, uint16(n)}}
 	cl := d.HTTPClient(2 * time.Second)
 	tr := cl.Transport.(*http.Transport)
-	real := tr.DialContext
+	filtered := tr.DialContext
 	tr.DialContext = func(ctx context.Context, n, addr string) (net.Conn, error) {
 		if strings.HasPrefix(addr, "pub.test:") {
 			ips, _ := r.LookupNetIP(ctx, "ip", "pub.test")
@@ -88,7 +88,7 @@ func TestDialerRedirectToPrivateRefused(t *testing.T) {
 			}
 			return net.Dial("tcp", srv.Listener.Addr().String())
 		}
-		return real(ctx, n, addr)
+		return filtered(ctx, n, addr)
 	}
 	_, err := cl.Get("http://pub.test:80/")
 	if !errors.Is(err, ErrRefused) {

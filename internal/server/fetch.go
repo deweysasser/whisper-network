@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -339,15 +338,17 @@ func (s *Server) closePacing() {
 
 // checkFetchPolicies meters the stored fetch policies that do not parse or
 // validate (each blocks what it governs) and logs their keys once per
-// change.
-func (s *Server) checkFetchPolicies(ctx context.Context) {
-	bad, err := s.st.InvalidFetchPolicies(ctx)
+// change. It returns the rows it read (nil if reading failed), for
+// fetchSiteLabels.
+func (s *Server) checkFetchPolicies(ctx context.Context) []store.FetchPolicyRow {
+	rows, err := s.st.FetchPolicyRows(ctx)
 	if err != nil {
 		if ctx.Err() == nil {
 			s.log.Warn().Err(err).Msg("checking fetch policies failed")
 		}
-		return
+		return nil
 	}
+	bad := store.InvalidFetchPolicyKeys(rows)
 	s.metrics.SetFetchInvalidPolicies(len(bad))
 	joined := strings.Join(bad, "\x00")
 	t := &s.pacing
@@ -359,25 +360,19 @@ func (s *Server) checkFetchPolicies(ctx context.Context) {
 		s.log.Warn().Strs(obs.FieldPolicyKeys, bad).
 			Msg("invalid fetch policies block the sites they govern; fix them on the fetch policies page")
 	}
+	return rows
 }
 
 // --- results and failures ---
 
-// fetchSiteLabels returns the metric label of a site: the site itself when
-// a fetch policy names it (so the label set is bounded by the policy table),
-// else "other". Sites are never URLs.
-func (s *Server) fetchSiteLabels(ctx context.Context) func(site string) string {
+// fetchSiteLabels returns the metric label of a site given the fetch policy
+// rows: the site itself when a policy row (valid or not) names it, so the
+// label set is bounded by the policy table, else "other". Sites are never
+// URLs.
+func fetchSiteLabels(rows []store.FetchPolicyRow) func(site string) string {
 	known := map[string]bool{}
-	if ps, err := s.st.FetchPolicies(ctx); err == nil {
-		for _, p := range ps {
-			known[p.Site] = true
-		}
-	}
-	if bad, err := s.st.InvalidFetchPolicies(ctx); err == nil {
-		for _, k := range bad {
-			site, _, _ := strings.Cut(k, "@")
-			known[site] = true
-		}
+	for _, r := range rows {
+		known[r.Site] = true
 	}
 	return func(site string) string {
 		if site != "*" && known[site] {
@@ -387,46 +382,10 @@ func (s *Server) fetchSiteLabels(ctx context.Context) func(site string) string {
 	}
 }
 
+// siteLabel is fetchSiteLabels of the stored policies for one site.
 func (s *Server) siteLabel(ctx context.Context, site string) string {
-	return s.fetchSiteLabels(ctx)(site)
-}
-
-// notMedia reports whether the leading bytes of a fetch result are a web
-// page or an API answer (HTML, XML, JSON, plain text) rather than media,
-// and what they look like. It mirrors the downloader's own guard.
-func notMedia(head []byte) (string, bool) {
-	if knownMedia(head) {
-		return "media", false
-	}
-	ct := media.Sniff(head)
-	mt, _, _ := strings.Cut(ct, ";")
-	mt = strings.TrimSpace(mt)
-	switch {
-	case strings.HasPrefix(mt, "text/"), mt == "application/json", mt == "application/xml",
-		mt == "application/xhtml+xml":
-		return mt, true
-	}
-	if t := bytes.TrimLeft(bytes.TrimPrefix(head, []byte("\xef\xbb\xbf")), " \t\r\n"); len(t) > 0 && (t[0] == '<' || t[0] == '{') {
-		return "markup or JSON", true
-	}
-	return mt, false
-}
-
-// knownMedia reports whether head starts with the signature of a common
-// audio or video container, which is media whatever a text sniffer makes of
-// it (MPEG audio frames, say, can look like text).
-func knownMedia(head []byte) bool {
-	switch {
-	case len(head) >= 12 && string(head[:4]) == "RIFF" && string(head[8:12]) == "WAVE",
-		bytes.HasPrefix(head, []byte("fLaC")),
-		bytes.HasPrefix(head, []byte("OggS")),
-		bytes.HasPrefix(head, []byte("ID3")),
-		bytes.HasPrefix(head, []byte{0x1A, 0x45, 0xDF, 0xA3}),     // EBML: Matroska, WebM
-		len(head) >= 8 && string(head[4:8]) == "ftyp",             // ISO BMFF: MP4, M4A
-		len(head) >= 2 && head[0] == 0xFF && head[1]&0xE0 == 0xE0: // MPEG audio frame sync, ADTS
-		return true
-	}
-	return false
+	rows, _ := s.st.FetchPolicyRows(ctx) // on error, everything is "other"
+	return fetchSiteLabels(rows)(site)
 }
 
 // fetchResult accepts a fetch lease's result: the fetched media, streamed
@@ -478,7 +437,7 @@ func (s *Server) fetchResult(w http.ResponseWriter, r *http.Request, p *Principa
 		return err
 	}
 	defer out.Abort()
-	if what, bad := notMedia(head); bad {
+	if what, bad := media.NotMedia(head); bad {
 		return s.rejectFetch(ctx, l, http.StatusUnprocessableEntity, api.ProblemNotMedia,
 			"the fetched content is "+what+", not media", "not_media")
 	}
@@ -555,14 +514,12 @@ func (s *Server) fetchResult(w http.ResponseWriter, r *http.Request, p *Principa
 	return nil
 }
 
-// fetchLimit is a fetch lease's byte cap: the store's (the queue's upload
-// cap, bounded by store.Config.FetchMaxBytes), never above the server's
-// --max-upload-bytes.
+// fetchLimit is a fetch lease's byte cap: the store's (store.ByteCap of the
+// queue's upload cap and store.Config.FetchMaxBytes, which is this server's
+// --max-upload-bytes), bounded again here by the same rule so that a store
+// configured without FetchMaxBytes cannot lift the server's cap.
 func (s *Server) fetchLimit(l *store.Lease) int64 {
-	if l.MaxBytes > 0 {
-		return min(l.MaxBytes, s.cfg.MaxUploadBytes)
-	}
-	return s.cfg.MaxUploadBytes
+	return store.ByteCap(l.MaxBytes, s.cfg.MaxUploadBytes)
 }
 
 // rejectFetch refuses a fetch result that is the input's fault (too large,
@@ -634,16 +591,13 @@ func (s *Server) fetchFailed(ctx context.Context, l *store.Lease, stage api.Fail
 		obs.Warn(&s.log, obs.EventFetchRateLimited).Str(obs.FieldLeaseID, l.ID).Str(obs.FieldJobID, l.JobID).
 			Str(obs.FieldWorkerID, l.WorkerID).Str(obs.FieldSite, l.Site).Str(obs.FieldEgressKey, l.EgressKey).
 			Msg("fetch rate limited")
-		cds, err := s.st.FetchCooldowns(ctx, s.now())
-		if err != nil {
-			s.log.Warn().Err(err).Msg("loading fetch cooldowns failed")
-		}
-		for _, c := range cds {
-			if c.EgressKey == l.EgressKey && c.Site == l.Site {
-				obs.Warn(&s.log, obs.EventFetchCooldown).Str(obs.FieldSite, c.Site).
-					Str(obs.FieldEgressKey, c.EgressKey).Time(obs.FieldUntil, c.Until).Int(obs.FieldCooldownLevel, c.Level).
-					Bool(obs.FieldManual, c.Manual).Msg("fetch cooldown")
-			}
+		switch c, err := s.st.FetchCooldown(ctx, l.EgressKey, l.Site); {
+		case err == nil && c.Until.After(s.now()):
+			obs.Warn(&s.log, obs.EventFetchCooldown).Str(obs.FieldSite, c.Site).
+				Str(obs.FieldEgressKey, c.EgressKey).Time(obs.FieldUntil, c.Until).Int(obs.FieldCooldownLevel, c.Level).
+				Bool(obs.FieldManual, c.Manual).Msg("fetch cooldown")
+		case err != nil && !errors.Is(err, store.ErrNotFound):
+			s.log.Warn().Err(err).Msg("loading the fetch cooldown failed")
 		}
 	}
 	s.metrics.FetchResult(s.siteLabel(ctx, l.Site), outcome)

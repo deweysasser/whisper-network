@@ -61,6 +61,7 @@ func (s *Server) routes() http.Handler {
 	mux.Handle("POST /admin/grants", s.authed(anyHuman, s.handleAdminGrant))
 	mux.Handle("DELETE /admin/grants", s.authed(anyHuman, s.handleAdminRevoke))
 	mux.Handle("GET /admin/fetch-policies", s.authed(anyHuman, s.handleAdminListFetchPolicies))
+	mux.Handle("GET /admin/fetch-policies/{key}", s.authed(anyHuman, s.handleAdminGetFetchPolicy))
 	mux.Handle("PUT /admin/fetch-policies/{key}", s.authed(anyHuman, s.handleAdminPutFetchPolicy))
 	mux.Handle("DELETE /admin/fetch-policies/{key}", s.authed(anyHuman, s.handleAdminDeleteFetchPolicy))
 	mux.Handle("GET /admin/fetch-cooldowns", s.authed(anyHuman, s.handleAdminListCooldowns))

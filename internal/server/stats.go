@@ -87,8 +87,7 @@ func (s *Server) refreshStats(ctx context.Context) {
 // fetchStats adds the fetch pacing gauges to snap, and re-checks the fetch
 // policies (whisper_fetch_invalid_policies).
 func (s *Server) fetchStats(ctx context.Context, snap *obs.Snapshot) {
-	s.checkFetchPolicies(ctx)
-	label := s.fetchSiteLabels(ctx)
+	label := fetchSiteLabels(s.checkFetchPolicies(ctx))
 	now := s.now()
 	bySite := func(m map[string]int) []obs.SiteCount {
 		agg := map[string]int{}

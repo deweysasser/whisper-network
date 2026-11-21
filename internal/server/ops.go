@@ -451,7 +451,8 @@ func (o *Ops) ApproveWorker(ctx context.Context, a Actor, workerID string, queue
 	}
 	role := workerRole(w.Kind)
 	err = o.change(ctx, a, func(tx *store.Tx, rec recorder) error {
-		if _, err := tx.SetWorkerState(ctx, workerID, api.WorkerActive, a.Name); err != nil {
+		// Becoming active orphans nothing; there is nothing to report.
+		if _, err := tx.ChangeWorkerState(ctx, workerID, api.WorkerActive, a.Name); err != nil {
 			return err
 		}
 		for _, sc := range scopes {
@@ -834,7 +835,7 @@ func fetchPolicyAudit(p fetchpolicy.Policy) map[string]any {
 		rules[i] = r.String()
 	}
 	d := map[string]any{"key": p.Key, "site": p.Site, "rules": rules, "concurrency": p.Concurrency,
-		"backoff_initial": p.BackoffInitial.String(), "backoff_cap": p.BackoffCap.String()}
+		"backoff_initial": fetchpolicy.CompactDuration(p.BackoffInitial), "backoff_cap": fetchpolicy.CompactDuration(p.BackoffCap)}
 	if p.EgressKey != "" {
 		d["egress"] = p.EgressKey
 	}
@@ -895,7 +896,7 @@ func (o *Ops) SetCooldown(ctx context.Context, a Actor, egress, site string, unt
 }
 
 // ClearCooldown ends the cooldown of (egress, site) (audited as
-// fetch_cooldown.clear); clearing one that is not set is not an error.
+// fetch_cooldown.clear); one that is not set is a 404, and not audited.
 func (o *Ops) ClearCooldown(ctx context.Context, a Actor, egress, site string) error {
 	err := o.change(ctx, a, func(tx *store.Tx, rec recorder) error {
 		if err := tx.ClearCooldown(ctx, egress, site); err != nil {

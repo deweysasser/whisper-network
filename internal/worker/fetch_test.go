@@ -164,9 +164,11 @@ func TestFetchChildCrashAbortsUpload(t *testing.T) {
 	f := h.failure(task)
 	assert.True(t, f.Retryable)
 	assert.Equal(t, api.StageInput, f.Stage)
-	got := h.srv.Task(task)
-	assert.Nil(t, got.Fetched, "the server never saw a complete body")
-	assert.Equal(t, 1, got.AbortedResults, "the PUT was aborted, not ended cleanly")
+	// The failure report can overtake the server's view of the aborted
+	// PUT: wait for it.
+	h.eventually(func() bool { return h.srv.Task(task).AbortedResults == 1 },
+		"the PUT was aborted, not ended cleanly")
+	assert.Nil(t, h.srv.Task(task).Fetched, "the server never saw a complete body")
 }
 
 func TestFetchTooLarge(t *testing.T) {

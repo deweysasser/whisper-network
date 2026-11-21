@@ -51,7 +51,9 @@ const (
 	ActViewWorker
 	// ActUpdateWorker updates a worker's facts. The worker itself only.
 	ActUpdateWorker
-	// ActGrantProcess grants a worker process on Resource.Queue.
+	// ActGrantProcess grants a worker its working role on Resource.Queue:
+	// process for a processing worker, fetch for a downloader (the same
+	// queue_admin right; see CanApproveWorker).
 	ActGrantProcess
 	// ActLeaseTask claims a task from Resource.Queue. Workers only.
 	ActLeaseTask

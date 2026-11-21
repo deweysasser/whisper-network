@@ -57,7 +57,7 @@ func (s *Server) retryJob(ctx context.Context, actor Actor, jobID string) error 
 	}
 	obs.Info(&s.log, obs.EventJobRetried).Str(obs.FieldJobID, jobID).Str(obs.FieldActor, actor.Name).
 		Str("state", string(r.State)).Int("tasks", r.Tasks).Int("retries", r.Retries).
-		Bool("refetch", r.Refetch).
+		Bool(obs.FieldRefetch, r.Refetch).
 		Str("previous_error", r.PreviousError).Msg("job retried")
 	return nil
 }

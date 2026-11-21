@@ -354,7 +354,8 @@ func ParseAuditFilter(q url.Values) (store.AuditFilter, error) {
 	return f, nil
 }
 
-// handleAdminListFetchPolicies lists the valid fetch policies in key order.
+// handleAdminListFetchPolicies lists every stored fetch policy in key order,
+// the invalid ones too (marked, with the reason, so they can be repaired).
 func (s *Server) handleAdminListFetchPolicies(w http.ResponseWriter, r *http.Request, p *Principal) error {
 	if !auth.Can(p.Principal, auth.ActManageFetchPolicy, auth.Resource{}) {
 		return s.deny(r, p, "admin required")
@@ -364,18 +365,39 @@ func (s *Server) handleAdminListFetchPolicies(w http.ResponseWriter, r *http.Req
 		return err
 	}
 	out := make([]api.FetchPolicy, len(rows))
-	for i, r := range rows {
-		rules := r.Rules
-		if rules == nil {
-			rules = []string{}
-		}
-		out[i] = api.FetchPolicy{Key: r.Key, Site: r.Site, EgressKey: r.EgressKey, Rules: rules,
-			Concurrency: r.Concurrency, BackoffInitial: (time.Duration(r.BackoffInitialS) * time.Second).String(),
-			BackoffCap: (time.Duration(r.BackoffCapS) * time.Second).String(),
-			UpdatedBy:  r.UpdatedBy, UpdatedAt: r.UpdatedAt, Invalid: r.Invalid != "", InvalidReason: r.Invalid}
+	for i, row := range rows {
+		out[i] = fetchPolicyAPI(row)
 	}
 	writeJSON(w, http.StatusOK, out)
 	return nil
+}
+
+// handleAdminGetFetchPolicy is GET /admin/fetch-policies/{key}: one stored
+// policy, valid or not.
+func (s *Server) handleAdminGetFetchPolicy(w http.ResponseWriter, r *http.Request, p *Principal) error {
+	if !auth.Can(p.Principal, auth.ActManageFetchPolicy, auth.Resource{}) {
+		return s.deny(r, p, "admin required")
+	}
+	row, err := s.st.FetchPolicyRow(r.Context(), r.PathValue("key"))
+	if err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusOK, fetchPolicyAPI(row))
+	return nil
+}
+
+// fetchPolicyAPI is the wire form of a stored fetch policy row, durations in
+// compact form ("10m").
+func fetchPolicyAPI(r store.FetchPolicyRow) api.FetchPolicy {
+	rules := r.Rules
+	if rules == nil {
+		rules = []string{}
+	}
+	return api.FetchPolicy{Key: r.Key, Site: r.Site, EgressKey: r.EgressKey, Rules: rules,
+		Concurrency:    r.Concurrency,
+		BackoffInitial: fetchpolicy.CompactDuration(time.Duration(r.BackoffInitialS) * time.Second),
+		BackoffCap:     fetchpolicy.CompactDuration(time.Duration(r.BackoffCapS) * time.Second),
+		UpdatedBy:      r.UpdatedBy, UpdatedAt: r.UpdatedAt, Invalid: r.Invalid != "", InvalidReason: r.Invalid}
 }
 
 // policyFromRequest builds the store policy for PUT /admin/fetch-policies/{key}.
@@ -440,19 +462,11 @@ func (s *Server) handleAdminPutFetchPolicy(w http.ResponseWriter, r *http.Reques
 		status = http.StatusCreated
 	}
 	// Echo the stored policy, with its editor and time.
-	metas, err := s.st.FetchPolicyMetas(r.Context())
+	row, err := s.st.FetchPolicyRow(r.Context(), key)
 	if err != nil {
 		return err
 	}
-	m := metas[key]
-	req.Key, req.Site, req.EgressKey = key, fp.Site, fp.EgressKey
-	req.Rules = make([]string, len(fp.Rules))
-	for i, ru := range fp.Rules {
-		req.Rules[i] = ru.String()
-	}
-	req.BackoffInitial, req.BackoffCap = fp.BackoffInitial.String(), fp.BackoffCap.String()
-	req.UpdatedBy, req.UpdatedAt = m.UpdatedBy, m.UpdatedAt
-	writeJSON(w, status, req)
+	writeJSON(w, status, fetchPolicyAPI(row))
 	return nil
 }
 
@@ -514,8 +528,12 @@ func (s *Server) handleAdminSetCooldown(w http.ResponseWriter, r *http.Request, 
 	if err := s.ops.SetCooldown(r.Context(), p.Actor(), req.EgressKey, req.Site, until, req.Reason); err != nil {
 		return err
 	}
-	writeJSON(w, http.StatusCreated, api.FetchCooldown{EgressKey: req.EgressKey, Site: req.Site, Until: until,
-		Manual: true, SetBy: p.Name, Reason: req.Reason})
+	// Echo the stored row: an automatic cooldown it replaced keeps its level.
+	cd, err := s.st.FetchCooldown(r.Context(), req.EgressKey, req.Site)
+	if err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusCreated, cd)
 	return nil
 }
 

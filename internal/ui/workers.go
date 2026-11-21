@@ -305,7 +305,7 @@ func (u *UI) workerDetailFor(ctx context.Context, rc *reqCtx, wk *store.Worker, 
 	}
 	var grantable []string
 	for _, q := range queues {
-		if rc.can(workerGrantAction(wk.Kind), auth.Resource{Queue: q}) {
+		if rc.can(auth.ActGrantProcess, auth.Resource{Queue: q}) {
 			grantable = append(grantable, q)
 		}
 	}
@@ -325,10 +325,6 @@ func (u *UI) workerDetailFor(ctx context.Context, rc *reqCtx, wk *store.Worker, 
 	v.CanDelete = mayDeleteWorker(rc, wk)
 	return v, nil
 }
-
-// workerGrantAction is the action that grants a worker its working role
-// (process or fetch; both are queue_admin acts, see auth.CanApproveWorker).
-func workerGrantAction(api.WorkerKind) auth.Action { return auth.ActGrantProcess }
 
 // mayDeleteWorker reports whether the principal may delete wk now: it is
 // rejected and the principal holds the right that rejects it.

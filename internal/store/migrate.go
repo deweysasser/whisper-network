@@ -2,7 +2,10 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"database/sql/driver"
 	"embed"
+	"errors"
 	"fmt"
 	"io/fs"
 	"sort"
@@ -105,6 +108,18 @@ func retryBusy(ctx context.Context, limit time.Duration, op func() error) error 
 	}
 }
 
+// restoreForeignKeys turns foreign key enforcement back on for conn. If
+// that fails, conn is marked bad so the pool discards it rather than hand
+// out a connection with enforcement off.
+func restoreForeignKeys(conn *sql.Conn) error {
+	_, err := conn.ExecContext(context.Background(), "PRAGMA foreign_keys=ON")
+	if err == nil {
+		return nil
+	}
+	_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+	return fmt.Errorf("restoring foreign_keys (connection discarded): %w", err)
+}
+
 // foreignKeysOffDirective, as the first line of a migration, runs it with
 // foreign key enforcement off, which SQLite's table rebuild procedure needs
 // (https://sqlite.org/lang_altertable.html, "Making Other Kinds Of Table
@@ -118,7 +133,7 @@ func (m migration) foreignKeysOff() bool {
 	return strings.TrimSpace(first) == foreignKeysOffDirective
 }
 
-func (s *Store) applyMigration(ctx context.Context, m migration, latest int) error {
+func (s *Store) applyMigration(ctx context.Context, m migration, latest int) (err error) {
 	conn, err := s.w.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("migration %s: conn: %w", m.name, err)
@@ -139,7 +154,9 @@ func (s *Store) applyMigration(ctx context.Context, m migration, latest int) err
 		defer func() {
 			// Use a fresh context: ctx may be cancelled, and a pooled
 			// connection must never go back with enforcement off.
-			_, _ = conn.ExecContext(context.Background(), "PRAGMA foreign_keys=ON")
+			if rerr := restoreForeignKeys(conn); rerr != nil {
+				err = errors.Join(err, fmt.Errorf("migration %s: %w", m.name, rerr))
+			}
 		}()
 	}
 	tx, err := conn.BeginTx(ctx, nil)

@@ -69,3 +69,13 @@ func TestCapReader(t *testing.T) {
 	require.NoError(t, err, "no overflow at the largest cap")
 	assert.Equal(t, "123456", string(got))
 }
+
+func TestMediaGuardRefusesUTF16Page(t *testing.T) {
+	page := []byte{0xFF, 0xFE}
+	for _, r := range "<!DOCTYPE html><html><body>sign in</body></html>" {
+		page = append(page, byte(r), 0)
+	}
+	_, err := io.ReadAll(newMediaGuard(bytes.NewReader(page)))
+	var nm errNotMedia
+	require.ErrorAs(t, err, &nm)
+}

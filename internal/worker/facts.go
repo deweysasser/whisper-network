@@ -271,8 +271,8 @@ func (w *Worker) probeDownloader(ctx context.Context) error {
 	if w.egressClient != nil {
 		w.facts.EgressIP = w.initialEgressIP(ctx)
 	}
-	w.log.Info().Str(obs.FieldHostname, hostname).Int("slots", slots).Str("yt_dlp_version", w.tools.ytdlpVersion).
-		Str("egress_group", w.cfg.EgressGroup).Bool("egress_ip_known", w.facts.EgressIP != "").
+	w.log.Info().Str(obs.FieldHostname, hostname).Int("slots", slots).Str(obs.FieldYtDlpVersion, w.tools.ytdlpVersion).
+		Str(obs.FieldEgressGroup, w.cfg.EgressGroup).Bool(obs.FieldEgressIPKnown, w.facts.EgressIP != "").
 		Msg("probed downloader")
 	return nil
 }
