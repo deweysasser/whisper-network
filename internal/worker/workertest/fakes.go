@@ -402,8 +402,12 @@ func fakeYtDlp(args []string) int {
 // checkCookies verifies the --cookies file is a cookies file inside the
 // work directory (the worker copies the operator's file there per run).
 func checkCookies(path string) int {
+	// Resolve symlinks on both sides: on macOS the temp dir is /var/...
+	// but Getwd reports /private/var/....
 	wd, _ := os.Getwd()
-	if filepath.Dir(path) != wd {
+	wd, _ = filepath.EvalSymlinks(wd)
+	dir, _ := filepath.EvalSymlinks(filepath.Dir(path))
+	if dir != wd {
 		fmt.Fprintf(os.Stderr, "fake yt-dlp: --cookies %s is not in the work directory %s\n", path, wd)
 		return 2
 	}
