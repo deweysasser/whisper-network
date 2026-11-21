@@ -87,9 +87,10 @@ func landlockABI() int {
 //
 // Under DenyNet every handled network right is denied: no rules. With
 // ConnectPorts the handled set is the same (so bind(2) stays refused) plus a
-// ConnectTCP rule per port. Below ABI 4 best effort drops those rules along
-// with the TCP rights, leaving TCP connects unrestricted; that is a warning,
-// and the downloader probe reports it.
+// ConnectTCP rule per port. Below ABI 4 Landlock cannot limit TCP, so the
+// seccomp filter fails closed and refuses every socket (see
+// seccompRulesFor): a warning, the child cannot reach the network at all,
+// and the downloader probe reports less than full.
 func restrictLandlock(spec Spec, exe string, abi int) ([]string, error) {
 	if !spec.Confines() {
 		return nil, nil
@@ -102,7 +103,7 @@ func restrictLandlock(spec Spec, exe string, abi int) ([]string, error) {
 		warnings = append(warnings, fmt.Sprintf("landlock ABI %d: signals and abstract sockets not scoped (needs 6; seccomp covers signals)", abi))
 	}
 	if len(spec.ConnectPorts) > 0 && abi < 4 {
-		warnings = append(warnings, fmt.Sprintf("landlock ABI %d: TCP connect not limited to ports %v (needs 4)", abi, spec.ConnectPorts))
+		warnings = append(warnings, fmt.Sprintf("landlock ABI %d cannot limit TCP connects to ports %v (needs 4): all sockets refused", abi, spec.ConnectPorts))
 	}
 
 	cfg := landlock.V11.BestEffort()

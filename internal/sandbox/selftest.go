@@ -23,6 +23,10 @@ const (
 	// connect to a port of [Spec.ConnectPorts]. Only [ProbeDownloader]
 	// runs it.
 	CheckTCPConnectAllowed = "tcp_connect_allowed"
+	// CheckTCPListen is listen(2) on an unbound TCP socket (an autobind to
+	// an ephemeral port). Only [ProbeDownloader] runs it: elsewhere no
+	// socket can be created at all.
+	CheckTCPListen = "tcp_listen"
 )
 
 // Checks lists every self-test check.
@@ -31,8 +35,8 @@ var Checks = []string{CheckFSRead, CheckTCPConnect, CheckMPTCPConnect, CheckUDPS
 
 // DownloaderChecks lists the checks of a downloader self-test: every check of
 // [Checks], where tcp_connect targets a port outside the allowlist, plus
-// [CheckTCPConnectAllowed].
-var DownloaderChecks = append(append([]string(nil), Checks...), CheckTCPConnectAllowed)
+// [CheckTCPListen] and [CheckTCPConnectAllowed].
+var DownloaderChecks = append(append([]string(nil), Checks...), CheckTCPListen, CheckTCPConnectAllowed)
 
 // Outcomes of a check.
 const (

@@ -30,9 +30,10 @@ type Spec struct {
 	// DenyNet. The seccomp filter then lets socket(2) create AF_INET and
 	// AF_INET6 SOCK_STREAM sockets with protocol 0 or IPPROTO_TCP (no
 	// MPTCP, UDP, raw, Unix, netlink or socketpair), and Landlock (ABI 4+)
-	// refuses bind(2) and every TCP connect(2) except to these ports.
-	// Below ABI 4 Landlock cannot restrict TCP and the child may connect
-	// anywhere: a warning, like the other best-effort gaps, and
+	// refuses bind(2) and every TCP connect(2) except to these ports;
+	// listen(2), accept(2) and MSG_FASTOPEN sends are refused too. Below
+	// ABI 4 Landlock cannot restrict TCP, so the spec fails closed: every
+	// socket is refused as under plain DenyNet, with a warning, and
 	// [ProbeDownloader] reports less than full.
 	ConnectPorts []uint16
 

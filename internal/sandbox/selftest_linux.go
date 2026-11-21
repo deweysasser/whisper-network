@@ -22,8 +22,20 @@ func runNetChecks(tg selfTestTargets, out map[string]string) {
 	out[CheckUnixDgramSendto] = outcome(sendUnixDgram(tg.dgramPath))
 	out[CheckSignalParent] = outcome(unix.Kill(os.Getppid(), 0))
 	if tg.allowedTCP != "" {
+		out[CheckTCPListen] = outcome(listenTCP())
 		out[CheckTCPConnectAllowed] = outcome(dialInet(unix.SOCK_STREAM, 0, tg.allowedTCP))
 	}
+}
+
+// listenTCP calls listen(2) on a fresh, unbound TCP socket, which binds it
+// to an ephemeral port.
+func listenTCP() error {
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+	return unix.Listen(fd, 1)
 }
 
 // dialInet connects (stream) or sends one datagram (dgram) to addr.

@@ -48,6 +48,12 @@ func runHelper(args []string) int {
 		// TCP Fast Open: sendto(2) with MSG_FASTOPEN connects without
 		// connect(2).
 		fmt.Println(classify(sendFastOpen(args[1])))
+	case "listen":
+		fmt.Println(classify(listenTCP()))
+	case "accept":
+		// accept(2) on stdin: ENOTSOCK unless a filter refuses it first.
+		_, _, err := unix.Accept(0)
+		fmt.Println(classify(err))
 	case "bind":
 		fmt.Println(classify(bindTCP(args[1])))
 	case "raw":

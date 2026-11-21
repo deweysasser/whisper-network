@@ -44,6 +44,8 @@ func TestProbeDownloaderLevels(t *testing.T) {
 		"allowed port blocked":  {downloaderReport(6, CheckTCPConnectAllowed, OutcomeBlocked), api.SandboxFSOnly, false},
 		"allowed port error":    {downloaderReport(6, CheckTCPConnectAllowed, "error: connection refused"), api.SandboxFSOnly, false},
 		"udp open":              {downloaderReport(6, CheckUDPSend, OutcomeOpen), api.SandboxFSOnly, false},
+		"listen open":           {downloaderReport(6, CheckTCPListen, OutcomeOpen), api.SandboxFSOnly, false},
+		"missing listen check":  {downloaderReport(6, CheckTCPListen, ""), "", true},
 		"unix open":             {downloaderReport(6, CheckUnixConnect, OutcomeOpen), api.SandboxFSOnly, false},
 		"fs open":               {downloaderReport(6, CheckFSRead, OutcomeOpen), api.SandboxNone, false},
 		"missing allowed check": {downloaderReport(6, CheckTCPConnectAllowed, ""), "", true},

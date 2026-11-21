@@ -42,8 +42,12 @@ func TestSelfTestConnectAllowlist(t *testing.T) {
 	assert.Equal(t, "ok", runHelperUnder(t, spec, "dial-nonblock", allowed), "SOCK_NONBLOCK|SOCK_CLOEXEC still a TCP socket")
 	assert.Equal(t, "denied", runHelperUnder(t, spec, "dial", other), "other port refused (EACCES)")
 	assert.Equal(t, "ok", runHelperUnder(t, Spec{}, "tfo", other), "control: MSG_FASTOPEN connects unconfined")
-	assert.Equal(t, "ok", runHelperUnder(t, spec, "tfo", allowed), "MSG_FASTOPEN to the allowed port")
-	assert.Equal(t, "denied", runHelperUnder(t, spec, "tfo", other), "MSG_FASTOPEN to another port: Landlock checks it too")
+	assert.Equal(t, "denied", runHelperUnder(t, spec, "tfo", allowed), "MSG_FASTOPEN refused by seccomp, even to the allowed port")
+	assert.Equal(t, "denied", runHelperUnder(t, spec, "tfo", other), "MSG_FASTOPEN to another port")
+	assert.Equal(t, "ok", runHelperUnder(t, Spec{}, "listen"), "control: listen autobinds unconfined")
+	assert.Equal(t, "denied", runHelperUnder(t, spec, "listen"), "listen refused")
+	assert.Equal(t, "error: socket operation on non-socket", runHelperUnder(t, Spec{}, "accept"), "control")
+	assert.Equal(t, "denied", runHelperUnder(t, spec, "accept"), "accept refused")
 	assert.Equal(t, "denied", runHelperUnder(t, spec, "bind", "127.0.0.1:0"), "bind refused")
 	assert.Equal(t, "denied", runHelperUnder(t, spec, "mptcp", allowed), "MPTCP refused even to the allowed port")
 	assert.Equal(t, "denied", runHelperUnder(t, spec, "udp", udpListener(t)), "UDP refused")
@@ -110,10 +114,20 @@ func TestProbeDownloaderFailsOnBadBinary(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func TestSeccompInetStreamFilterShape(t *testing.T) {
-	for _, r := range []seccompRules{{denyNet: true, inetStream: true}, {denyNet: true, inetStream: true, signalPid: 1}} {
-		prog, err := buildSeccomp(r)
-		require.NoError(t, err)
-		assert.Less(t, len(prog), 255)
+// Below Landlock ABI 4 a ConnectPorts spec fails closed: no TCP sockets.
+func TestSeccompRulesForConnectPorts(t *testing.T) {
+	spec := Spec{DenyNet: true, ConnectPorts: []uint16{8080}}
+	for _, c := range []struct {
+		abi        int
+		inetStream bool
+		signalPid  int
+	}{{0, false, 7}, {3, false, 7}, {4, true, 7}, {6, true, 0}, {11, true, 0}} {
+		r := seccompRulesFor(spec, c.abi, 7)
+		assert.True(t, r.denyNet, "abi %d", c.abi)
+		assert.Equal(t, c.inetStream, r.inetStream, "abi %d", c.abi)
+		assert.Equal(t, c.signalPid, r.signalPid, "abi %d", c.abi)
 	}
+	r := seccompRulesFor(Spec{DenyNet: true}, 11, 7)
+	assert.True(t, r.denyNet)
+	assert.False(t, r.inetStream, "plain DenyNet")
 }

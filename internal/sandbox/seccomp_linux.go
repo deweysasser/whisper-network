@@ -34,7 +34,10 @@ type seccompRules struct {
 	denyNet bool
 	// inetStream relaxes denyNet: socket(2) may create AF_INET and
 	// AF_INET6 SOCK_STREAM sockets with protocol 0 or IPPROTO_TCP, so
-	// Landlock's TCP connect rules decide where they go.
+	// Landlock's TCP connect rules decide where they go. Such a socket
+	// still may not listen(2) (an unbound socket autobinds without the
+	// Landlock bind check) or accept(2), and sendto(2)/sendmsg(2)/
+	// sendmmsg(2) with MSG_FASTOPEN (a connect without connect(2)) fail.
 	inetStream bool
 	// signalPid, when non-zero, confines signals to this process and its
 	// process group: the fallback for kernels without Landlock signal
@@ -72,6 +75,19 @@ func installSeccomp(r seccompRules) error {
 	return nil
 }
 
+// seccompRulesFor picks the filter parts for spec. abi is the Landlock ABI
+// and pid the process the signal fallback (abi < 6) confines signals to.
+// TCP sockets are allowed for ConnectPorts only where Landlock can limit
+// their connects (ABI 4+); below that the spec fails closed and refuses
+// every socket, as plain DenyNet does.
+func seccompRulesFor(spec Spec, abi, pid int) seccompRules {
+	r := seccompRules{denyNet: spec.DenyNet, inetStream: spec.DenyNet && len(spec.ConnectPorts) > 0 && abi >= 4}
+	if abi < 6 {
+		r.signalPid = pid
+	}
+	return r
+}
+
 // restrictSeccomp installs the filter a confining spec needs. abi is the
 // Landlock ABI; below 6 the filter also confines signals. A kernel or
 // architecture without seccomp yields a warning, not an error, like a
@@ -80,11 +96,7 @@ func restrictSeccomp(spec Spec, abi int) ([]string, error) {
 	if !spec.Confines() {
 		return nil, nil
 	}
-	r := seccompRules{denyNet: spec.DenyNet, inetStream: spec.DenyNet && len(spec.ConnectPorts) > 0}
-	if abi < 6 {
-		r.signalPid = os.Getpid()
-	}
-	err := installSeccomp(r)
+	err := installSeccomp(seccompRulesFor(spec, abi, os.Getpid()))
 	switch {
 	case err == nil:
 		return nil, nil
