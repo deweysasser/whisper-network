@@ -62,9 +62,6 @@ func (d *Dialer) DialContext(ctx context.Context, network, addr string) (net.Con
 		if !d.AllowPrivate && Refused(a) {
 			continue
 		}
-		if lastErr == nil {
-			lastErr = fmt.Errorf("egress: no address for %s", host)
-		}
 		c, err := d.Inner.DialContext(ctx, network, net.JoinHostPort(a.WithZone("").String(), port))
 		if err == nil {
 			return c, nil
@@ -78,7 +75,11 @@ func (d *Dialer) DialContext(ctx context.Context, network, addr string) (net.Con
 }
 
 // HTTPClient returns a client whose every connection (including redirect hops)
-// goes through the filter. It never uses environment proxies.
+// goes through the filter. It never uses environment proxies. Callers should
+// reuse the returned client (it pools connections; idle ones expire after 30s).
+//
+// Errors returned by the client are *url.Error values containing the full
+// URL; callers must not log them verbatim (log the site key instead).
 func (d *Dialer) HTTPClient(timeout time.Duration) *http.Client {
 	return &http.Client{
 		Timeout: timeout,
@@ -86,6 +87,8 @@ func (d *Dialer) HTTPClient(timeout time.Duration) *http.Client {
 			Proxy:                 nil,
 			DialContext:           d.DialContext,
 			TLSHandshakeTimeout:   10 * time.Second,
+			IdleConnTimeout:       30 * time.Second,
+			MaxIdleConns:          16,
 			ResponseHeaderTimeout: timeout,
 		},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {

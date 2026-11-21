@@ -14,6 +14,8 @@ func TestRefusedRanges(t *testing.T) {
 		"192.0.2.1": true, "198.51.100.1": true, "203.0.113.1": true, "2001:db8::1": true,
 		"64:ff9b::a00:1": true, "2002:0a00:0001::1": true, "::ffff:8.8.8.8": false,
 		"64:ff9b::808:808": false, "2002:0808:0808::1": false,
+		"::7f00:1": true, "::a00:1": true, "64:ff9b:1::1": true, "2001::1": true,
+		"100::1": true, "fec0::1": true, "::808:808": true,
 		"8.8.8.8": false, "2606:4700::1": false,
 	}
 	for s, want := range cases {

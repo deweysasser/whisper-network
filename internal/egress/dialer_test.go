@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -40,31 +42,62 @@ func localServer(t *testing.T) (*httptest.Server, string) {
 }
 
 func TestDialerRebinding(t *testing.T) {
-	_, port := localServer(t)
-	// First lookup is "public" (8.8.8.8, unroutable here -> would hang/fail), second private.
 	r := &stubResolver{seq: [][]netip.Addr{{netip.MustParseAddr("8.8.8.8")}, {netip.MustParseAddr("127.0.0.1")}}}
-	d := &Dialer{Resolver: r, Inner: net.Dialer{Timeout: 200 * time.Millisecond}}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	c, err := d.DialContext(ctx, "tcp", "rebind.test:"+port)
-	if err == nil {
-		// If we reached 127.0.0.1 we dialed an unchecked address.
-		c.Close()
-		t.Fatal("connected to private address: second resolution used")
+	var mu sync.Mutex
+	var dialed []string
+	d := &Dialer{Resolver: r, Inner: net.Dialer{Control: func(network, address string, _ syscall.RawConn) error {
+		mu.Lock()
+		dialed = append(dialed, address)
+		mu.Unlock()
+		return errors.New("stop")
+	}}}
+	if _, err := d.DialContext(context.Background(), "tcp", "rebind.test:8080"); err == nil {
+		t.Fatal("expected control error")
 	}
 	if r.calls != 1 {
 		t.Fatalf("resolver called %d times, want 1", r.calls)
+	}
+	if len(dialed) != 1 || dialed[0] != "8.8.8.8:8080" {
+		t.Fatalf("dialed %v, want the checked literal 8.8.8.8:8080", dialed)
 	}
 }
 
 func TestDialerRedirectToPrivateRefused(t *testing.T) {
 	_, port := localServer(t)
-	r := &stubResolver{seq: [][]netip.Addr{{netip.MustParseAddr("127.0.0.1")}}}
+	// pub.test resolves to a public IP (filter passes; connection is faked to the
+	// local server), then 302s to evil.test which resolves to loopback.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://evil.test:"+port+"/", http.StatusFound)
+	}))
+	defer srv.Close()
+	r := &mapResolver{m: map[string]string{"pub.test": "8.8.8.8", "evil.test": "127.0.0.1"}}
 	d := &Dialer{Resolver: r}
-	_, err := d.HTTPClient(2 * time.Second).Get("http://evil.test:" + port + "/")
-	if !errors.Is(err, ErrRefused) {
-		t.Fatalf("err=%v, want ErrRefused", err)
+	cl := d.HTTPClient(2 * time.Second)
+	tr := cl.Transport.(*http.Transport)
+	real := tr.DialContext
+	tr.DialContext = func(ctx context.Context, n, addr string) (net.Conn, error) {
+		if strings.HasPrefix(addr, "pub.test:") {
+			ips, _ := r.LookupNetIP(ctx, "ip", "pub.test")
+			if Refused(ips[0]) {
+				return nil, ErrRefused
+			}
+			return net.Dial("tcp", srv.Listener.Addr().String())
+		}
+		return real(ctx, n, addr)
 	}
+	_, err := cl.Get("http://pub.test:80/")
+	if !errors.Is(err, ErrRefused) {
+		t.Fatalf("err=%v, want ErrRefused on redirect hop", err)
+	}
+	if !strings.Contains(err.Error(), "evil.test") {
+		t.Fatalf("hop 2 not exercised: %v", err)
+	}
+}
+
+type mapResolver struct{ m map[string]string }
+
+func (m *mapResolver) LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error) {
+	return []netip.Addr{netip.MustParseAddr(m.m[host])}, nil
 }
 
 func TestDialerAllowPrivate(t *testing.T) {
