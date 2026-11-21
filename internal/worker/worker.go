@@ -46,9 +46,11 @@ type Worker struct {
 	offered []models.Model
 
 	// Downloader state: the filtering proxy yt-dlp is pointed at, the
-	// filtered client for the egress probe, and the probe's trigger.
+	// filtered clients for the egress probe and for plain GET fetches, and
+	// the probe's trigger.
 	proxy         *egress.Proxy
 	egressClient  *http.Client
+	fetchClient   *http.Client
 	egressTrigger chan struct{}
 	egressMu      sync.Mutex
 	egressIP      string
@@ -74,9 +76,9 @@ type tools struct {
 	ytdlp, ytdlpVersion          string // downloader only
 	whisper, ffmpeg              string // absolute paths, "" if absent
 	engineVersion, ffmpegVersion string
-	// whisperRO and ffmpegRO are what each tool's sandbox may read besides
-	// the system paths (see toolReadOnly).
-	whisperRO, ffmpegRO []string
+	// whisperRO, ffmpegRO and ytdlpRO are what each tool's sandbox may
+	// read besides the system paths (see toolReadOnly, ytdlpReadOnly).
+	whisperRO, ffmpegRO, ytdlpRO []string
 }
 
 // New validates cfg and returns a worker.

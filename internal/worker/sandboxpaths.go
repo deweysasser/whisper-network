@@ -2,6 +2,7 @@ package worker
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -93,4 +94,64 @@ func underAny(path string, roots []string) bool {
 func homeDir() string {
 	h, _ := os.UserHomeDir()
 	return h
+}
+
+// fetchSystemReadOnly are the system files yt-dlp (Python) needs besides
+// systemReadOnly: CA certificates for TLS through the proxy, and the
+// timezone.
+var fetchSystemReadOnly = []string{"/etc/ssl", "/etc/pki", "/etc/ca-certificates", "/etc/localtime"}
+
+// ytdlpReadOnly is what a yt-dlp child may read besides the system paths:
+// toolReadOnly of yt-dlp itself; the root of the virtualenv it lives in
+// (bin/yt-dlp with a pyvenv.cfg one level up), whose lib/ holds its
+// modules; and the interpreter of its #! line when that lies outside the
+// system paths. The same rules apply to each: no directory under the home
+// directory or holding the worker's state.
+func ytdlpReadOnly(ytdlp, stateDir, home string) ([]string, error) {
+	ro, err := toolReadOnly(ytdlp, stateDir, home)
+	if err != nil {
+		return nil, err
+	}
+	real := ro[0]
+	if root := filepath.Dir(filepath.Dir(real)); root != "/" {
+		if _, err := os.Stat(filepath.Join(root, "pyvenv.cfg")); err == nil {
+			if h := canonical(home); h != "" && h != "/" && within(root, h) {
+				return nil, fmt.Errorf("%s: the sandbox grants read access to its virtualenv %s, which is under the home directory %s; install it in a dedicated directory such as /opt/yt-dlp", ytdlp, root, h)
+			}
+			ro = append(ro, root)
+		}
+	}
+	if interp := shebang(real); interp != "" && filepath.IsAbs(interp) {
+		if r, err := filepath.EvalSymlinks(interp); err == nil && !underAny(r, systemReadOnly) && !underAny(r, ro) {
+			iro, err := toolReadOnly(interp, stateDir, home)
+			if err != nil {
+				return nil, fmt.Errorf("%s's interpreter: %w", ytdlp, err)
+			}
+			ro = append(ro, iro...)
+		}
+	}
+	if err := checkStateOutside(stateDir, ro); err != nil {
+		return nil, fmt.Errorf("%s: %w", ytdlp, err)
+	}
+	return ro, nil
+}
+
+// shebang returns the interpreter of a #! script, or "".
+func shebang(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	buf := make([]byte, 256)
+	n, _ := io.ReadFull(f, buf)
+	line, _, _ := strings.Cut(string(buf[:n]), "\n")
+	rest, ok := strings.CutPrefix(line, "#!")
+	if !ok {
+		return ""
+	}
+	if f := strings.Fields(rest); len(f) > 0 {
+		return f[0]
+	}
+	return ""
 }

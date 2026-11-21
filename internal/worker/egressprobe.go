@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -32,6 +33,7 @@ func (w *Worker) startEgress(ctx context.Context) (func(), error) {
 	}
 	w.proxy = p
 	w.egressClient = d.HTTPClient(egressProbeTimeout)
+	w.fetchClient = d.HTTPClient(w.cfg.Limits.FetchTimeout)
 	if w.cfg.AllowPrivateEgress {
 		w.log.Warn().Msg("--allow-private-egress: this downloader may reach loopback, private and link-local " +
 			"addresses; fetch URLs can then probe the local network")
@@ -54,9 +56,16 @@ func (w *Worker) initialEgressIP(ctx context.Context) string {
 	return ip
 }
 
+// Probe failures of errClass's "status" and "body" classes.
+var (
+	errProbeStatus = errors.New("egress probe: unexpected status")
+	errProbeBody   = errors.New("egress probe: unusable response body")
+)
+
 // probeEgressIP asks the operator's probe URL for this worker's public IP
 // through the filtered egress client. The body must be at most 64 bytes and
-// an IP address.
+// a global IP address (any address with AllowPrivateEgress): a private one
+// would group this worker with unrelated hosts behind other NATs.
 func (w *Worker) probeEgressIP(ctx context.Context) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, egressProbeTimeout)
 	defer cancel()
@@ -70,20 +79,24 @@ func (w *Worker) probeEgressIP(ctx context.Context) (string, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("probe status %d", resp.StatusCode)
+		return "", fmt.Errorf("%w %d", errProbeStatus, resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, egressProbeMax+1))
 	if err != nil {
-		return "", stripURL(err)
+		return "", fmt.Errorf("%w: reading: %w", errProbeBody, stripURL(err))
 	}
 	if len(body) > egressProbeMax {
-		return "", errors.New("probe response too large")
+		return "", fmt.Errorf("%w: too large", errProbeBody)
 	}
 	a, err := netip.ParseAddr(strings.TrimSpace(string(body)))
 	if err != nil {
-		return "", errors.New("probe response is not an IP address")
+		return "", fmt.Errorf("%w: not an IP address", errProbeBody)
 	}
-	return a.Unmap().String(), nil
+	a = a.WithZone("").Unmap()
+	if !w.cfg.AllowPrivateEgress && egress.Refused(a) {
+		return "", fmt.Errorf("%w: not a global address", errProbeBody)
+	}
+	return a.String(), nil
 }
 
 // stripURL drops the *url.Error wrapper, whose text contains the URL.
@@ -95,17 +108,25 @@ func stripURL(err error) error {
 	return err
 }
 
-// errClass is a log-safe description of a probe error.
+// errClass is a log-safe description of an egress error (probe or fetch):
+// one of timeout, refused, dns, status, body or other, never the error's
+// text, which may contain the URL or its host.
 func errClass(err error) string {
+	var ne net.Error
+	var dns *net.DNSError
 	switch {
-	case errors.Is(err, context.DeadlineExceeded):
-		return "timeout"
-	case errors.Is(err, context.Canceled):
-		return "canceled"
 	case errors.Is(err, egress.ErrRefused):
 		return "refused"
+	case errors.As(err, &dns):
+		return "dns"
+	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &ne) && ne.Timeout():
+		return "timeout"
+	case errors.Is(err, errProbeStatus):
+		return "status"
+	case errors.Is(err, errProbeBody):
+		return "body"
 	}
-	return stripURL(err).Error()
+	return "other"
 }
 
 // requestEgressProbe asks runEgressProbe to probe now (for example after a

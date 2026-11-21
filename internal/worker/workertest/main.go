@@ -1,10 +1,10 @@
 // Package workertest provides test doubles for running the worker without a
-// real server, whisper-cli or ffmpeg:
+// real server, whisper-cli, ffmpeg or yt-dlp:
 //
 //   - Server, an httptest server that speaks the worker API of DESIGN.md
 //     §6.2 with injectable faults (cut downloads, failing uploads, cancelled
 //     leases, paused or rejected workers);
-//   - fake whisper-cli and ffmpeg executables, which are the test binary
+//   - fake whisper-cli, ffmpeg and yt-dlp executables, which are the test binary
 //     itself started under another name.
 //
 // A package that runs the worker calls Main from its TestMain. The same test
@@ -26,6 +26,7 @@ import (
 const (
 	WhisperName = "whisper-cli"
 	FFmpegName  = "ffmpeg"
+	YtDlpName   = "yt-dlp"
 )
 
 // Main dispatches the test binary's roles and otherwise runs the tests. Call
@@ -43,6 +44,8 @@ func Main(m *testing.M) {
 		os.Exit(fakeWhisper(os.Args[1:]))
 	case FFmpegName:
 		os.Exit(fakeFFmpeg(os.Args[1:]))
+	case YtDlpName:
+		os.Exit(fakeYtDlp(os.Args[1:]))
 	}
 	os.Exit(m.Run())
 }
@@ -52,9 +55,10 @@ type Fakes struct {
 	Dir        string
 	WhisperCLI string
 	FFmpeg     string
+	YtDlp      string
 }
 
-// InstallFakes links whisper-cli and ffmpeg to the running test binary in a
+// InstallFakes links whisper-cli, ffmpeg and yt-dlp to the running test binary in a
 // fresh directory. The test binary must use Main in its TestMain.
 func InstallFakes(t testing.TB) Fakes {
 	t.Helper()
@@ -63,8 +67,9 @@ func InstallFakes(t testing.TB) Fakes {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
-	f := Fakes{Dir: dir, WhisperCLI: filepath.Join(dir, WhisperName), FFmpeg: filepath.Join(dir, FFmpegName)}
-	for _, p := range []string{f.WhisperCLI, f.FFmpeg} {
+	f := Fakes{Dir: dir, WhisperCLI: filepath.Join(dir, WhisperName), FFmpeg: filepath.Join(dir, FFmpegName),
+		YtDlp: filepath.Join(dir, YtDlpName)}
+	for _, p := range []string{f.WhisperCLI, f.FFmpeg, f.YtDlp} {
 		if err := os.Symlink(self, p); err != nil {
 			t.Skipf("cannot create fake tool symlink: %v", err)
 		}

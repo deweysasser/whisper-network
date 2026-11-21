@@ -115,6 +115,32 @@ func (c *Client) PutPrepareResult(ctx context.Context, leaseID string, res Prepa
 	return resp.Body.Close()
 }
 
+// PutFetchResult streams a fetch lease's media as application/octet-stream,
+// chunked (its length is unknown until the end), with X-Fetch-Method set to
+// method when non-empty. body is read once, so the upload is never retried
+// and redirects are not followed. To abort the upload so the server sees a
+// truncated body rather than a short one, cancel ctx or make body's Read
+// fail: either way the chunked body is never terminated.
+func (c *Client) PutFetchResult(ctx context.Context, leaseID, method string, body io.Reader) error {
+	req, err := c.newRequest(ctx, http.MethodPut, c.endpoint("lease", leaseID, "result"), body)
+	if err != nil {
+		return err
+	}
+	req.ContentLength = -1
+	req.Header.Set("Content-Type", "application/octet-stream")
+	if method != "" {
+		req.Header.Set(api.HeaderFetchMethod, method)
+	}
+	hc := *c.hc
+	hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := c.sendWith(&hc, req, http.StatusOK, http.StatusCreated, http.StatusNoContent)
+	if err != nil {
+		return err
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	return resp.Body.Close()
+}
+
 // ReportFailure ends a lease as failed. The stderr tail is truncated to
 // api.MaxStderrTail by the caller's responsibility.
 func (c *Client) ReportFailure(ctx context.Context, leaseID string, rep api.FailureReport) error {

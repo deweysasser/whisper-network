@@ -84,6 +84,10 @@ func (w *Worker) handleLease(runCtx, workCtx context.Context, l *api.Lease) {
 	if l.Model != "" {
 		log = log.With().Str(obs.FieldModel, l.Model).Logger()
 	}
+	if l.Site != "" {
+		// A fetch's site stands for its URL, which is never logged.
+		log = log.With().Str(obs.FieldSite, l.Site).Logger()
+	}
 	log.Info().Msg("lease claimed")
 
 	taskCtx, cancel := context.WithCancelCause(workCtx)
@@ -136,6 +140,8 @@ func (w *Worker) execute(ctx context.Context, l *api.Lease, run *leaseRun, log z
 		return w.prepare(ctx, l, dir, run, log)
 	case api.KindTranscribe:
 		return w.transcribe(ctx, l, dir, run, log)
+	case api.KindFetch:
+		return w.fetch(ctx, l, dir, run, log)
 	}
 	return taskStats{}, preWork(fmt.Sprintf("unknown task kind %q", l.Kind), nil)
 }

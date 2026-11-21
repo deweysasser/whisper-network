@@ -1,0 +1,295 @@
+package worker
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"sync/atomic"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/deweysasser/whisper-network/internal/api"
+	"github.com/deweysasser/whisper-network/internal/egress"
+	"github.com/deweysasser/whisper-network/internal/worker/workertest"
+)
+
+// fakeMedia is a body that sniffs as media (FLAC) and is longer than the
+// media guard's sniff window.
+var fakeMedia = append([]byte("fLaC\x00\x00\x00\x22"), bytes.Repeat([]byte{1, 2, 3, 0xfe}, 1024)...)
+
+const fetchURL = "https://www.youtube.com/watch?v=secretVideoId"
+
+// fetchHarness is an active downloader whose fake yt-dlp runs in mode,
+// printing body in the modes that print one.
+func fetchHarness(t *testing.T, mode string, body []byte) *harness {
+	t.Helper()
+	h := downloaderHarness(t)
+	h.cfg.ChildEnv = append(h.cfg.ChildEnv, workertest.YtDlpMode(mode), workertest.YtDlpBody(body))
+	return h
+}
+
+// startFetch runs h's worker and queues one fetch task.
+func startFetch(t *testing.T, h *harness, task workertest.Task) string {
+	t.Helper()
+	h.run()
+	h.activate()
+	task.Kind = api.KindFetch
+	if task.URL == "" {
+		task.URL = fetchURL
+	}
+	if task.Site == "" {
+		task.Site = "youtube.com"
+	}
+	return h.srv.AddTask(task)
+}
+
+// failure waits for the task's first failure report.
+func (h *harness) failure(task string) api.FailureReport {
+	h.t.Helper()
+	h.eventually(func() bool { return len(h.srv.Task(task).Failures) > 0 }, "no failure reported")
+	return h.srv.Task(task).Failures[0]
+}
+
+// assertNoURL checks the worker never logged a fetch URL.
+func (h *harness) assertNoURL(urls ...string) {
+	h.t.Helper()
+	logs := string(h.logs.Bytes())
+	for _, u := range urls {
+		assert.NotContains(h.t, logs, u)
+	}
+	assert.NotContains(h.t, logs, "secretVideoId")
+}
+
+// mediaServer serves body with ctype and counts requests.
+func mediaServer(t *testing.T, status int, ctype string, body []byte) (*httptest.Server, *atomic.Int32) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", ctype)
+		w.WriteHeader(status)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &hits
+}
+
+func TestFetchEndToEnd(t *testing.T) {
+	h := fetchHarness(t, workertest.YtDlpOK, fakeMedia)
+	task := startFetch(t, h, workertest.Task{})
+	h.eventually(h.taskState(task, api.TaskDone), "fetch never completed")
+	got := h.srv.Task(task)
+	assert.Equal(t, fakeMedia, got.Fetched)
+	assert.Equal(t, api.FetchMethodYtDlp, got.FetchMethod)
+	assert.Zero(t, got.AbortedResults)
+	h.waitEvent("task.done")
+	assert.Contains(t, string(h.logs.Bytes()), `"site":"youtube.com"`)
+	h.assertNoURL(fetchURL)
+}
+
+func TestFetchCopiesCookies(t *testing.T) {
+	h := fetchHarness(t, workertest.YtDlpOK, fakeMedia)
+	cookies := filepath.Join(t.TempDir(), "cookies.txt")
+	require.NoError(t, os.WriteFile(cookies, []byte(workertest.CookiesHeader+"\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tx\n"), 0o600))
+	h.cfg.YtDlpCookies = cookies
+	task := startFetch(t, h, workertest.Task{})
+	h.eventually(h.taskState(task, api.TaskDone), "fetch with cookies never completed")
+	assert.Equal(t, fakeMedia, h.srv.Task(task).Fetched)
+}
+
+func TestFetchFallsBackToGETOnUnsupported(t *testing.T) {
+	srv, hits := mediaServer(t, http.StatusOK, "audio/flac", fakeMedia)
+	h := fetchHarness(t, workertest.YtDlpUnsupported, nil)
+	h.cfg.AllowPrivateEgress = true
+	u := srv.URL + "/podcast/secretVideoId.flac"
+	task := startFetch(t, h, workertest.Task{URL: u, Site: "127.0.0.1"})
+	h.eventually(h.taskState(task, api.TaskDone), "GET fallback never completed")
+	got := h.srv.Task(task)
+	assert.Equal(t, fakeMedia, got.Fetched)
+	assert.Equal(t, api.FetchMethodHTTP, got.FetchMethod)
+	assert.Equal(t, int32(1), hits.Load())
+	h.assertNoURL(u)
+}
+
+func TestFetchNoFallbackOnRateLimit(t *testing.T) {
+	srv, hits := mediaServer(t, http.StatusOK, "audio/flac", fakeMedia)
+	h := fetchHarness(t, workertest.YtDlpRateLimited, nil)
+	h.cfg.AllowPrivateEgress = true
+	task := startFetch(t, h, workertest.Task{URL: srv.URL + "/a.flac"})
+	f := h.failure(task)
+	assert.Equal(t, api.StageRateLimited, f.Stage)
+	assert.True(t, f.Retryable)
+	assert.Empty(t, f.StderrTail, "yt-dlp's stderr may quote the URL")
+	assert.Zero(t, hits.Load(), "no GET after a rate limit")
+	h.assertNoURL(srv.URL)
+}
+
+func TestFetchPrivateVideoNotRetryable(t *testing.T) {
+	h := fetchHarness(t, workertest.YtDlpPrivate, nil)
+	task := startFetch(t, h, workertest.Task{})
+	f := h.failure(task)
+	assert.False(t, f.Retryable)
+	assert.Equal(t, api.StageInput, f.Stage)
+	assert.Empty(t, f.StderrTail)
+	h.assertNoURL(fetchURL)
+}
+
+func TestFetchHTMLRefused(t *testing.T) {
+	h := fetchHarness(t, workertest.YtDlpHTML, nil)
+	task := startFetch(t, h, workertest.Task{})
+	f := h.failure(task)
+	assert.False(t, f.Retryable)
+	assert.Equal(t, api.StageInput, f.Stage)
+	assert.Contains(t, f.Reason, "not media")
+	assert.Nil(t, h.srv.Task(task).Fetched)
+}
+
+func TestFetchChildCrashAbortsUpload(t *testing.T) {
+	h := fetchHarness(t, workertest.YtDlpCrashAfterBytes, fakeMedia)
+	task := startFetch(t, h, workertest.Task{})
+	f := h.failure(task)
+	assert.True(t, f.Retryable)
+	assert.Equal(t, api.StageInput, f.Stage)
+	got := h.srv.Task(task)
+	assert.Nil(t, got.Fetched, "the server never saw a complete body")
+	assert.Equal(t, 1, got.AbortedResults, "the PUT was aborted, not ended cleanly")
+}
+
+func TestFetchTooLarge(t *testing.T) {
+	h := fetchHarness(t, workertest.YtDlpOK, fakeMedia)
+	task := startFetch(t, h, workertest.Task{MaxOutputBytes: 1000})
+	f := h.failure(task)
+	assert.False(t, f.Retryable)
+	assert.Equal(t, api.StageInput, f.Stage)
+	assert.Contains(t, f.Reason, "too large")
+	assert.Nil(t, h.srv.Task(task).Fetched)
+}
+
+func TestFetchGETRefusesPrivateByDefault(t *testing.T) {
+	srv, hits := mediaServer(t, http.StatusOK, "audio/flac", fakeMedia)
+	h := fetchHarness(t, workertest.YtDlpUnsupported, nil)
+	task := startFetch(t, h, workertest.Task{URL: srv.URL + "/a.flac", Site: "127.0.0.1"})
+	f := h.failure(task)
+	assert.False(t, f.Retryable, "a URL on a refused address is the input's fault")
+	assert.Equal(t, api.StageInput, f.Stage)
+	assert.Zero(t, hits.Load())
+	h.assertNoURL(srv.URL)
+}
+
+func TestFetchGETOutcomes(t *testing.T) {
+	for name, c := range map[string]struct {
+		status    int
+		ctype     string
+		body      []byte
+		stage     api.FailureStage
+		retryable bool
+	}{
+		"html":        {200, "text/html; charset=utf-8", fakeMedia, api.StageInput, false},
+		"json":        {200, "application/json", fakeMedia, api.StageInput, false},
+		"xml":         {200, "text/xml", fakeMedia, api.StageInput, false},
+		"sniffed":     {200, "application/octet-stream", []byte("<html><body>x</body></html>"), api.StageInput, false},
+		"429":         {429, "text/plain", nil, api.StageRateLimited, true},
+		"404":         {404, "text/plain", nil, api.StageInput, false},
+		"410":         {410, "text/plain", nil, api.StageInput, false},
+		"503":         {503, "text/plain", nil, api.StageInput, true},
+		"forbidden":   {403, "text/plain", nil, api.StageInput, false},
+		"partial 206": {206, "audio/flac", fakeMedia, api.StageInput, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv, _ := mediaServer(t, c.status, c.ctype, c.body)
+			h := fetchHarness(t, workertest.YtDlpUnsupported, nil)
+			h.cfg.AllowPrivateEgress = true
+			task := startFetch(t, h, workertest.Task{URL: srv.URL + "/a.flac"})
+			f := h.failure(task)
+			assert.Equal(t, c.stage, f.Stage)
+			assert.Equal(t, c.retryable, f.Retryable)
+			assert.Nil(t, h.srv.Task(task).Fetched)
+			h.assertNoURL(srv.URL)
+		})
+	}
+}
+
+func TestFetchGETTooLarge(t *testing.T) {
+	srv, _ := mediaServer(t, http.StatusOK, "audio/flac", fakeMedia)
+	h := fetchHarness(t, workertest.YtDlpUnsupported, nil)
+	h.cfg.AllowPrivateEgress = true
+	task := startFetch(t, h, workertest.Task{URL: srv.URL + "/a.flac", MaxOutputBytes: 1000})
+	f := h.failure(task)
+	assert.False(t, f.Retryable)
+	assert.Contains(t, f.Reason, "too large")
+}
+
+func TestFetchYtDlpGonePreWork(t *testing.T) {
+	h := fetchHarness(t, workertest.YtDlpOK, fakeMedia)
+	h.run()
+	h.activate()
+	h.eventually(func() bool { return len(h.srv.Claims()) > 0 }, "worker never claimed")
+	require.NoError(t, os.Remove(h.fakes.YtDlp))
+	task := h.srv.AddTask(workertest.Task{Kind: api.KindFetch, URL: fetchURL, Site: "youtube.com"})
+	f := h.failure(task)
+	assert.Equal(t, api.StagePreWork, f.Stage)
+	assert.Contains(t, f.Reason, "yt-dlp")
+}
+
+func TestFetchNetworkErrorTriggersEgressProbe(t *testing.T) {
+	h := fetchHarness(t, workertest.YtDlpUnsupported, nil)
+	h.cfg.AllowPrivateEgress = true
+	// A port nothing listens on.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	dead := "http://" + ln.Addr().String() + "/a.flac"
+	require.NoError(t, ln.Close())
+	var probes atomic.Int32
+	probe := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		probes.Add(1)
+		_, _ = w.Write([]byte("203.0.113.7"))
+	}))
+	defer probe.Close()
+	h.cfg.EgressProbe = probe.URL
+	h.cfg.EgressProbeInterval = 1 << 40
+	task := startFetch(t, h, workertest.Task{URL: dead})
+	f := h.failure(task)
+	assert.True(t, f.Retryable)
+	assert.Equal(t, api.StageInput, f.Stage)
+	h.eventually(func() bool { return probes.Load() >= 2 }, "no egress probe after the network error")
+}
+
+func TestErrClassFixed(t *testing.T) {
+	for want, err := range map[string]error{
+		"timeout": context.DeadlineExceeded,
+		"refused": errors.Join(egress.ErrRefused, errors.New("https://secret.example/x")),
+		"dns":     &net.DNSError{Err: "no such host", Name: "secret.example"},
+		"status":  errProbeStatus,
+		"body":    errProbeBody,
+		"other":   errors.New("Get \"https://secret.example/x\": EOF"),
+	} {
+		assert.Equal(t, want, errClass(err))
+	}
+}
+
+func TestEgressProbeRejectsNonGlobalIP(t *testing.T) {
+	for _, body := range []string{"10.1.2.3", "127.0.0.1", "192.168.1.1", "100.64.0.1", "fd00::1"} {
+		srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+			_, _ = rw.Write([]byte(body))
+		}))
+		h := downloaderHarness(t)
+		h.cfg.EgressProbe = srv.URL
+		w, err := New(h.cfg)
+		require.NoError(t, err)
+		w.egressClient = srv.Client() // reach the loopback probe; the answer is still checked
+		_, err = w.probeEgressIP(t.Context())
+		assert.ErrorIs(t, err, errProbeBody, body)
+
+		w.cfg.AllowPrivateEgress = true
+		ip, err := w.probeEgressIP(t.Context())
+		require.NoError(t, err, body)
+		assert.Equal(t, body, ip)
+		srv.Close()
+	}
+}

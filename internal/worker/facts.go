@@ -220,6 +220,21 @@ func (w *Worker) probeDownloader(ctx context.Context) error {
 	}
 	w.tools.ytdlp = p
 	w.tools.ytdlpVersion = parseYtDlpVersion(w.toolOutput(ctx, p, "--version"))
+	if err := checkStateOutside(w.cfg.StateDir, slices.Concat(systemReadOnly, childSystemFiles, fetchSystemReadOnly)); err != nil {
+		return err
+	}
+	home := homeDir()
+	if w.tools.ytdlpRO, err = ytdlpReadOnly(p, w.cfg.StateDir, home); err != nil {
+		return err
+	}
+	// yt-dlp runs deno, when installed, for YouTube's JavaScript challenges.
+	if d, err := lookTool("deno"); err == nil {
+		if ro, err := toolReadOnly(d, w.cfg.StateDir, home); err == nil {
+			w.tools.ytdlpRO = append(w.tools.ytdlpRO, ro...)
+		} else {
+			w.log.Warn().Err(err).Msg("deno is not usable in the yt-dlp sandbox; sites that need it may fail")
+		}
+	}
 
 	level := api.SandboxNone
 	if w.proxy == nil {

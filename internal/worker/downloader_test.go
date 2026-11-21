@@ -4,8 +4,6 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -18,20 +16,12 @@ import (
 	"github.com/deweysasser/whisper-network/internal/sandbox"
 )
 
-// fakeYtDlp writes an executable that prints a version.
-func fakeYtDlp(t *testing.T) string {
-	t.Helper()
-	p := filepath.Join(t.TempDir(), "yt-dlp")
-	require.NoError(t, os.WriteFile(p, []byte("#!/bin/sh\necho 2025.01.15\n"), 0o755))
-	return p
-}
-
 // downloaderHarness configures h as a downloader whose ffmpeg and
 // whisper-cli do not exist.
 func downloaderHarness(t *testing.T) *harness {
 	h := newHarness(t)
 	h.cfg.Downloader = true
-	h.cfg.YtDlp = fakeYtDlp(t)
+	h.cfg.YtDlp = h.fakes.YtDlp
 	h.cfg.WhisperCLI = "/nonexistent/whisper-cli"
 	h.cfg.FFmpeg = "/nonexistent/ffmpeg"
 	h.cfg.Slots = 0

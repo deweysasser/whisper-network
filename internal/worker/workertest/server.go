@@ -85,6 +85,10 @@ type Task struct {
 	OmitSize bool
 	// InputURL, if set, replaces the lease's input_url.
 	InputURL string
+	// URL, Site and MaxOutputBytes are a fetch lease's url, site and byte
+	// cap (0: none).
+	URL, Site      string
+	MaxOutputBytes int64
 
 	State    api.TaskState
 	Attempts int
@@ -94,6 +98,13 @@ type Task struct {
 	ComputeMS     string
 	FFmpegVersion string
 	Failures      []api.FailureReport
+	// Fetched and FetchMethod are an accepted fetch result and its
+	// X-Fetch-Method.
+	Fetched     []byte
+	FetchMethod string
+	// AbortedResults counts result PUTs whose body broke off (a chunked
+	// body that never ended cleanly); nothing of them is kept.
+	AbortedResults int
 }
 
 // Lease is the server's record of a lease.
@@ -512,6 +523,9 @@ func (s *Server) leaseLocked(t *Task, wk *Worker) api.Lease {
 		if t.OmitSize {
 			l.InputBytes = 0
 		}
+	case api.KindFetch:
+		l.Seq = 0
+		l.URL, l.Site, l.MaxOutputBytes = t.URL, t.Site, t.MaxOutputBytes
 	case api.KindTranscribe:
 		l.AudioSamples = int64(max(len(t.Input)-44, 0) / media.BytesPerSample)
 		if t.LeaseAudioSamples > 0 {
@@ -626,6 +640,10 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request, l *Lease, _ *
 func (s *Server) result(w http.ResponseWriter, r *http.Request, l *Lease, t *Task, _ *Worker) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		// The upload broke off: keep nothing, as the real server does.
+		s.mu.Lock()
+		t.AbortedResults++
+		s.mu.Unlock()
 		return
 	}
 	s.mu.Lock()
@@ -662,6 +680,13 @@ func (s *Server) result(w http.ResponseWriter, r *http.Request, l *Lease, t *Tas
 		}
 		s.mu.Lock()
 		t.Transcript = &res
+	case api.KindFetch:
+		if r.Header.Get("Content-Type") != "application/octet-stream" {
+			problem(w, http.StatusUnsupportedMediaType, api.ProblemBadRequest, "")
+			return
+		}
+		s.mu.Lock()
+		t.Fetched, t.FetchMethod = body, r.Header.Get(api.HeaderFetchMethod)
 	}
 	t.State = api.TaskDone
 	s.endLocked(l, api.OutcomeDone, false)

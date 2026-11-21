@@ -2,9 +2,12 @@ package workertest
 
 import (
 	"bytes"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -251,4 +254,126 @@ func forkTree(tool string) int {
 	fmt.Fprintf(os.Stderr, "%s: grandchild pid %d\n", tool, c.Process.Pid)
 	time.Sleep(time.Hour)
 	return 1
+}
+
+// FakeYtDlpVersion is what the fake yt-dlp reports.
+const FakeYtDlpVersion = "2025.01.15"
+
+// Behaviour modes of the fake yt-dlp (WN_FAKE_YTDLP). Their stderr is what
+// the real yt-dlp prints in each case.
+const (
+	YtDlpOK              = "ok"                // print the body (WN_FAKE_YTDLP_BODY) and exit 0
+	YtDlpUnsupported     = "unsupported"       // no extractor matches the URL
+	YtDlpRateLimited     = "ratelimited"       // YouTube's bot check
+	YtDlpPrivate         = "private"           // a private video
+	YtDlpCrashAfterBytes = "crash-after-bytes" // print the body, pause, then fail
+	YtDlpHTML            = "html"              // print an HTML page and exit 0
+)
+
+// CookiesHeader is the first line yt-dlp expects of a cookies file; the
+// fake refuses a --cookies file without it.
+const CookiesHeader = "# Netscape HTTP Cookie File"
+
+const (
+	envYtDlp     = "WN_FAKE_YTDLP"
+	envYtDlpBody = "WN_FAKE_YTDLP_BODY"
+)
+
+// YtDlpMode returns the env entry selecting the fake yt-dlp's mode.
+func YtDlpMode(mode string) string { return envYtDlp + "=" + mode }
+
+// YtDlpBody returns the env entry carrying the media the fake yt-dlp
+// prints. The body travels in the environment, base64-encoded, because the
+// sandboxed fake may read nothing outside its work directory (keep it well
+// under 96 KiB).
+func YtDlpBody(b []byte) string { return envYtDlpBody + "=" + base64.StdEncoding.EncodeToString(b) }
+
+// expectedYtDlpArgs is the fixed yt-dlp invocation (worker.YtDlpArgs) up to
+// the optional --cookies; PROXY is the egress proxy URL.
+var expectedYtDlpArgs = []string{"--ignore-config", "--no-playlist", "--match-filter", "!is_live", "-f", "bestaudio",
+	"--use-extractors", "default,-generic", "--no-cache-dir", "--no-part", "-o", "-", "--proxy", "PROXY"}
+
+var proxyArgRE = regexp.MustCompile(`^http://127\.0\.0\.1:[1-9][0-9]*$`)
+
+// fakeYtDlp imitates yt-dlp: --version, and the fixed download command,
+// which it refuses in any other form.
+func fakeYtDlp(args []string) int {
+	if len(args) == 1 && args[0] == "--version" {
+		fmt.Println(FakeYtDlpVersion)
+		return 0
+	}
+	if len(args) < len(expectedYtDlpArgs)+2 {
+		fmt.Fprintf(os.Stderr, "fake yt-dlp: unexpected arguments %q\n", args)
+		return 2
+	}
+	for i, want := range expectedYtDlpArgs {
+		if want == "PROXY" && proxyArgRE.MatchString(args[i]) || args[i] == want {
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "fake yt-dlp: argument %d is %q, want %q\n", i, args[i], want)
+		return 2
+	}
+	rest := args[len(expectedYtDlpArgs):]
+	if rest[0] == "--cookies" {
+		if code := checkCookies(rest[1]); code != 0 {
+			return code
+		}
+		rest = rest[2:]
+	}
+	if len(rest) != 2 || rest[0] != "--" {
+		fmt.Fprintf(os.Stderr, "fake yt-dlp: want -- URL at the end, got %q\n", rest)
+		return 2
+	}
+	url := rest[1]
+	body, err := base64.StdEncoding.DecodeString(os.Getenv(envYtDlpBody))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "fake yt-dlp: bad %s: %v\n", envYtDlpBody, err)
+		return 2
+	}
+	fmt.Fprintf(os.Stderr, "[youtube] Extracting URL: %s\n", url)
+	switch mode := os.Getenv(envYtDlp); mode {
+	case YtDlpOK, "":
+		_, _ = os.Stdout.Write(body)
+		return 0
+	case YtDlpUnsupported:
+		fmt.Fprintf(os.Stderr, "ERROR: No suitable extractor found for URL %s\n", url)
+		return 1
+	case YtDlpRateLimited:
+		fmt.Fprint(os.Stderr, "ERROR: [youtube] secretVideoId: Sign in to confirm you’re not a bot. "+
+			"Use --cookies-from-browser or --cookies for the authentication. See  "+
+			"https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies.\n")
+		return 1
+	case YtDlpPrivate:
+		fmt.Fprint(os.Stderr, "ERROR: [youtube] secretVideoId: Private video. Sign in if you've been granted access to this video\n")
+		return 1
+	case YtDlpCrashAfterBytes:
+		_, _ = os.Stdout.Write(body)
+		// Let the bytes reach the server before failing.
+		time.Sleep(500 * time.Millisecond)
+		fmt.Fprint(os.Stderr, "ERROR: unable to download video data: [Errno 104] Connection reset by peer\n")
+		return 1
+	case YtDlpHTML:
+		_, _ = os.Stdout.WriteString("<!DOCTYPE html>\n<html><head><title>Sign in</title></head><body>" +
+			strings.Repeat("<p>please sign in</p>", 100) + "</body></html>\n")
+		return 0
+	default:
+		fmt.Fprintf(os.Stderr, "fake yt-dlp: unknown mode %q\n", mode)
+		return 2
+	}
+}
+
+// checkCookies verifies the --cookies file is a cookies file inside the
+// work directory (the worker copies the operator's file there per run).
+func checkCookies(path string) int {
+	wd, _ := os.Getwd()
+	if filepath.Dir(path) != wd {
+		fmt.Fprintf(os.Stderr, "fake yt-dlp: --cookies %s is not in the work directory %s\n", path, wd)
+		return 2
+	}
+	b, err := os.ReadFile(path)
+	if err != nil || !strings.HasPrefix(string(b), CookiesHeader) {
+		fmt.Fprintf(os.Stderr, "ERROR: '%s' does not look like a Netscape format cookies file\n", path)
+		return 1
+	}
+	return 0
 }
