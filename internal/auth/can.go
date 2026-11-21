@@ -19,6 +19,8 @@ func Can(p Principal, a Action, r Resource) bool {
 	switch a {
 	case ActSubmitJob:
 		return admin || p.onQueue(api.RoleSubmit, r.Queue)
+	case ActSubmitURL:
+		return admin || p.onQueue(api.RoleSubmitURL, r.Queue)
 	case ActListQueue:
 		return VisibilityOn(p, r.Queue) != SeesNone
 	case ActViewJob, ActViewJobContent:
@@ -46,7 +48,8 @@ func Can(p Principal, a Action, r Resource) bool {
 	case ActViewClient:
 		return admin || p.holds(api.RoleClientAdmin, scopeAll) ||
 			(p.Kind == KindClient && p.ID != "" && p.ID == r.ClientID)
-	case ActSetQueueWeight, ActCreateQueue, ActGrantRoles, ActCreateUser, ActViewAudit:
+	case ActSetQueueWeight, ActCreateQueue, ActGrantRoles, ActCreateUser, ActViewAudit,
+		ActManageFetchPolicy:
 		return admin
 	case ActViewJobWorkers:
 		return admin || p.onQueue(api.RoleQueueAdmin, r.Queue) || p.workerAdminFor(r.WorkerID)
@@ -98,7 +101,7 @@ func VisibilityOn(p Principal, queue string) Visibility {
 		p.onQueue(api.RoleViewAll, queue) || p.onQueue(api.RoleReadAll, queue) {
 		return SeesAll
 	}
-	if p.onQueue(api.RoleSubmit, queue) {
+	if p.onQueue(api.RoleSubmit, queue) || p.onQueue(api.RoleSubmitURL, queue) {
 		return SeesOwn
 	}
 	return SeesNone

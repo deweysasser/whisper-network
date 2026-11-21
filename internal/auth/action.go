@@ -9,6 +9,10 @@ const (
 
 	// ActSubmitJob creates a job on Resource.Queue.
 	ActSubmitJob
+	// ActSubmitURL creates a fetch job (a URL to download) on Resource.Queue.
+	ActSubmitURL
+	// ActManageFetchPolicy edits fetch policies and cooldowns. Admin only.
+	ActManageFetchPolicy
 	// ActListQueue lists jobs on Resource.Queue; see Visibility for which.
 	ActListQueue
 	// ActViewJob reads a job's status document; needs Queue and OwnerID.

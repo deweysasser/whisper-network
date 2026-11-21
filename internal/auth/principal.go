@@ -50,7 +50,7 @@ func ValidateGrant(g api.Grant) error {
 	case api.RoleWorkerAdmin:
 		ok = g.Scope == scopeAll || nonEmptySuffix(g.Scope, workerScope)
 	case api.RoleQueueAdmin, api.RoleSubmit, api.RoleViewAll, api.RoleReadAll,
-		api.RoleDeleteAll, api.RoleProcess:
+		api.RoleDeleteAll, api.RoleProcess, api.RoleFetch, api.RoleSubmitURL:
 		ok = nonEmptySuffix(g.Scope, queuePrefix)
 	default:
 		return &ForbiddenError{Reason: "unknown role " + string(g.Role)}

@@ -126,3 +126,36 @@ type AuditList struct {
 	Entries    []AuditEntry `json:"entries"`
 	NextBefore int64        `json:"next_before,omitempty"`
 }
+
+// FetchPolicy is a per-site (optionally per-egress) download policy.
+// Durations are Go duration strings.
+type FetchPolicy struct {
+	Key            string
+	Site           string
+	EgressKey      string `json:",omitempty"`
+	Rules          []string
+	Concurrency    int
+	BackoffInitial string
+	BackoffCap     string
+	UpdatedBy      string
+	UpdatedAt      time.Time
+}
+
+// FetchCooldown is an active pause on fetching a site from an egress.
+type FetchCooldown struct {
+	EgressKey string
+	Site      string
+	Until     time.Time
+	Level     int
+	Manual    bool
+	SetBy     string
+	Reason    string
+}
+
+// SetCooldownRequest manually starts a cooldown; Duration is a Go duration.
+type SetCooldownRequest struct {
+	EgressKey string
+	Site      string
+	Duration  string
+	Reason    string
+}
