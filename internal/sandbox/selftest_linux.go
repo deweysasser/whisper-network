@@ -21,6 +21,9 @@ func runNetChecks(tg selfTestTargets, out map[string]string) {
 	out[CheckAbstractConnect] = outcome(dialUnix("@" + tg.abstract))
 	out[CheckUnixDgramSendto] = outcome(sendUnixDgram(tg.dgramPath))
 	out[CheckSignalParent] = outcome(unix.Kill(os.Getppid(), 0))
+	if tg.allowedTCP != "" {
+		out[CheckTCPConnectAllowed] = outcome(dialInet(unix.SOCK_STREAM, 0, tg.allowedTCP))
+	}
 }
 
 // dialInet connects (stream) or sends one datagram (dgram) to addr.

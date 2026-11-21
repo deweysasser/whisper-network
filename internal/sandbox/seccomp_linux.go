@@ -16,7 +16,9 @@ import (
 // ABI 9 and UDP from ABI 10, and never MPTCP, raw or netlink sockets; its
 // signal and abstract-socket scoping starts at ABI 6. Rather than chase each
 // protocol, a child that must not use the network may not create sockets at
-// all, nor socket pairs. Confined children also may not create or enter
+// all, nor socket pairs. A child with a TCP connect allowlist
+// (Spec.ConnectPorts) may create plain TCP sockets and nothing else;
+// Landlock's connect rules then limit where they go. Confined children also may not create or enter
 // namespaces (clone/unshare with CLONE_NEW*, setns; clone3 reports ENOSYS
 // so callers fall back to clone). Denied calls fail with an errno; nothing is killed, so a tool that
 // probes for a socket degrades the way it would on a host without network.
@@ -30,6 +32,10 @@ type seccompRules struct {
 	// denyNet makes socket(2) and socketpair(2) fail with EACCES for every
 	// family.
 	denyNet bool
+	// inetStream relaxes denyNet: socket(2) may create AF_INET and
+	// AF_INET6 SOCK_STREAM sockets with protocol 0 or IPPROTO_TCP, so
+	// Landlock's TCP connect rules decide where they go.
+	inetStream bool
 	// signalPid, when non-zero, confines signals to this process and its
 	// process group: the fallback for kernels without Landlock signal
 	// scoping (ABI < 6). Signals to other processes fail with EPERM.
@@ -74,7 +80,7 @@ func restrictSeccomp(spec Spec, abi int) ([]string, error) {
 	if !spec.Confines() {
 		return nil, nil
 	}
-	r := seccompRules{denyNet: spec.DenyNet}
+	r := seccompRules{denyNet: spec.DenyNet, inetStream: spec.DenyNet && len(spec.ConnectPorts) > 0}
 	if abi < 6 {
 		r.signalPid = os.Getpid()
 	}

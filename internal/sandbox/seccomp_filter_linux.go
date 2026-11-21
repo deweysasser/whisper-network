@@ -11,6 +11,8 @@ const (
 	seccompOffNR      = 0
 	seccompOffArch    = 4
 	seccompOffArg0Low = 16
+	seccompOffArg1Low = 24
+	seccompOffArg2Low = 32
 
 	// x32 syscalls on amd64 carry this bit in nr and use different
 	// numbers; the filter refuses them all.
@@ -35,6 +37,7 @@ const (
 	bpfJEQ   = unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K
 	bpfJGE   = unix.BPF_JMP | unix.BPF_JGE | unix.BPF_K
 	bpfJSET  = unix.BPF_JMP | unix.BPF_JSET | unix.BPF_K
+	bpfAND   = unix.BPF_ALU | unix.BPF_AND | unix.BPF_K
 	bpfRet   = unix.BPF_RET | unix.BPF_K
 )
 
@@ -87,6 +90,26 @@ func buildSeccomp(r seccompRules) ([]unix.SockFilter, error) {
 			bpfStmt(bpfRet, seccompDeny(errno)),
 			bpfStmt(bpfRet, unix.SECCOMP_RET_ALLOW))
 	}
+	// allowTCPSocket lets socket(2) through only for
+	// (AF_INET|AF_INET6, SOCK_STREAM [|SOCK_NONBLOCK|SOCK_CLOEXEC],
+	// 0|IPPROTO_TCP) and refuses every other socket with EACCES. The
+	// kernel reads all three arguments as int, so the low words decide.
+	allowTCPSocket := func() {
+		const typeFlags = unix.SOCK_NONBLOCK | unix.SOCK_CLOEXEC
+		prog = append(prog,
+			bpfJump(bpfJEQ, unix.SYS_SOCKET, 0, 11),
+			bpfStmt(bpfLoadW, seccompOffArg0Low),
+			bpfJump(bpfJEQ, unix.AF_INET, 1, 0),
+			bpfJump(bpfJEQ, unix.AF_INET6, 0, 6), // → deny
+			bpfStmt(bpfLoadW, seccompOffArg1Low),
+			bpfStmt(bpfAND, ^uint32(typeFlags)),
+			bpfJump(bpfJEQ, unix.SOCK_STREAM, 0, 3), // → deny
+			bpfStmt(bpfLoadW, seccompOffArg2Low),
+			bpfJump(bpfJEQ, 0, 2, 0),                // → allow
+			bpfJump(bpfJEQ, unix.IPPROTO_TCP, 1, 0), // → allow
+			bpfStmt(bpfRet, seccompDeny(unix.EACCES)),
+			bpfStmt(bpfRet, unix.SECCOMP_RET_ALLOW))
+	}
 
 	// Process containment: the worker kills the child's whole process
 	// group on cancel, so no descendant may leave it. io_uring can create
@@ -110,7 +133,11 @@ func buildSeccomp(r seccompRules) ([]unix.SockFilter, error) {
 		// socket), which Landlock below ABI 9 does not check. The child's
 		// inherited descriptors are /dev/null and pipes, not sockets, so
 		// with neither call there is no socket to send from.
-		deny(unix.SYS_SOCKET, unix.EACCES)
+		if r.inetStream {
+			allowTCPSocket()
+		} else {
+			deny(unix.SYS_SOCKET, unix.EACCES)
+		}
 		deny(unix.SYS_SOCKETPAIR, unix.EACCES)
 	}
 	if pid := r.signalPid; pid > 0 {

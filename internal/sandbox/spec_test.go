@@ -33,6 +33,16 @@ func TestSpecArgsRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSpecArgsRoundTripConnectPorts(t *testing.T) {
+	spec := Spec{ReadWrite: []string{"/tmp/t"}, DenyNet: true, ConnectPorts: []uint16{8080, 1, 65535}}
+	args := spec.Args()
+	assert.Contains(t, args, "--connect-port=8080")
+	assert.Contains(t, args, "--connect-port=65535")
+	inv, err := ParseArgs(append(args, "--", "yt-dlp"))
+	require.NoError(t, err)
+	assert.Equal(t, spec, inv.Spec)
+}
+
 func TestParseArgsErrors(t *testing.T) {
 	for name, args := range map[string][]string{
 		"no command":   {"--deny-net", "--"},

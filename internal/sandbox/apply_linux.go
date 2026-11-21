@@ -84,6 +84,12 @@ func landlockABI() int {
 // TCP rights that adds device ioctls (ABI 5), signal and abstract Unix
 // socket scoping (ABI 6), pathname Unix socket connects (ABI 9) and UDP
 // (ABI 10). The kernel enforces the subset it supports.
+//
+// Under DenyNet every handled network right is denied: no rules. With
+// ConnectPorts the handled set is the same (so bind(2) stays refused) plus a
+// ConnectTCP rule per port. Below ABI 4 best effort drops those rules along
+// with the TCP rights, leaving TCP connects unrestricted; that is a warning,
+// and the downloader probe reports it.
 func restrictLandlock(spec Spec, exe string, abi int) ([]string, error) {
 	if !spec.Confines() {
 		return nil, nil
@@ -94,6 +100,9 @@ func restrictLandlock(spec Spec, exe string, abi int) ([]string, error) {
 	}
 	if abi >= 1 && abi < 6 {
 		warnings = append(warnings, fmt.Sprintf("landlock ABI %d: signals and abstract sockets not scoped (needs 6; seccomp covers signals)", abi))
+	}
+	if len(spec.ConnectPorts) > 0 && abi < 4 {
+		warnings = append(warnings, fmt.Sprintf("landlock ABI %d: TCP connect not limited to ports %v (needs 4)", abi, spec.ConnectPorts))
 	}
 
 	cfg := landlock.V11.BestEffort()
@@ -109,6 +118,11 @@ func restrictLandlock(spec Spec, exe string, abi int) ([]string, error) {
 		var err error
 		if rules, err = fsRules(spec, exe); err != nil {
 			return warnings, err
+		}
+	}
+	if spec.DenyNet {
+		for _, p := range spec.ConnectPorts {
+			rules = append(rules, landlock.ConnectTCP(p))
 		}
 	}
 	if err := cfg.Restrict(rules...); err != nil {

@@ -18,8 +18,10 @@
 // On Linux the filesystem rules and IPC scoping use Landlock in best-effort
 // mode (rights the running kernel does not know are dropped rather than
 // failing), and a hand-written seccomp filter refuses every socket under
-// [Spec.DenyNet] and keeps descendants in their process group. [Probe]
-// measures what was actually enforced. On darwin only rlimits, nice and the
+// [Spec.DenyNet] (all but plain TCP when [Spec.ConnectPorts] names the
+// ports a downloader's child may reach, which Landlock then enforces) and
+// keeps descendants in their process group. [Probe] and [ProbeDownloader]
+// measure what was actually enforced. On darwin only rlimits, nice and the
 // process group are applied; on other systems the child is simply run and
 // its exit code forwarded.
 package sandbox
