@@ -359,24 +359,20 @@ func (s *Server) handleAdminListFetchPolicies(w http.ResponseWriter, r *http.Req
 	if !auth.Can(p.Principal, auth.ActManageFetchPolicy, auth.Resource{}) {
 		return s.deny(r, p, "admin required")
 	}
-	ps, err := s.st.FetchPolicies(r.Context())
+	rows, err := s.st.FetchPolicyRows(r.Context())
 	if err != nil {
 		return err
 	}
-	metas, err := s.st.FetchPolicyMetas(r.Context())
-	if err != nil {
-		return err
-	}
-	out := make([]api.FetchPolicy, len(ps))
-	for i, fp := range ps {
-		rules := make([]string, len(fp.Rules))
-		for j, ru := range fp.Rules {
-			rules[j] = ru.String()
+	out := make([]api.FetchPolicy, len(rows))
+	for i, r := range rows {
+		rules := r.Rules
+		if rules == nil {
+			rules = []string{}
 		}
-		m := metas[fp.Key]
-		out[i] = api.FetchPolicy{Key: fp.Key, Site: fp.Site, EgressKey: fp.EgressKey, Rules: rules,
-			Concurrency: fp.Concurrency, BackoffInitial: fp.BackoffInitial.String(), BackoffCap: fp.BackoffCap.String(),
-			UpdatedBy: m.UpdatedBy, UpdatedAt: m.UpdatedAt}
+		out[i] = api.FetchPolicy{Key: r.Key, Site: r.Site, EgressKey: r.EgressKey, Rules: rules,
+			Concurrency: r.Concurrency, BackoffInitial: (time.Duration(r.BackoffInitialS) * time.Second).String(),
+			BackoffCap: (time.Duration(r.BackoffCapS) * time.Second).String(),
+			UpdatedBy:  r.UpdatedBy, UpdatedAt: r.UpdatedAt, Invalid: r.Invalid != "", InvalidReason: r.Invalid}
 	}
 	writeJSON(w, http.StatusOK, out)
 	return nil
@@ -477,6 +473,9 @@ func (s *Server) handleAdminListCooldowns(w http.ResponseWriter, r *http.Request
 	return nil
 }
 
+// maxCooldown caps a manual cooldown (the longest rate window).
+const maxCooldown = 168 * time.Hour
+
 func (s *Server) handleAdminSetCooldown(w http.ResponseWriter, r *http.Request, p *Principal) error {
 	if !auth.Can(p.Principal, auth.ActManageFetchPolicy, auth.Resource{}) {
 		return s.deny(r, p, "admin required")
@@ -489,8 +488,8 @@ func (s *Server) handleAdminSetCooldown(w http.ResponseWriter, r *http.Request, 
 	if err != nil {
 		return badRequest("duration: " + err.Error())
 	}
-	if d <= 0 {
-		return badRequest("duration must be positive")
+	if d <= 0 || d > maxCooldown {
+		return badRequest("duration must be positive and at most " + maxCooldown.String())
 	}
 	until := s.now().Add(d)
 	if err := s.ops.SetCooldown(r.Context(), p.Actor(), req.EgressKey, req.Site, until, req.Reason); err != nil {

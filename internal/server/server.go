@@ -484,8 +484,16 @@ func New(cfg Config, deps Deps) (*Server, error) {
 	}
 	s.bg, s.bgCancel = context.WithCancel(context.Background())
 	s.models = newModelCache(filepath.Join(cfg.DataDir, "models"), cfg.ModelUpstream, s.httpClient, s.log)
-	s.ops = &Ops{Store: s.st, Log: s.log, PasswordParams: cfg.PasswordParams, Notify: s.disp.Notify, JobFinished: s.jobFinished, PacingChanged: s.FetchPacingChanged,
-		PasswordSlot: s.PasswordSlot, MaxUploadBytes: cfg.MaxUploadBytes}
+	s.ops = &Ops{
+		Store:          s.st,
+		Log:            s.log,
+		PasswordParams: cfg.PasswordParams,
+		Notify:         s.disp.Notify,
+		JobFinished:    s.jobFinished,
+		PacingChanged:  s.FetchPacingChanged,
+		PasswordSlot:   s.PasswordSlot,
+		MaxUploadBytes: cfg.MaxUploadBytes,
+	}
 	if deps.UI != nil {
 		s.ui = deps.UI(s)
 	}

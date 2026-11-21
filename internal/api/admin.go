@@ -139,6 +139,11 @@ type FetchPolicy struct {
 	BackoffCap     string    `json:"backoff_cap"`
 	UpdatedBy      string    `json:"updated_by"`
 	UpdatedAt      time.Time `json:"updated_at"`
+	// Invalid marks a stored row that does not validate (a hand edit). It
+	// blocks the site it governs until a PUT repairs it or a DELETE removes
+	// it; InvalidReason says why. The other fields are as stored.
+	Invalid       bool   `json:"invalid,omitempty"`
+	InvalidReason string `json:"invalid_reason,omitempty"`
 }
 
 // FetchCooldown is an active pause on fetching a site from an egress.

@@ -874,12 +874,18 @@ func (t *Tx) SetCooldown(ctx context.Context, egressKey, site string, until time
 	return nil
 }
 
-// ClearCooldown deletes the cooldown row of (egressKey, site), if any, which
-// also resets its level.
+// ClearCooldown deletes the cooldown row of (egressKey, site), which also
+// resets its level. ErrNotFound if there is none.
 func (t *Tx) ClearCooldown(ctx context.Context, egressKey, site string) error {
-	if _, err := t.tx.ExecContext(ctx, `DELETE FROM fetch_cooldowns WHERE egress_key = ? AND site = ?`,
-		egressKey, site); err != nil {
+	res, err := t.tx.ExecContext(ctx, `DELETE FROM fetch_cooldowns WHERE egress_key = ? AND site = ?`,
+		egressKey, site)
+	if err != nil {
 		return fmt.Errorf("clear cooldown: %w", err)
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return fmt.Errorf("clear cooldown: %w", err)
+	} else if n == 0 {
+		return fmt.Errorf("cooldown %s/%s: %w", egressKey, site, ErrNotFound)
 	}
 	return nil
 }
@@ -918,4 +924,51 @@ func (s *Store) FetchPolicyMetas(ctx context.Context) (map[string]FetchPolicyMet
 // downloaders removed behind the store's back.
 func (s *Store) FailAllOrphanedFetchJobs(ctx context.Context) (OrphanFailures, error) {
 	return inTx1(ctx, s, func(tx *Tx) (OrphanFailures, error) { return tx.failAllOrphanedFetchJobs(ctx) })
+}
+
+// FetchPolicyRow is a stored fetch policy as it is, valid or not.
+type FetchPolicyRow struct {
+	Key, Site, EgressKey string
+	// Rules are the stored rule strings (nil if the stored list does not
+	// parse as JSON).
+	Rules                        []string
+	Concurrency                  int
+	BackoffInitialS, BackoffCapS int64
+	UpdatedBy                    string
+	UpdatedAt                    time.Time
+	// Invalid is why the row does not validate (empty for a valid row).
+	Invalid string
+}
+
+// FetchPolicyRows returns every fetch policy row in key order, including the
+// invalid ones (which fail their site closed) with the reason.
+func (s *Store) FetchPolicyRows(ctx context.Context) ([]FetchPolicyRow, error) {
+	rows, err := s.r.QueryContext(ctx, `SELECT key, site, COALESCE(egress_key, ''), rules, concurrency,
+		backoff_initial_s, backoff_cap_s, updated_by, updated_at FROM fetch_policies ORDER BY key`)
+	if err != nil {
+		return nil, fmt.Errorf("fetch policy rows: %w", err)
+	}
+	defer rows.Close()
+	var out []FetchPolicyRow
+	for rows.Next() {
+		var r FetchPolicyRow
+		var rules string
+		var at int64
+		if err := rows.Scan(&r.Key, &r.Site, &r.EgressKey, &rules, &r.Concurrency, &r.BackoffInitialS,
+			&r.BackoffCapS, &r.UpdatedBy, &at); err != nil {
+			return nil, fmt.Errorf("fetch policy rows: %w", err)
+		}
+		r.UpdatedAt = fromMS(at)
+		p := fetchpolicy.Policy{Key: r.Key, Site: r.Site, EgressKey: r.EgressKey, Concurrency: r.Concurrency,
+			BackoffInitial: time.Duration(r.BackoffInitialS) * time.Second, BackoffCap: time.Duration(r.BackoffCapS) * time.Second}
+		if err := json.Unmarshal([]byte(rules), &r.Rules); err != nil {
+			r.Invalid = "rules: " + err.Error()
+		} else if err := parseFetchRules(&p, rules); err != nil {
+			r.Invalid = "rules: " + err.Error()
+		} else if err := p.Validate(); err != nil {
+			r.Invalid = err.Error()
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }

@@ -11,7 +11,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/deweysasser/whisper-network/internal/api"
-	"github.com/deweysasser/whisper-network/internal/store"
+	"github.com/deweysasser/whisper-network/internal/media"
+	"github.com/deweysasser/whisper-network/internal/testscale"
 )
 
 func goodPolicy() api.FetchPolicy {
@@ -70,7 +71,7 @@ func TestFetchPolicyRoundTrip(t *testing.T) {
 	require.Len(t, seeded, 2)
 	assert.Equal(t, "*", seeded[0].Key)
 	assert.Equal(t, "youtube.com", seeded[1].Key)
-	assert.Equal(t, []string{"1/3m0s"}, seeded[1].Rules)
+	assert.Equal(t, []string{"1/3m"}, seeded[1].Rules)
 	assert.Equal(t, "12h0m0s", seeded[1].BackoffInitial)
 
 	// The path key wins; site and egress derive from it.
@@ -103,6 +104,133 @@ func TestFetchPolicyRoundTrip(t *testing.T) {
 	h.expectOneAudit(mark, "fetch_policy.delete", later, "fetch_policy:example.com@label:home")
 	resp, b := h.call("DELETE", "/admin/fetch-policies/example.com@label:home", h.admin, nil)
 	h.expectProblem(resp, b, http.StatusNotFound, api.ProblemNotFound)
+}
+
+func TestPutSeededPolicies(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	for _, key := range []string{"*", "youtube.com"} {
+		mark := h.auditMark()
+		p := goodPolicy()
+		p.Concurrency = 4
+		var got api.FetchPolicy
+		h.expect("PUT", "/admin/fetch-policies/"+key, h.admin, p, http.StatusOK, &got)
+		assert.Equal(t, 4, got.Concurrency)
+		h.expectOneAudit(mark, "fetch_policy.put", later, "fetch_policy:"+key)
+	}
+}
+
+func (h *harness) corruptPolicy(key, set string) {
+	h.t.Helper()
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(h.dir, "wn.db")+"?_pragma=busy_timeout(5000)")
+	require.NoError(h.t, err)
+	defer db.Close()
+	_, err = db.Exec(`UPDATE fetch_policies SET `+set+` WHERE key = ?`, key)
+	require.NoError(h.t, err)
+}
+
+func (h *harness) policies() map[string]api.FetchPolicy {
+	h.t.Helper()
+	var ps []api.FetchPolicy
+	h.expect("GET", "/admin/fetch-policies", h.admin, nil, 200, &ps)
+	m := map[string]api.FetchPolicy{}
+	for _, p := range ps {
+		m[p.Key] = p
+	}
+	return m
+}
+
+// TestInvalidFetchPolicyVisibleAndRepairable: a hand-corrupted row blocks
+// its site, shows in GET as invalid, and a PUT repairs it (a DELETE removes
+// it).
+func TestInvalidFetchPolicyVisibleAndRepairable(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	client := h.client(submitURLOn("public"))
+	did, dtok := h.downloader("", "", "public")
+	h.fetchSubmit(client, "public", exURL)
+
+	h.corruptPolicy("*", "rules = 'garbage'")
+	h.srv.FetchPacingChanged()
+	assert.Nil(t, h.claim(did, dtok, "", nil), "an invalid default blocks every site")
+	p := h.policies()["*"]
+	assert.True(t, p.Invalid)
+	assert.NotEmpty(t, p.InvalidReason)
+	assert.Equal(t, 2, p.Concurrency)
+	assert.False(t, h.policies()["youtube.com"].Invalid)
+
+	h.expect("PUT", "/admin/fetch-policies/*", h.admin, api.FetchPolicy{Concurrency: 2, BackoffInitial: "5m",
+		BackoffCap: "6h"}, http.StatusOK, nil)
+	assert.False(t, h.policies()["*"].Invalid)
+	assert.NotNil(t, h.claim(did, dtok, "", nil), "repaired")
+
+	h.corruptPolicy("youtube.com", "concurrency = 0, backoff_cap_s = 1")
+	yt := h.policies()["youtube.com"]
+	assert.True(t, yt.Invalid)
+	assert.Equal(t, "1s", yt.BackoffCap)
+	h.expect("DELETE", "/admin/fetch-policies/youtube.com", h.admin, nil, http.StatusNoContent, nil)
+	_, ok := h.policies()["youtube.com"]
+	assert.False(t, ok)
+}
+
+// TestPolicyAndCooldownChangesWakePacing: a claim blocked by a cooldown or a
+// rate rule is woken by the admin change itself, with no other event.
+func TestPolicyAndCooldownChangesWakePacing(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	client := h.client(submitURLOn("public"))
+	did, dtok := h.downloader("a", "", "public")
+	wait := testscale.D(8 * time.Second)
+	waitClaim := func() chan *api.Lease {
+		got := make(chan *api.Lease, 1)
+		go func() { got <- h.claim(did, dtok, wait.String(), nil) }()
+		require.Eventually(t, func() bool { return len(h.srv.waiters.keys()) > 0 },
+			testscale.D(5*time.Second), 5*time.Millisecond, "the claim is waiting")
+		return got
+	}
+	woken := func(got chan *api.Lease, what string) {
+		t.Helper()
+		select {
+		case l := <-got:
+			require.NotNil(t, l, what)
+		case <-time.After(wait):
+			t.Fatal("claim not woken: " + what)
+		}
+	}
+
+	h.expect("POST", "/admin/fetch-cooldowns", h.admin, api.SetCooldownRequest{EgressKey: "label:a",
+		Site: "example.com", Duration: "1h"}, http.StatusCreated, nil)
+	var cds []api.FetchCooldown
+	h.expect("GET", "/admin/fetch-cooldowns", h.admin, nil, 200, &cds)
+	require.Len(t, cds, 1)
+	h.fetchSubmit(client, "public", exURL)
+	require.Nil(t, h.claim(did, dtok, "", nil))
+	got := waitClaim()
+	h.expect("DELETE", "/admin/fetch-cooldowns/"+escapeSeg(cds[0].EgressKey)+"/example.com", h.admin, nil,
+		http.StatusNoContent, nil)
+	woken(got, "cleared cooldown")
+
+	// A rate rule: the second youtube fetch waits until the rule is loosened.
+	h.fetchSubmit(client, "public", ytURL)
+	l := h.claim(did, dtok, "", nil)
+	require.NotNil(t, l)
+	resp, b := h.putFetch(l, dtok, canonicalFLAC(t, speech(1, media.SampleRate)))
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(b))
+	h.fetchSubmit(client, "public", ytURL+"x")
+	require.Nil(t, h.claim(did, dtok, "", nil))
+	got = waitClaim()
+	h.expect("PUT", "/admin/fetch-policies/youtube.com", h.admin, api.FetchPolicy{Concurrency: 1,
+		BackoffInitial: "1h", BackoffCap: "2h"}, http.StatusOK, nil)
+	woken(got, "loosened policy")
+}
+
+func TestClearMissingCooldown404(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	mark := h.auditMark()
+	resp, b := h.call("DELETE", "/admin/fetch-cooldowns/label%3Ahome/example.com", h.admin, nil)
+	h.expectProblem(resp, b, http.StatusNotFound, api.ProblemNotFound)
+	assert.Equal(t, mark, h.auditMark())
 }
 
 func TestDeleteDefaultPolicy409(t *testing.T) {
@@ -142,6 +270,8 @@ func TestCooldownSetAndClear(t *testing.T) {
 		{EgressKey: "label:home", Site: "example.com", Duration: "-1h"},
 		{EgressKey: "", Site: "example.com", Duration: "1h"},
 		{EgressKey: "label:home", Site: "", Duration: "1h"},
+		{EgressKey: "label:home", Site: "example.com", Duration: "169h"},
+		{EgressKey: "label:home", Site: "example.com", Duration: "9999999h"},
 	} {
 		resp, b := h.call("POST", "/admin/fetch-cooldowns", h.admin, bad)
 		h.expectProblem(resp, b, http.StatusBadRequest, api.ProblemBadRequest)
@@ -182,5 +312,4 @@ func TestReaperFailsOrphanedFetchJobs(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, api.JobFailed, got.State)
 	assert.Contains(t, got.Error, "no downloader")
-	_ = store.SystemActor
 }
