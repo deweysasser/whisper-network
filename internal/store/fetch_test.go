@@ -23,13 +23,29 @@ func (f *fixture) urlJob(queueID int64, site string) *Job {
 }
 
 // fetchEl is what a full-sandbox downloader slot offers.
-func fetchEl(waiting ...string) Eligibility {
-	return Eligibility{Kinds: []api.TaskKind{api.KindFetch}, SandboxLevel: api.SandboxFull, WaitingGroups: waiting}
+func fetchEl(waiting ...FetchWaiter) Eligibility {
+	return Eligibility{Kinds: []api.TaskKind{api.KindFetch}, SandboxLevel: api.SandboxFull, Waiting: waiting}
 }
 
+// waiters are the given downloaders as waiting fetch claims, with their
+// stored egress keys and sandbox levels.
+func (f *fixture) waiters(workerIDs ...string) []FetchWaiter {
+	f.t.Helper()
+	var out []FetchWaiter
+	for _, id := range workerIDs {
+		w := FetchWaiter{WorkerID: id}
+		require.NoError(f.t, f.s.r.QueryRowContext(f.ctx, `SELECT egress_key, sandbox_level FROM workers WHERE id = ?`,
+			id).Scan(&w.EgressKey, &w.SandboxLevel))
+		out = append(out, w)
+	}
+	return out
+}
+
+// claimFetch claims for workerID while the downloaders waiting (worker ids)
+// have fetch claims waiting.
 func (f *fixture) claimFetch(workerID string, waiting ...string) *Lease {
 	f.t.Helper()
-	l, err := f.s.Claim(f.ctx, workerID, fetchEl(waiting...), ttl)
+	l, err := f.s.Claim(f.ctx, workerID, fetchEl(f.waiters(waiting...)...), ttl)
 	require.NoError(f.t, err)
 	return l
 }
@@ -441,8 +457,8 @@ func TestFetchRotationIgnoresGroupThatCannotClaim(t *testing.T) {
 	_, err := f.s.Fail(f.ctx, lb.ID, b, "net", true)
 	require.NoError(t, err)
 	f.clk.Advance(3 * time.Minute)
-	assert.Nil(t, f.claimFetch(b, "A", "B"), "b failed the only pending task")
-	l := f.claimFetch(a, "A", "B")
+	assert.Nil(t, f.claimFetch(b, a, b), "b failed the only pending task")
+	l := f.claimFetch(a, a, b)
 	require.NotNil(t, l, "B cannot take job1, so it must not hold A back")
 	assert.Equal(t, j1.ID, l.JobID)
 }
@@ -451,13 +467,47 @@ func TestFetchRotationIgnoresGroupBelowSandboxFloor(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
 	a := f.downloader(api.SandboxFull, "A", f.pubID)
-	f.downloader(api.SandboxFSOnly, "B", f.pubID)
+	b := f.downloader(api.SandboxFSOnly, "B", f.pubID)
 	f.urlJob(f.pubID, "example.com")
 	f.urlJob(f.pubID, "example.com")
 	l := f.claimFetch(a)
 	require.NotNil(t, l)
 	f.acceptFetch(l, "x")
-	require.NotNil(t, f.claimFetch(a, "A", "B"), "B (never fetched) is below the fetch sandbox floor")
+	require.NotNil(t, f.claimFetch(a, a, b), "B (never fetched) is below the fetch sandbox floor")
+}
+
+// TestFetchRotationCountsOnlyWaitingDownloaders: rotation defers to another
+// group only for a downloader of it that is waiting now and could take the
+// task. A group whose waiting downloader holds no grant, while its granted
+// one is not waiting (busy, offline but not yet stale), must not hold the
+// site back from everyone else.
+func TestFetchRotationCountsOnlyWaitingDownloaders(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	a1 := f.downloader(api.SandboxFull, "A")            // waiting, no fetch grant
+	f.downloader(api.SandboxFull, "A", f.pubID)         // granted, not waiting
+	a3 := f.downloader(api.SandboxFSOnly, "A", f.pubID) // waiting, granted, stored level below the floor
+	b := f.downloader(api.SandboxFull, "B", f.pubID)
+	f.urlJob(f.pubID, "example.com")
+	f.urlJob(f.pubID, "example.com")
+	l := f.claimFetch(b)
+	require.NotNil(t, l)
+	f.acceptFetch(l, "b1") // B fetched the site; A never did
+	f.clk.Advance(3 * time.Minute)
+	require.NotNil(t, f.claimFetch(b, a1, a3, b), "no waiting downloader of A can take the task")
+
+	// A waiting downloader that can serve it does hold B back.
+	f.urlJob(f.pubID, "example.com")
+	f.clk.Advance(3 * time.Minute)
+	a4 := f.downloader(api.SandboxFull, "A", f.pubID)
+	assert.Nil(t, f.claimFetch(b, a4, b), "A's waiting a4 goes first")
+	// Its reported level, not the stored one, decides.
+	lowered := f.waiters(a4)
+	lowered[0].SandboxLevel = api.SandboxFSOnly
+	el := fetchEl(append(lowered, f.waiters(b)...)...)
+	got, err := f.s.Claim(f.ctx, b, el, ttl)
+	require.NoError(t, err)
+	assert.NotNil(t, got, "a4's waiting claim reports a level below the floor")
 }
 
 func TestFetchInvalidPolicyFailsClosed(t *testing.T) {
@@ -544,8 +594,8 @@ func TestFetchRotationPrefersLeastRecentGroup(t *testing.T) {
 	f.clk.Advance(3 * time.Minute)
 
 	f.urlJob(f.pubID, "youtube.com")
-	assert.Nil(t, f.claimFetch(a, "A", "B"), "B fetched youtube less recently")
-	assert.Nil(t, f.claimFetch(a, "B"), "the claimer's own key in waiting changes nothing")
+	assert.Nil(t, f.claimFetch(a, a, b), "B fetched youtube less recently")
+	assert.Nil(t, f.claimFetch(a, b), "the claimer's own waiting claim changes nothing")
 	l = f.claimFetch(a)
 	require.NotNil(t, l, "no one else waiting")
 	f.acceptFetch(l, "a2")
@@ -554,10 +604,10 @@ func TestFetchRotationPrefersLeastRecentGroup(t *testing.T) {
 	// with no downloader able to serve it is ignored.
 	f.clk.Advance(3 * time.Minute)
 	f.urlJob(f.pubID, "youtube.com")
-	f.downloader(api.SandboxFull, "C", f.pubID)
-	f.downloader(api.SandboxFull, "D") // no fetch grant
-	assert.Nil(t, f.claimFetch(b, "A", "B", "C"), "C never fetched")
-	require.NotNil(t, f.claimFetch(b, "A", "B", "D"), "D (no fetch grant) cannot serve the queue")
+	c := f.downloader(api.SandboxFull, "C", f.pubID)
+	d := f.downloader(api.SandboxFull, "D") // no fetch grant
+	assert.Nil(t, f.claimFetch(b, a, b, c), "C never fetched")
+	require.NotNil(t, f.claimFetch(b, a, b, d), "D (no fetch grant) cannot serve the queue")
 
 	// A waiting group that is itself blocked does not hold others back.
 	f.clk.Advance(3 * time.Minute)
@@ -565,7 +615,7 @@ func TestFetchRotationPrefersLeastRecentGroup(t *testing.T) {
 	_, err := f.s.w.ExecContext(f.ctx, `INSERT INTO fetch_cooldowns (egress_key, site, until, level, manual, set_by)
 		VALUES ('C', 'youtube.com', ?, 0, 1, 'user:1')`, toMS(f.clk.Now().Add(time.Hour)))
 	require.NoError(t, err)
-	require.NotNil(t, f.claimFetch(a, "A", "C"))
+	require.NotNil(t, f.claimFetch(a, a, c))
 }
 
 func TestFetchClaimRaceSameGroup(t *testing.T) {

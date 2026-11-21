@@ -458,23 +458,29 @@ func (p *pacer) lastStart(ctx context.Context, egress, site string) (int64, erro
 	return at.Int64, nil
 }
 
-// canServe reports whether some downloader of egress could claim a pending
-// fetch task of site now, by the claim's own per-worker rules: an active
-// downloader at or above the fetch sandbox floor, the claim's fetch branch
-// (fetchBranchSQL: kind and grant) and the failed-here exclusion. A waiting
-// group that cannot claim the site's tasks must not hold others back from
-// them, or the site could stall.
-func (p *pacer) canServe(ctx context.Context, egress, site string) (bool, error) {
-	levels, err := queryStrings(ctx, p.q, `SELECT DISTINCT w.sandbox_level FROM workers w
-		WHERE w.kind = 'downloader' AND w.state = 'active' AND w.egress_key = ?
-		AND EXISTS (SELECT 1 FROM tasks t JOIN jobs j ON j.id = t.job_id
-			WHERE t.state = 'pending' AND COALESCE(j.fetch_site, '') = ?
-			AND `+fetchBranchSQL("'worker:' || w.id")+` AND NOT `+failedHereFor("w.id")+`)`, egress, site)
-	if err != nil {
-		return false, fmt.Errorf("fetch rotation: %w", err)
-	}
-	for _, l := range levels {
-		if api.SandboxLevel(l).Rank() >= p.minSandbox.Rank() {
+// canServe reports whether one of the waiting downloaders ws could claim a
+// pending fetch task of site now, by the claim's own per-worker rules: an
+// active downloader whose claim reports a sandbox level at or above the
+// fetch floor, the claim's fetch branch (fetchBranchSQL: kind and grant)
+// and the failed-here exclusion. Only downloaders actually waiting count: a
+// group whose waiting downloaders cannot claim the site's tasks must not
+// hold others back from them (its other downloaders, busy or offline, are
+// not asking), or the site could stall.
+func (p *pacer) canServe(ctx context.Context, ws []FetchWaiter, site string) (bool, error) {
+	for _, w := range ws {
+		if w.SandboxLevel.Rank() < p.minSandbox.Rank() {
+			continue
+		}
+		var ok bool
+		if err := p.q.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM workers w
+			WHERE w.id = ? AND w.kind = 'downloader' AND w.state = 'active'
+			AND EXISTS (SELECT 1 FROM tasks t JOIN jobs j ON j.id = t.job_id
+				WHERE t.state = 'pending' AND COALESCE(j.fetch_site, '') = ?
+				AND `+fetchBranchSQL("'worker:' || w.id")+` AND NOT `+failedHereFor("w.id")+`))`,
+			w.WorkerID, site).Scan(&ok); err != nil {
+			return false, fmt.Errorf("fetch rotation: %w", err)
+		}
+		if ok {
 			return true, nil
 		}
 	}
@@ -512,29 +518,24 @@ func queryStrings(ctx context.Context, q querier, query string, args ...any) ([]
 //     fail closed, see fetchPolicies), the starts recorded in
 //     fetch_starts, the in-flight count (unended leases from egressKey on
 //     jobs of the site) and the cooldown; or
-//   - rotation prefers another group: some other key K in waiting (egress
-//     keys with a fetch claim waiting now) is itself allowed by pacing,
-//     has a downloader that could claim one of the site's pending tasks
-//     now (pacer.canServe: the claim's own worker rules), and
+//   - rotation prefers another group: some other key K of waiting (the
+//     downloaders with a fetch claim waiting now) is itself allowed by
+//     pacing, has a waiting downloader that could claim one of the site's
+//     pending tasks now (pacer.canServe: the claim's own worker rules), and
 //     last started a fetch of the site strictly earlier than egressKey did
 //     (never counts as earliest). Equal last starts do not block, so two
 //     groups that never fetched the site do not hold each other back.
 //
 // It runs inside the claim's transaction, so the decision and the start the
 // claim then records are atomic with respect to other claims.
-func (t *Tx) blockedFetchSites(ctx context.Context, fp *fetchPolicies, egressKey string, waiting []string,
+func (t *Tx) blockedFetchSites(ctx context.Context, fp *fetchPolicies, egressKey string, waiting []FetchWaiter,
 	now time.Time) ([]string, error) {
 	sites, err := pendingFetchSites(ctx, t.tx)
 	if err != nil || len(sites) == 0 {
 		return nil, err
 	}
 	p := &pacer{q: t.tx, fp: fp, minSandbox: t.s.cfg.FetchMinSandbox, now: now}
-	var others []string
-	for _, k := range waiting {
-		if k != egressKey && !slices.Contains(others, k) {
-			others = append(others, k)
-		}
-	}
+	others := waitingGroups(waiting, egressKey)
 	var blocked []string
 	for _, site := range sites {
 		ok, _, err := p.decide(ctx, egressKey, site)
@@ -554,14 +555,39 @@ func (t *Tx) blockedFetchSites(ctx context.Context, fp *fetchPolicies, egressKey
 	return blocked, nil
 }
 
+// waitingGroup is one other egress group's waiting downloaders.
+type waitingGroup struct {
+	key string
+	ws  []FetchWaiter
+}
+
+// waitingGroups groups the waiting downloaders of keys other than mine, in
+// first-seen order.
+func waitingGroups(waiting []FetchWaiter, mine string) []waitingGroup {
+	var out []waitingGroup
+	for _, w := range waiting {
+		if w.EgressKey == mine {
+			continue
+		}
+		i := slices.IndexFunc(out, func(g waitingGroup) bool { return g.key == w.EgressKey })
+		if i < 0 {
+			out = append(out, waitingGroup{key: w.EgressKey})
+			i = len(out) - 1
+		}
+		out[i].ws = append(out[i].ws, w)
+	}
+	return out
+}
+
 // rotationAllows reports whether no group in others should take site
 // before egress (see blockedFetchSites).
-func (p *pacer) rotationAllows(ctx context.Context, egress, site string, others []string) (bool, error) {
+func (p *pacer) rotationAllows(ctx context.Context, egress, site string, others []waitingGroup) (bool, error) {
 	mine, err := p.lastStart(ctx, egress, site)
 	if err != nil {
 		return false, err
 	}
-	for _, k := range others {
+	for _, g := range others {
+		k := g.key
 		theirs, err := p.lastStart(ctx, k, site)
 		if err != nil {
 			return false, err
@@ -576,7 +602,7 @@ func (p *pacer) rotationAllows(ctx context.Context, egress, site string, others 
 		if !ok {
 			continue
 		}
-		if ok, err = p.canServe(ctx, k, site); err != nil {
+		if ok, err = p.canServe(ctx, g.ws, site); err != nil {
 			return false, err
 		}
 		if ok {

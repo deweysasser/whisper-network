@@ -702,3 +702,45 @@ func TestFetchSiteLabel(t *testing.T) {
 	assert.Equal(t, "youtube.com", h.srv.siteLabel(h.ctx, "youtube.com"))
 	assert.Equal(t, "other", h.srv.siteLabel(h.ctx, "vimeo.com"))
 }
+
+// TestRotationBlockedClaimRewoken: a claim that rotation holds back for a
+// less recent group is woken when that group's claim takes a fetch, which
+// makes the held-back group the least recent: it must not sleep out its
+// long poll.
+func TestRotationBlockedClaimRewoken(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	client := h.client(submitURLOn("public"))
+	aid, atok := h.downloader("a", "", "public")
+	bid, btok := h.downloader("b", "", "public")
+	// a fetches the site once; b never has.
+	h.fetchSubmit(client, "public", exURL)
+	l := h.claim(aid, atok, "", nil)
+	require.NotNil(t, l)
+	resp, body := h.putFetch(l, atok, canonicalFLAC(t, speech(1, media.SampleRate)))
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+	h.clk.Advance(time.Hour)
+
+	// b has a claim waiting (registered directly: only its presence
+	// matters), so a's claims are held back for b.
+	defer h.srv.waiters.add(store.FetchWaiter{WorkerID: bid, EgressKey: "label:b", SandboxLevel: api.SandboxFull})()
+	h.fetchSubmit(client, "public", exURL+"?1")
+	h.fetchSubmit(client, "public", exURL+"?2")
+	wait := testscale.D(8 * time.Second)
+	got := make(chan *api.Lease, 1)
+	go func() { got <- h.claim(aid, atok, wait.String(), nil) }()
+	require.Eventually(t, func() bool { return slices.Contains(h.srv.waiters.keys(), "label:a") },
+		testscale.D(5*time.Second), 5*time.Millisecond, "a's claim is waiting")
+	assert.Nil(t, h.claim(aid, atok, "", nil), "rotation holds a back while b waits")
+
+	lb := h.claim(bid, btok, "", nil)
+	require.NotNil(t, lb, "b, the least recent group, takes one")
+	start := time.Now()
+	select {
+	case la := <-got:
+		require.NotNil(t, la, "a's waiting claim was woken and took the other job")
+		assert.Less(t, time.Since(start), wait)
+	case <-time.After(wait + testscale.D(2*time.Second)):
+		t.Fatal("a's claim never returned")
+	}
+}

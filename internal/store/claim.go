@@ -36,9 +36,17 @@ type Eligibility struct {
 	// EgressKey is the downloader's egress key for fetch pacing. When
 	// empty, Claim uses the worker's stored egress_key.
 	EgressKey string
-	// WaitingGroups are the egress keys of downloaders with a fetch claim
-	// waiting now (from the server), for rotation: see blockedFetchSites.
-	WaitingGroups []string
+	// Waiting are the downloader claims waiting for a fetch task now (from
+	// the server), for rotation between egress groups: see
+	// blockedFetchSites.
+	Waiting []FetchWaiter
+}
+
+// FetchWaiter is a downloader whose fetch claim is waiting now: its egress
+// key and the sandbox level its claim reported.
+type FetchWaiter struct {
+	WorkerID, EgressKey string
+	SandboxLevel        api.SandboxLevel
 }
 
 // Lease is a lease together with what a worker needs to run its task.
@@ -227,7 +235,7 @@ func (s *Store) Claim(ctx context.Context, workerID string, el Eligibility, ttl 
 			if fp, err = loadFetchPolicies(ctx, tx); err != nil {
 				return err
 			}
-			if c.blocked, err = (&Tx{s: s, tx: tx}).blockedFetchSites(ctx, fp, egress, el.WaitingGroups, now); err != nil {
+			if c.blocked, err = (&Tx{s: s, tx: tx}).blockedFetchSites(ctx, fp, egress, el.Waiting, now); err != nil {
 				return err
 			}
 		}

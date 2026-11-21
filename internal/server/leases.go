@@ -105,13 +105,14 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request, p *Principa
 			return err
 		}
 		if wait > 0 {
-			defer s.waiters.add(el.EgressKey)()
+			defer s.waiters.add(store.FetchWaiter{WorkerID: wk.ID, EgressKey: el.EgressKey,
+				SandboxLevel: el.SandboxLevel})()
 		}
 	}
 	rescheduled := false
 	for {
 		if downloader {
-			el.WaitingGroups = s.waiters.keys()
+			el.Waiting = s.waiters.waiting()
 		}
 		// Take the wake-up channel before claiming so a notification that
 		// races with an empty claim is not lost.
@@ -133,6 +134,12 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request, p *Principa
 			if lease.Kind == api.KindFetch {
 				// The start may close a rate window: when does it reopen?
 				s.reschedulePacing()
+				if len(waitingKeys(el.Waiting)) > 1 {
+					// Rotation may have held another group's waiting
+					// claims back for this one; this start changes who
+					// is least recent, so let them look again.
+					s.disp.Notify()
+				}
 			}
 			if s.afterClaim != nil {
 				s.afterClaim(ctx)

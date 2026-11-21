@@ -166,38 +166,68 @@ func egressKeyFor(f api.WorkerFacts, remote string) string {
 	return "unknown"
 }
 
-// fetchWaiters counts the egress keys of downloaders whose fetch claim is
-// long-polling now (a multiset), for the store's rotation between groups.
+// fetchWaiters tracks the downloaders whose fetch claim is long-polling now,
+// for the store's rotation between egress groups (store.FetchWaiter): each
+// worker's egress key and reported sandbox level, counted per worker (a
+// worker's slots wait separately).
 type fetchWaiters struct {
 	mu sync.Mutex
-	n  map[string]int
+	w  map[string]*fetchWaiter
 }
 
-// add registers one waiting claim from key. The returned remove func is
+type fetchWaiter struct {
+	store.FetchWaiter
+	n int
+}
+
+// add registers one waiting claim of w. The returned remove func is
 // idempotent.
-func (f *fetchWaiters) add(key string) (remove func()) {
+func (f *fetchWaiters) add(w store.FetchWaiter) (remove func()) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.n == nil {
-		f.n = map[string]int{}
+	if f.w == nil {
+		f.w = map[string]*fetchWaiter{}
 	}
-	f.n[key]++
+	e := f.w[w.WorkerID]
+	if e == nil {
+		e = &fetchWaiter{}
+		f.w[w.WorkerID] = e
+	}
+	e.FetchWaiter = w // the latest claim's key and level
+	e.n++
 	return sync.OnceFunc(func() {
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		if f.n[key]--; f.n[key] <= 0 {
-			delete(f.n, key)
+		if e.n--; e.n <= 0 && f.w[w.WorkerID] == e {
+			delete(f.w, w.WorkerID)
 		}
 	})
 }
 
-// keys returns the distinct waiting keys, sorted.
-func (f *fetchWaiters) keys() []string {
+// waiting returns the waiting downloaders, by worker id.
+func (f *fetchWaiters) waiting() []store.FetchWaiter {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	out := make([]string, 0, len(f.n))
-	for k := range f.n {
-		out = append(out, k)
+	out := make([]store.FetchWaiter, 0, len(f.w))
+	for _, e := range f.w {
+		out = append(out, e.FetchWaiter)
+	}
+	slices.SortFunc(out, func(a, b store.FetchWaiter) int { return strings.Compare(a.WorkerID, b.WorkerID) })
+	return out
+}
+
+// keys returns the distinct egress keys of the waiting downloaders, sorted.
+func (f *fetchWaiters) keys() []string {
+	return waitingKeys(f.waiting())
+}
+
+// waitingKeys is the distinct egress keys of ws, sorted.
+func waitingKeys(ws []store.FetchWaiter) []string {
+	var out []string
+	for _, w := range ws {
+		if !slices.Contains(out, w.EgressKey) {
+			out = append(out, w.EgressKey)
+		}
 	}
 	slices.Sort(out)
 	return out
