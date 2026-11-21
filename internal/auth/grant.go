@@ -25,7 +25,8 @@ func (e *ForbiddenError) Is(target error) bool { return target == ErrForbidden }
 // transcripts, so it may not hand that power out (admin only).
 func queueGrantable(r api.Role) bool {
 	switch r {
-	case api.RoleSubmit, api.RoleViewAll, api.RoleDeleteAll, api.RoleProcess:
+	case api.RoleSubmit, api.RoleViewAll, api.RoleDeleteAll, api.RoleProcess,
+		api.RoleSubmitURL, api.RoleFetch:
 		return true
 	}
 	return false

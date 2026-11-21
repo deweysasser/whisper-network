@@ -309,3 +309,35 @@ func TestDefaultHTTPClientIsPrivate(t *testing.T) {
 	assert.Nil(t, hc.CheckRedirect, "the caller's client is not modified")
 	assert.NotNil(t, c.hc.CheckRedirect)
 }
+
+func TestSubmitURL(t *testing.T) {
+	var gotKey, gotCT string
+	var gotBody api.FetchRequest
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /queue/{q}/fetch", func(w http.ResponseWriter, r *http.Request) {
+		gotKey, gotCT = r.Header.Get("Idempotency-Key"), r.Header.Get("Content-Type")
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&gotBody))
+		w.Header().Set("Location", "/job/j9")
+		writeJSON(w, http.StatusCreated, api.Job{ID: "j9", State: api.JobFetching})
+	})
+	mux.HandleFunc("POST /queue/nodl/fetch", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", api.ProblemContentType)
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(api.Problem{Type: "no-downloader", Title: "Conflict", Status: 409, Detail: "no downloader online"})
+	})
+	c, _ := newTestClient(t, mux)
+	job, err := c.SubmitURL(context.Background(), "public",
+		api.FetchRequest{JobParams: api.JobParams{Model: "small.en", Label: "x"}, URL: "https://example.com/a"}, "k2")
+	require.NoError(t, err)
+	assert.Equal(t, "j9", job.ID)
+	assert.Equal(t, "k2", gotKey)
+	assert.Equal(t, "application/json", gotCT)
+	assert.Equal(t, "https://example.com/a", gotBody.URL)
+	assert.Equal(t, "small.en", gotBody.Model)
+
+	_, err = c.SubmitURL(context.Background(), "nodl", api.FetchRequest{URL: "https://example.com/a"}, "")
+	var ce *Error
+	require.ErrorAs(t, err, &ce)
+	assert.Equal(t, "no-downloader", ce.Problem.Type)
+	assert.Contains(t, err.Error(), "no downloader online")
+}

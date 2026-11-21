@@ -233,15 +233,19 @@ func (o *Ops) RegisterWorker(ctx context.Context, tokenHash string, facts api.Wo
 // ffmpeg_version that changed, its previous value under "old_<name>", so a
 // worker restarted on another build is traceable.
 func (o *Ops) UpdateWorkerFacts(ctx context.Context, a Actor, workerID string, facts api.WorkerFacts) error {
-	_, err := o.commit(ctx, a, func(tx *store.Tx, rec recorder) error {
+	var orphaned store.OrphanFailures
+	_, err := o.commit(ctx, a, func(tx *store.Tx, rec recorder) (err error) {
 		old, err := tx.WorkerByID(ctx, workerID)
 		if err != nil {
 			return err
 		}
-		if err := tx.UpdateWorkerFacts(ctx, workerID, facts); err != nil {
+		if orphaned, err = tx.UpdateWorkerFacts(ctx, workerID, facts); err != nil {
 			return err
 		}
 		d := workerFactsDetail(facts)
+		if len(orphaned.Jobs) > 0 {
+			d["failed_jobs"] = orphaned.Jobs
+		}
 		for name, v := range map[string][2]string{
 			"version":        {old.Facts.Version, facts.Version},
 			"engine_version": {old.Facts.EngineVersion, facts.EngineVersion},
@@ -253,6 +257,9 @@ func (o *Ops) UpdateWorkerFacts(ctx context.Context, a Actor, workerID string, f
 		}
 		return rec("worker.update_facts", store.WorkerPrincipal(workerID), d)
 	})
+	if err == nil {
+		o.jobsFinished(ctx, orphaned.Jobs)
+	}
 	return err
 }
 

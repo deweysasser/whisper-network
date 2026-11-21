@@ -50,37 +50,62 @@ func addGrant(ctx context.Context, tx *sql.Tx, principal string, role api.Role, 
 // access to a queue's media takes effect at once rather than when the
 // running task ends. The cancelled leases' ids are returned; the caller
 // should wake waiting claims if there are any.
+//
+// It is a convenience for tests and tools: it does not report the fetching
+// jobs the revocation fails for want of a downloader. The server revokes
+// through Tx.RevokeGrant, which does.
 func (s *Store) RemoveGrant(ctx context.Context, principal string, role api.Role, scope string) ([]string, error) {
-	return inTx1(ctx, s, func(tx *Tx) ([]string, error) { return tx.RemoveGrant(ctx, principal, role, scope) })
+	return inTx1(ctx, s, func(tx *Tx) ([]string, error) {
+		r, err := tx.RevokeGrant(ctx, principal, role, scope)
+		return r.Cancelled, err
+	})
 }
 
-// RemoveGrant is Store.RemoveGrant inside the transaction.
-func (t *Tx) RemoveGrant(ctx context.Context, principal string, role api.Role, scope string) ([]string, error) {
+// Revocation is the effect of removing a grant.
+type Revocation struct {
+	// Cancelled are the leases of the principal that the revocation ended.
+	Cancelled []string
+	// Orphaned are the fetching jobs failed because no eligible downloader
+	// was left, and the leases (any worker's) ended by failing them.
+	Orphaned OrphanFailures
+}
+
+// RevokeGrant is RemoveGrant reporting the whole effect.
+func (t *Tx) RevokeGrant(ctx context.Context, principal string, role api.Role, scope string) (Revocation, error) {
+	var out Revocation
 	res, err := t.tx.ExecContext(ctx, `DELETE FROM grants WHERE principal = ? AND role = ? AND scope = ?`,
 		principal, string(role), scope)
 	if err := mustAffect(res, err, "remove grant"); err != nil {
-		return nil, err
+		return out, err
 	}
 	workerID, isWorker := strings.CutPrefix(principal, "worker:")
-	if role != api.RoleProcess || !isWorker {
-		return nil, nil
+	if !isWorker || (role != api.RoleProcess && role != api.RoleFetch) {
+		return out, nil
 	}
-	ls, err := liveLeases(ctx, t.tx, `l.worker_id = ? AND t.job_id IS NOT NULL AND NOT `+processGrantSQL, workerID, principal)
+	reason, cond := "process grant revoked", `t.kind <> 'fetch' AND NOT `+processGrantSQL
+	if role == api.RoleFetch {
+		reason, cond = "fetch grant revoked", `t.kind = 'fetch' AND NOT `+fetchGrantSQL
+	}
+	ls, err := liveLeases(ctx, t.tx, `l.worker_id = ? AND t.job_id IS NOT NULL AND `+cond, workerID, principal)
 	if err != nil {
-		return nil, err
+		return out, err
 	}
 	now := t.s.now()
-	var cancelled []string
 	for _, l := range ls {
-		end, err := t.s.endLease(ctx, t.tx, l, api.OutcomeCancelled, true, "process grant revoked", "", now)
+		end, err := t.s.endLease(ctx, t.tx, l, api.OutcomeCancelled, true, reason, "", now)
 		if err != nil {
-			return nil, err
+			return out, err
 		}
 		if end != nil {
-			cancelled = append(cancelled, l.ID)
+			out.Cancelled = append(out.Cancelled, l.ID)
 		}
 	}
-	return cancelled, nil
+	if role == api.RoleFetch {
+		if out.Orphaned, err = t.failAllOrphanedFetchJobs(ctx); err != nil {
+			return out, err
+		}
+	}
+	return out, nil
 }
 
 // GrantsFor lists a principal's grants ordered by role then scope.

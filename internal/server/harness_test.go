@@ -35,10 +35,36 @@ import (
 	"github.com/deweysasser/whisper-network/internal/testscale"
 )
 
-// fakeClock is a settable clock shared by the store and the server.
+// fakeClock is a settable clock shared by the store and the server. Its
+// AfterFunc timers fire (each in its own goroutine) when Advance reaches
+// them.
 type fakeClock struct {
-	mu sync.Mutex
-	t  time.Time
+	mu     sync.Mutex
+	t      time.Time
+	timers []*fakeTimer
+}
+
+type fakeTimer struct {
+	due  time.Time
+	f    func()
+	done bool // fired or stopped
+}
+
+// AfterFunc is time.AfterFunc on the fake clock; it returns the stop func.
+func (c *fakeClock) AfterFunc(d time.Duration, f func()) func() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	t := &fakeTimer{due: c.t.Add(d), f: f}
+	c.timers = append(c.timers, t)
+	return func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if t.done {
+			return false
+		}
+		t.done = true
+		return true
+	}
 }
 
 func (c *fakeClock) Now() time.Time {
@@ -49,8 +75,24 @@ func (c *fakeClock) Now() time.Time {
 
 func (c *fakeClock) Advance(d time.Duration) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.t = c.t.Add(d)
+	var due []*fakeTimer
+	keep := c.timers[:0]
+	for _, t := range c.timers {
+		switch {
+		case t.done:
+		case !t.due.After(c.t):
+			t.done = true
+			due = append(due, t)
+		default:
+			keep = append(keep, t)
+		}
+	}
+	c.timers = keep
+	c.mu.Unlock()
+	for _, t := range due {
+		go t.f()
+	}
 }
 
 // syncBuffer is a goroutine-safe log sink (handlers log concurrently).
@@ -161,7 +203,8 @@ func newHarness(t *testing.T, opts ...harnessOpt) *harness {
 	logger := obs.NewLogger(zerolog.New(h.logs).With().Timestamp().Logger(), obs.ModeServer)
 	h.srv, err = New(cfg, Deps{Store: h.st, Blobs: h.blobs, Logger: logger, Metrics: h.metrics, Now: h.clk.Now,
 		FreeBytes:  func(string) (int64, error) { return h.free.Load(), nil },
-		TotalBytes: func(string) (int64, error) { return h.total.Load(), nil }, LookupModel: lookupTestModel})
+		TotalBytes: func(string) (int64, error) { return h.total.Load(), nil }, LookupModel: lookupTestModel,
+		AfterFunc: h.clk.AfterFunc})
 	require.NoError(t, err)
 	h.ts = httptest.NewServer(h.srv.Handler())
 	t.Cleanup(func() {
@@ -181,6 +224,61 @@ func (h *harness) client(grants ...api.Grant) string {
 }
 
 func submitOn(q string) api.Grant { return api.Grant{Role: api.RoleSubmit, Scope: "queue:" + q} }
+
+func submitURLOn(q string) api.Grant { return api.Grant{Role: api.RoleSubmitURL, Scope: "queue:" + q} }
+
+// downloader registers a downloader worker in egress group (none if empty)
+// at sandbox level lvl (full if empty) and approves it for queues.
+func (h *harness) downloader(group string, lvl api.SandboxLevel, queues ...string) (string, string) {
+	h.t.Helper()
+	return h.activeWorker(api.WorkerFacts{Kind: api.WorkerDownloader, Kinds: []api.TaskKind{api.KindFetch},
+		Models: []string{}, EgressGroup: group, SandboxLevel: lvl}, queues...)
+}
+
+// fetchCall posts a URL job and returns the response and body.
+func (h *harness) fetchCall(token, queue string, fr api.FetchRequest, key string) (*http.Response, []byte) {
+	h.t.Helper()
+	b, err := json.Marshal(fr)
+	require.NoError(h.t, err)
+	hdr := map[string]string{"Content-Type": "application/json"}
+	if key != "" {
+		hdr["Idempotency-Key"] = key
+	}
+	resp := h.do(req{method: "POST", path: "/queue/" + queue + "/fetch", token: token, body: bytes.NewReader(b), header: hdr})
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(h.t, err)
+	return resp, body
+}
+
+// fetchSubmit posts a URL job and requires 201, returning the job.
+func (h *harness) fetchSubmit(token, queue, url string) api.Job {
+	h.t.Helper()
+	resp, b := h.fetchCall(token, queue, api.FetchRequest{JobParams: api.JobParams{Model: "small.en"}, URL: url}, "")
+	require.Equal(h.t, http.StatusCreated, resp.StatusCode, string(b))
+	var j api.Job
+	require.NoError(h.t, json.Unmarshal(b, &j))
+	assert.Equal(h.t, "/job/"+j.ID, resp.Header.Get("Location"))
+	return j
+}
+
+// putFetch PUTs a fetch result with a chunked body (no Content-Length).
+func (h *harness) putFetch(l *api.Lease, token string, body []byte) (*http.Response, []byte) {
+	h.t.Helper()
+	resp := h.do(req{method: "PUT", path: "/lease/" + l.ID + "/result", token: token,
+		body:   io.MultiReader(bytes.NewReader(body)),
+		header: map[string]string{"Content-Type": "application/octet-stream", api.HeaderFetchMethod: "yt-dlp"}})
+	b, err := io.ReadAll(resp.Body)
+	require.NoError(h.t, err)
+	return resp, b
+}
+
+// metricsText renders the server's metrics.
+func (h *harness) metricsText() string {
+	h.t.Helper()
+	var b bytes.Buffer
+	h.metrics.Set().WritePrometheus(&b)
+	return b.String()
+}
 
 // req is one HTTP request in a test.
 type req struct {

@@ -21,7 +21,7 @@
   <div class="scroll">
   <table class="data workers">
     <thead><tr>
-      {{template "th" (col "workers.worker")}}{{template "th" (col "workers.state")}}{{template "th" (col "workers.queues")}}{{template "th" (col "workers.sandbox")}}
+      {{template "th" (col "workers.worker")}}{{template "th" (col "workers.kind")}}{{template "th" (col "workers.state")}}{{template "th" (col "workers.queues")}}{{template "th" (col "workers.sandbox")}}
       {{template "th" (col "workers.version")}}{{template "th" (col "workers.slots" "n")}}{{template "th" (col "workers.seen")}}
       {{template "th" (col "workers.done" "n")}}{{template "th" (col "workers.audio" "n")}}{{template "th" (col "workers.rtf" "n")}}{{template "th" (col "workers.failure" "n")}}
       {{- /* Further summary columns add their headers here, matching cells in "worker-row". */}}
@@ -30,7 +30,7 @@
     <tbody>
     {{range .Data.Rows}}{{template "worker-row" .}}
     {{else}}
-    <tr><td colspan="12" class="muted">{{if .Data.State}}No workers in state {{.Data.State}}.{{else}}No workers are registered, or none you may manage.{{end}}</td></tr>
+    <tr><td colspan="13" class="muted">{{if .Data.State}}No workers in state {{.Data.State}}.{{else}}No workers are registered, or none you may manage.{{end}}</td></tr>
     {{end}}
     </tbody>
   </table>
@@ -46,6 +46,8 @@
     {{template "ref" .Ref}}
     {{- with .Hostname}}<div class="muted small">{{.}}</div>{{end}}
   </td>
+  <td><span class="badge kind-{{.Kind}}" title="{{vhelp "worker" (or .Kind "processing")}}">{{or .Kind "processing"}}</span>
+    {{- if eq (print .Kind) "downloader"}}<div class="muted small"><code>{{.EgressKey}}</code>{{with .YtDlpVersion}} · yt-dlp {{.}}{{end}}</div>{{end}}</td>
   <td><span class="badge state-{{.State}}" title="{{vhelp "worker" .State}}">{{.State}}</span>{{with .PauseReason}} <span class="badge auto-paused" title="Paused by the circuit breaker: {{.}}">auto</span>{{end}}</td>
   <td>{{range .Queues}}<span class="chip">{{.}}</span>{{else}}<span class="muted">none</span>{{end}}</td>
   <td><span class="badge sandbox-{{.Sandbox}}">{{.Sandbox}}</span></td>

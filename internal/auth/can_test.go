@@ -331,3 +331,41 @@ func TestJobAccessMatrix(t *testing.T) {
 		})
 	}
 }
+
+func TestCanSubmitURL(t *testing.T) {
+	sub := g(api.RoleSubmitURL, "queue:A")
+	r := Resource{Queue: "A"}
+	assert.True(t, Can(user(sub), ActSubmitURL, r))
+	assert.True(t, Can(client(sub), ActSubmitURL, r))
+	assert.True(t, Can(user(admin), ActSubmitURL, r))
+	assert.False(t, Can(user(submitA), ActSubmitURL, r))
+	assert.False(t, Can(user(sub), ActSubmitURL, Resource{Queue: "B"}))
+	assert.False(t, Can(worker(sub), ActSubmitURL, r))
+}
+
+func TestSubmitURLOwnJobRights(t *testing.T) {
+	p := Principal{Kind: KindClient, ID: "c1", Grants: []api.Grant{g(api.RoleSubmitURL, "queue:A")}}
+	own := Resource{Queue: "A", OwnerID: "c1"}
+	other := Resource{Queue: "A", OwnerID: "c2"}
+	for _, a := range []Action{ActViewJob, ActViewJobContent, ActDownloadTranscript, ActDeleteJob, ActRetryJob} {
+		assert.True(t, Can(p, a, own), "action %d own", a)
+		assert.False(t, Can(p, a, other), "action %d other", a)
+	}
+	assert.Equal(t, SeesOwn, VisibilityOn(p, "A"))
+	assert.True(t, Can(p, ActListQueue, Resource{Queue: "A"}))
+}
+
+func TestCanManageFetchPolicy(t *testing.T) {
+	assert.True(t, Can(user(admin), ActManageFetchPolicy, Resource{}))
+	assert.False(t, Can(user(qaA), ActManageFetchPolicy, Resource{Queue: "A"}))
+	assert.False(t, Can(user(waAll), ActManageFetchPolicy, Resource{}))
+	assert.False(t, Can(worker(), ActManageFetchPolicy, Resource{}))
+}
+
+func TestLeaseTaskFetchOrProcess(t *testing.T) {
+	r := Resource{Queue: "A"}
+	assert.True(t, Can(worker(g(api.RoleFetch, "queue:A")), ActLeaseTask, r))
+	assert.True(t, Can(worker(g(api.RoleProcess, "queue:A")), ActLeaseTask, r))
+	assert.False(t, Can(worker(g(api.RoleFetch, "queue:B")), ActLeaseTask, r))
+	assert.False(t, Can(worker(), ActLeaseTask, r))
+}

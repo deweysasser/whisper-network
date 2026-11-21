@@ -51,7 +51,9 @@ const (
 	ActViewWorker
 	// ActUpdateWorker updates a worker's facts. The worker itself only.
 	ActUpdateWorker
-	// ActGrantProcess grants a worker process on Resource.Queue.
+	// ActGrantProcess grants a worker its working role on Resource.Queue:
+	// process for a processing worker, fetch for a downloader (the same
+	// queue_admin right; see CanApproveWorker).
 	ActGrantProcess
 	// ActLeaseTask claims a task from Resource.Queue. Workers only.
 	ActLeaseTask
@@ -84,6 +86,11 @@ const (
 	// ActViewJob on the job; without this, the job shows only that it is
 	// running (DESIGN.md §5.3).
 	ActViewJobWorkers
+
+	// ActSubmitURL creates a fetch job (a URL to download) on Resource.Queue.
+	ActSubmitURL
+	// ActManageFetchPolicy edits fetch policies and cooldowns. Admin only.
+	ActManageFetchPolicy
 )
 
 // Resource identifies what an Action targets. Fields irrelevant to the

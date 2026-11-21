@@ -137,7 +137,8 @@ button.link.danger { color: var(--danger); }
 .state-active, .job-done, .online { color: var(--ok); }
 .state-paused { color: var(--muted); }
 .state-rejected, .job-failed { color: var(--danger); }
-.job-running { color: var(--accent); }
+.job-running, .job-fetching { color: var(--accent); }
+.kind-downloader { color: var(--accent); }
 .sandbox-none { color: var(--danger); }
 .sandbox-fs-only { color: var(--warn); }
 .sandbox-full { color: var(--ok); }
@@ -165,6 +166,8 @@ table.workers tr.worker-paused:has(.auto-paused) td:first-child { box-shadow: in
 .small { font-size: 0.85em; }
 .error { color: var(--danger); }
 .notice { color: var(--warn); }
+.notice.error, .invalid-reason, tr.invalid code { color: var(--danger); }
+tr.invalid td:first-child { box-shadow: inset 4px 0 0 var(--danger); }
 .wrap { overflow-wrap: anywhere; white-space: pre-wrap; }
 .secret { border-color: var(--warn); }
 .token { display: block; padding: 0.6rem; overflow-wrap: anywhere; user-select: all; }

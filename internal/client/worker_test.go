@@ -346,3 +346,37 @@ func TestDownloadInputCap(t *testing.T) {
 		require.ErrorIs(t, err, ErrInputTooLarge)
 	})
 }
+
+func TestPutFetchResult(t *testing.T) {
+	var got struct {
+		ct, method, body string
+		te               []string
+		cl               int64
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /lease/{id}/result", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		if r.PathValue("id") == "moved" {
+			http.Redirect(w, r, "/lease/l1/result", http.StatusTemporaryRedirect)
+			return
+		}
+		b, _ := io.ReadAll(r.Body)
+		got.ct, got.method, got.body = r.Header.Get("Content-Type"), r.Header.Get(api.HeaderFetchMethod), string(b)
+		got.te, got.cl = r.TransferEncoding, r.ContentLength
+		w.WriteHeader(http.StatusOK)
+	}))
+	c, _ := newTestClient(t, mux)
+	ctx := context.Background()
+
+	// A reader of unknown length is sent chunked.
+	require.NoError(t, c.PutFetchResult(ctx, "l1", api.FetchMethodYtDlp, io.MultiReader(strings.NewReader("ID3"), strings.NewReader("media"))))
+	assert.Equal(t, "application/octet-stream", got.ct)
+	assert.Equal(t, api.FetchMethodYtDlp, got.method)
+	assert.Equal(t, "ID3media", got.body)
+	assert.Equal(t, []string{"chunked"}, got.te)
+	assert.Equal(t, int64(-1), got.cl)
+
+	got.body = ""
+	err := c.PutFetchResult(ctx, "moved", api.FetchMethodHTTP, strings.NewReader("x"))
+	require.Error(t, err, "redirects are not followed")
+	assert.Empty(t, got.body)
+}

@@ -18,11 +18,38 @@ const (
 	CheckAbstractConnect = "abstract_connect"  // connect to an abstract Unix socket
 	CheckUnixDgramSendto = "unix_dgram_sendto" // socketpair(AF_UNIX, SOCK_DGRAM), then sendto a pathname socket outside the allowed paths
 	CheckSignalParent    = "signal_parent"     // kill(parent, 0): signal a process outside the sandbox
+
+	// CheckTCPConnectAllowed is the one check that must succeed: a TCP
+	// connect to a port of [Spec.ConnectPorts]. Only [ProbeDownloader]
+	// runs it.
+	CheckTCPConnectAllowed = "tcp_connect_allowed"
+	// CheckTCPListen is listen(2) on an unbound TCP socket (an autobind to
+	// an ephemeral port). Only [ProbeDownloader] runs it: elsewhere no
+	// socket can be created at all.
+	CheckTCPListen = "tcp_listen"
+	// CheckTCPFastOpen is sendto(2) with MSG_FASTOPEN to the tcp_connect
+	// listener (a port outside the allowlist): a connect that Landlock's
+	// connect hook does not see, which only the seccomp filter refuses.
+	// Only [ProbeDownloader] runs it. A kernel with TCP Fast Open disabled
+	// reports it unsupported.
+	CheckTCPFastOpen = "tcp_fastopen"
+	// CheckAbstractBind is bind(2) of a socketpair(AF_UNIX, SOCK_STREAM)
+	// end to an abstract name: the stream pairs the downloader profile
+	// allows must not claim names other processes connect to. Only
+	// [ProbeDownloader] runs it.
+	CheckAbstractBind = "abstract_bind"
 )
 
 // Checks lists every self-test check.
 var Checks = []string{CheckFSRead, CheckTCPConnect, CheckMPTCPConnect, CheckUDPSend,
 	CheckUnixConnect, CheckAbstractConnect, CheckUnixDgramSendto, CheckSignalParent}
+
+// DownloaderChecks lists the checks of a downloader self-test: every check of
+// [Checks], where tcp_connect targets a port outside the allowlist, plus
+// [CheckTCPListen], [CheckTCPFastOpen], [CheckAbstractBind] and
+// [CheckTCPConnectAllowed].
+var DownloaderChecks = append(append([]string(nil), Checks...), CheckTCPListen, CheckTCPFastOpen, CheckAbstractBind,
+	CheckTCPConnectAllowed)
 
 // Outcomes of a check.
 const (
@@ -45,18 +72,24 @@ type selfTestReport struct {
 // selfTestTargets are the self-test's arguments, in order.
 type selfTestTargets struct {
 	forbidden, allowed, tcp, udp, unixPath, abstract, dgramPath string
+	// allowedTCP, when set, is a listener on a port of the spec's
+	// ConnectPorts, for [CheckTCPConnectAllowed].
+	allowedTCP string
 }
 
 // runSelfTest applies the spec to this process, then tries the operations the
 // sandbox should forbid. inv.Argv is {forbiddenFile, allowedFile, tcpAddr,
-// udpAddr, unixSocketPath, abstractSocketName, unixDgramSocketPath}. The
-// report goes to stdout as one JSON object.
+// udpAddr, unixSocketPath, abstractSocketName, unixDgramSocketPath
+// [allowedTCPAddr]}. The report goes to stdout as one JSON object.
 func runSelfTest(inv Invocation) error {
-	if len(inv.Argv) != 7 {
-		return errors.New("sandbox-exec: selftest wants: forbiddenFile allowedFile tcpAddr udpAddr unixSocket abstractSocket unixDgramSocket")
+	if len(inv.Argv) != 7 && len(inv.Argv) != 8 {
+		return errors.New("sandbox-exec: selftest wants: forbiddenFile allowedFile tcpAddr udpAddr unixSocket abstractSocket unixDgramSocket [allowedTCPAddr]")
 	}
 	a := inv.Argv
 	tg := selfTestTargets{forbidden: a[0], allowed: a[1], tcp: a[2], udp: a[3], unixPath: a[4], abstract: a[5], dgramPath: a[6]}
+	if len(a) == 8 {
+		tg.allowedTCP = a[7]
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		return err

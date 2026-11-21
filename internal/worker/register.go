@@ -44,7 +44,7 @@ func (w *Worker) ensureCredentials(ctx context.Context) error {
 func (w *Worker) register(ctx context.Context) (*Credentials, error) {
 	var reg *api.RegisterResponse
 	err := w.retry(ctx, "register", func(ctx context.Context) (err error) {
-		reg, err = w.cfg.Client.Register(ctx, w.facts)
+		reg, err = w.cfg.Client.Register(ctx, w.currentFacts())
 		return err
 	})
 	if err != nil {
@@ -112,12 +112,13 @@ func (w *Worker) awaitActive(ctx context.Context) error {
 
 // patchFacts sends the probed facts if the server's copy differs.
 func (w *Worker) patchFacts(ctx context.Context, server api.WorkerFacts) error {
-	if factsEqual(server, w.facts) {
+	facts := w.currentFacts()
+	if factsEqual(server, facts) {
 		return nil
 	}
 	w.log.Info().Msg("facts changed since last start; updating server")
 	return w.retry(ctx, "patch facts", func(ctx context.Context) error {
-		return w.api.PatchWorker(ctx, w.creds.ID, w.facts)
+		return w.api.PatchWorker(ctx, w.creds.ID, facts)
 	})
 }
 
@@ -132,7 +133,8 @@ func factsEqual(a, b api.WorkerFacts) bool {
 		a.Hostname == b.Hostname && a.Description == b.Description && a.CPUModel == b.CPUModel &&
 		a.Cores == b.Cores && a.MemBytes == b.MemBytes && a.OS == b.OS && a.Arch == b.Arch &&
 		a.EngineVersion == b.EngineVersion && a.FFmpegVersion == b.FFmpegVersion &&
-		a.SandboxLevel == b.SandboxLevel && a.Slots == b.Slots && a.Version == b.Version
+		a.SandboxLevel == b.SandboxLevel && a.Slots == b.Slots && a.Version == b.Version &&
+		a.Kind == b.Kind && a.YtDlpVersion == b.YtDlpVersion && a.EgressGroup == b.EgressGroup && a.EgressIP == b.EgressIP
 }
 
 // retry runs op until it succeeds, fails non-transiently, or ctx ends,

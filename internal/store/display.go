@@ -257,3 +257,8 @@ func (s *Store) ProcessWorkers(ctx context.Context, queueID int64, seenWithin ti
 // PrepareMinSandbox is the lowest sandbox level a worker needs to be
 // offered prepare tasks.
 func (s *Store) PrepareMinSandbox() api.SandboxLevel { return s.cfg.PrepareMinSandbox }
+
+// FetchMinSandbox is the lowest sandbox level a downloader needs to be
+// offered fetch tasks and to count as a queue's downloader
+// (Config.FetchMinSandbox).
+func (s *Store) FetchMinSandbox() api.SandboxLevel { return s.cfg.FetchMinSandbox }

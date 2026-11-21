@@ -1,6 +1,7 @@
 package store
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -29,6 +30,12 @@ type Worker struct {
 	// PauseReason says why the system paused the worker by itself; empty
 	// unless the circuit breaker paused it.
 	PauseReason string
+	// Kind is fixed at registration: processing (the default) or
+	// downloader. Facts.Kind mirrors it.
+	Kind api.WorkerKind
+	// EgressKey identifies the network egress the worker fetches from;
+	// "unknown" until the server sets it.
+	EgressKey string
 }
 
 // Principal returns the worker's grant principal.
@@ -55,13 +62,19 @@ func (t *Tx) registerWorker(ctx context.Context, tokenHash string, facts api.Wor
 		return nil, err
 	}
 	now := fromMS(toMS(t.s.now()))
-	w := &Worker{ID: t.s.cfg.NewID(IDWorker), State: api.WorkerPending, Facts: facts, RegisteredAt: now}
+	if facts.Kind == "" {
+		facts.Kind = api.WorkerProcessing
+	}
+	w := &Worker{ID: t.s.cfg.NewID(IDWorker), State: api.WorkerPending, Facts: facts, RegisteredAt: now,
+		Kind: facts.Kind, EgressKey: "unknown"}
 	_, err = t.tx.ExecContext(ctx, `INSERT INTO workers (id, token_hash, state, hostname, description, cpu_model,
 		cores, mem_bytes, os, arch, engine_version, ffmpeg_version, sandbox_level, kinds, slots, models, version,
-		registered_at, registered_from) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		registered_at, registered_from, kind, ytdlp_version, egress_group, egress_ip)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		w.ID, tokenHash, string(w.State), facts.Hostname, facts.Description, facts.CPUModel, facts.Cores,
 		facts.MemBytes, facts.OS, facts.Arch, facts.EngineVersion, facts.FFmpegVersion, string(facts.SandboxLevel),
-		kinds, facts.Slots, models, facts.Version, toMS(now), source)
+		kinds, facts.Slots, models, facts.Version, toMS(now), source, string(facts.Kind), facts.YtDlpVersion,
+		facts.EgressGroup, facts.EgressIP)
 	if isUnique(err) {
 		return nil, fmt.Errorf("register worker: %w", ErrConflict)
 	}
@@ -94,6 +107,7 @@ func nonNil[T any](s []T) []T {
 const workerSelect = `SELECT w.id, w.state, w.hostname, w.description, w.cpu_model, w.cores, w.mem_bytes, w.os,
 	w.arch, w.engine_version, w.ffmpeg_version, w.sandbox_level, w.kinds, w.slots, w.models, w.version,
 	w.registered_at, w.decided_by, w.decided_at, w.last_seen_at, w.gauges, w.pause_reason,
+	w.kind, w.egress_key, w.ytdlp_version, w.egress_group, w.egress_ip,
 	(SELECT COALESCE(SUM(f.failures), 0) FROM worker_failure_streak f WHERE f.worker_id = w.id),
 	(SELECT COUNT(*) FROM worker_failure_streak f WHERE f.worker_id = w.id), ` + workerStatsCols + `
 	FROM workers w LEFT JOIN worker_stats ws ON ws.worker_id = w.id`
@@ -109,6 +123,7 @@ func scanWorker(row interface{ Scan(...any) error }) (*Worker, error) {
 	if err := row.Scan(append([]any{&w.ID, &w.State, &f.Hostname, &f.Description, &f.CPUModel, &f.Cores,
 		&f.MemBytes, &f.OS, &f.Arch, &f.EngineVersion, &f.FFmpegVersion, &f.SandboxLevel, &kinds, &f.Slots,
 		&models, &f.Version, &registered, &decidedBy, &decidedAt, &lastSeen, &gauges, &pauseReason,
+		&w.Kind, &w.EgressKey, &f.YtDlpVersion, &f.EgressGroup, &f.EgressIP,
 		&w.FailureStreak, &w.StreakJobs}, st.dest()...)...); err != nil {
 		return nil, err
 	}
@@ -119,6 +134,7 @@ func scanWorker(row interface{ Scan(...any) error }) (*Worker, error) {
 	if err := json.Unmarshal([]byte(models), &f.Models); err != nil {
 		return nil, fmt.Errorf("worker %s models: %w", w.ID, err)
 	}
+	f.Kind = w.Kind
 	w.RegisteredAt = fromMS(registered)
 	w.DecidedBy = decidedBy.String
 	w.PauseReason = pauseReason.String
@@ -178,24 +194,58 @@ func (s *Store) ListWorkers(ctx context.Context) ([]Worker, error) {
 	return out, rows.Err()
 }
 
-// UpdateWorkerFacts replaces a worker's reported facts.
+// UpdateWorkerFacts replaces a worker's reported facts. The worker kind is
+// fixed at registration: facts naming another kind are ErrConflict. It is a
+// convenience for tests and tools: it drops the fetching jobs the change can
+// fail, which the server reports through Tx.UpdateWorkerFacts.
 func (s *Store) UpdateWorkerFacts(ctx context.Context, id string, facts api.WorkerFacts) error {
-	return s.InTx(ctx, func(tx *Tx) error { return tx.UpdateWorkerFacts(ctx, id, facts) })
+	return s.InTx(ctx, func(tx *Tx) error { _, err := tx.UpdateWorkerFacts(ctx, id, facts); return err })
 }
 
-// UpdateWorkerFacts is Store.UpdateWorkerFacts inside the transaction.
-func (t *Tx) UpdateWorkerFacts(ctx context.Context, id string, facts api.WorkerFacts) error {
+// UpdateWorkerFacts is Store.UpdateWorkerFacts inside the transaction. A
+// downloader that reports a sandbox level below FetchMinSandbox is no longer
+// eligible, so fetching jobs it was the last eligible downloader for fail;
+// they are returned.
+func (t *Tx) UpdateWorkerFacts(ctx context.Context, id string, facts api.WorkerFacts) (OrphanFailures, error) {
+	var none OrphanFailures
 	kinds, models, err := factsJSON(facts)
 	if err != nil {
-		return err
+		return none, err
+	}
+	var kind api.WorkerKind
+	if err := t.tx.QueryRowContext(ctx, `SELECT kind FROM workers WHERE id = ?`, id).Scan(&kind); err != nil {
+		return none, notFound(err, "worker "+id)
+	}
+	if want := cmp.Or(facts.Kind, api.WorkerProcessing); want != kind {
+		return none, fmt.Errorf("worker %s is a %s, not a %s: %w", id, kind, want, ErrConflict)
 	}
 	res, err := t.tx.ExecContext(ctx, `UPDATE workers SET hostname=?, description=?, cpu_model=?, cores=?,
 		mem_bytes=?, os=?, arch=?, engine_version=?, ffmpeg_version=?, sandbox_level=?, kinds=?, slots=?,
-		models=?, version=? WHERE id = ?`,
+		models=?, version=?, ytdlp_version=?, egress_group=?, egress_ip=? WHERE id = ?`,
 		facts.Hostname, facts.Description, facts.CPUModel, facts.Cores, facts.MemBytes, facts.OS, facts.Arch,
 		facts.EngineVersion, facts.FFmpegVersion, string(facts.SandboxLevel), kinds, facts.Slots, models,
-		facts.Version, id)
-	return mustAffect(res, err, "update worker facts")
+		facts.Version, facts.YtDlpVersion, facts.EgressGroup, facts.EgressIP, id)
+	if err := mustAffect(res, err, "update worker facts"); err != nil {
+		return none, err
+	}
+	if kind == api.WorkerDownloader && facts.SandboxLevel.Rank() < t.s.cfg.FetchMinSandbox.Rank() {
+		return t.failAllOrphanedFetchJobs(ctx)
+	}
+	return none, nil
+}
+
+// SetWorkerEgressKey records the egress key the server derived for a worker.
+func (s *Store) SetWorkerEgressKey(ctx context.Context, id, key string) error {
+	return s.InTx(ctx, func(tx *Tx) error { return tx.SetWorkerEgressKey(ctx, id, key) })
+}
+
+// SetWorkerEgressKey is Store.SetWorkerEgressKey inside the transaction.
+func (t *Tx) SetWorkerEgressKey(ctx context.Context, id, key string) error {
+	if key == "" {
+		return fmt.Errorf("%w: empty egress key", ErrInvalid)
+	}
+	res, err := t.tx.ExecContext(ctx, `UPDATE workers SET egress_key = ? WHERE id = ?`, key, id)
+	return mustAffect(res, err, "set worker egress key")
 }
 
 // workerTransitions is the worker state machine (DESIGN.md §4.2).
@@ -223,46 +273,68 @@ func canTransition(from, to api.WorkerState) bool {
 // reason, and making the worker active (resume, approval) also clears its
 // failure streak. Rejecting a worker cancels its live leases, whose tasks
 // return to pending without consuming an attempt; their ids are returned.
+//
+// It is a convenience for tests and tools: it does not report the fetching
+// jobs a rejection fails for want of a downloader. The server changes state
+// through Tx.ChangeWorkerState, which does.
 func (s *Store) SetWorkerState(ctx context.Context, id string, state api.WorkerState, decidedBy string) (cancelled []string, err error) {
-	return inTx1(ctx, s, func(tx *Tx) ([]string, error) { return tx.SetWorkerState(ctx, id, state, decidedBy) })
+	return inTx1(ctx, s, func(tx *Tx) ([]string, error) {
+		c, err := tx.ChangeWorkerState(ctx, id, state, decidedBy)
+		return c.Cancelled, err
+	})
 }
 
-// SetWorkerState is Store.SetWorkerState inside the transaction.
-func (t *Tx) SetWorkerState(ctx context.Context, id string, state api.WorkerState, decidedBy string) (cancelled []string, err error) {
+// WorkerStateChange is the effect of a worker state change.
+type WorkerStateChange struct {
+	// Cancelled are the worker's own leases that rejection ended.
+	Cancelled []string
+	// Orphaned are the fetching jobs failed because no eligible downloader
+	// was left, and the leases (any worker's) ended by failing them.
+	Orphaned OrphanFailures
+}
+
+// ChangeWorkerState is SetWorkerState reporting the whole effect.
+func (t *Tx) ChangeWorkerState(ctx context.Context, id string, state api.WorkerState, decidedBy string) (out WorkerStateChange, err error) {
 	var cur api.WorkerState
-	if err := t.tx.QueryRowContext(ctx, `SELECT state FROM workers WHERE id = ?`, id).Scan(&cur); err != nil {
-		return nil, notFound(err, "worker "+id)
+	var kind api.WorkerKind
+	if err := t.tx.QueryRowContext(ctx, `SELECT state, kind FROM workers WHERE id = ?`, id).Scan(&cur, &kind); err != nil {
+		return out, notFound(err, "worker "+id)
 	}
 	if !canTransition(cur, state) {
-		return nil, fmt.Errorf("worker %s: %s -> %s: %w", id, cur, state, ErrConflict)
+		return out, fmt.Errorf("worker %s: %s -> %s: %w", id, cur, state, ErrConflict)
 	}
 	if cur == state {
-		return nil, nil
+		return out, nil
 	}
 	now := t.s.now()
 	if _, err := t.tx.ExecContext(ctx, `UPDATE workers SET state = ?, decided_by = ?, decided_at = ?,
 		pause_reason = NULL WHERE id = ?`, string(state), decidedBy, toMS(now), id); err != nil {
-		return nil, fmt.Errorf("set worker state: %w", err)
+		return out, fmt.Errorf("set worker state: %w", err)
 	}
 	if state == api.WorkerActive {
 		if err := clearFailureStreak(ctx, t.tx, id); err != nil {
-			return nil, err
+			return out, err
 		}
 	}
 	if state != api.WorkerRejected {
-		return nil, nil
+		return out, nil
 	}
 	ls, err := liveLeases(ctx, t.tx, `l.worker_id = ?`, id)
 	if err != nil {
-		return nil, err
+		return out, err
 	}
 	for _, l := range ls {
 		if _, err := t.s.endLease(ctx, t.tx, l, api.OutcomeCancelled, true, "worker rejected", "", now); err != nil {
-			return nil, err
+			return out, err
 		}
-		cancelled = append(cancelled, l.ID)
+		out.Cancelled = append(out.Cancelled, l.ID)
 	}
-	return cancelled, nil
+	if kind == api.WorkerDownloader {
+		if out.Orphaned, err = t.failAllOrphanedFetchJobs(ctx); err != nil {
+			return out, err
+		}
+	}
+	return out, nil
 }
 
 // TouchWorker records that a worker was just seen. Non-nil gauges replace the

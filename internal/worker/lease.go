@@ -68,7 +68,11 @@ var errFinished = errors.New("task finished")
 
 // leaseRun is the state a lease's task shares with its heartbeat.
 type leaseRun struct {
-	// uploading is set once the result upload starts. From then on the
+	// uploading is set once the server may have the whole result: when a
+	// prepare or transcribe upload starts, and when a fetch's stream has
+	// ended cleanly (its producer finished), not while it is still
+	// streaming, since the server cannot accept a body it has not fully
+	// received and a 410 then must kill the fetch. From then on the
 	// upload's own response decides the outcome: a heartbeat's 410 may only
 	// mean the server already accepted the result (the lease ended as
 	// done) before the worker heard back, so it must not cancel the upload.
@@ -83,6 +87,10 @@ func (w *Worker) handleLease(runCtx, workCtx context.Context, l *api.Lease) {
 		Str(obs.FieldTaskKind, string(l.Kind)).Str(obs.FieldLeaseID, l.ID).Logger()
 	if l.Model != "" {
 		log = log.With().Str(obs.FieldModel, l.Model).Logger()
+	}
+	if l.Site != "" {
+		// A fetch's site stands for its URL, which is never logged.
+		log = log.With().Str(obs.FieldSite, l.Site).Logger()
 	}
 	log.Info().Msg("lease claimed")
 
@@ -136,6 +144,8 @@ func (w *Worker) execute(ctx context.Context, l *api.Lease, run *leaseRun, log z
 		return w.prepare(ctx, l, dir, run, log)
 	case api.KindTranscribe:
 		return w.transcribe(ctx, l, dir, run, log)
+	case api.KindFetch:
+		return w.fetch(ctx, l, dir, run, log)
 	}
 	return taskStats{}, preWork(fmt.Sprintf("unknown task kind %q", l.Kind), nil)
 }

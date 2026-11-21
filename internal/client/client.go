@@ -145,7 +145,12 @@ func (c *Client) newRequest(ctx context.Context, method string, u *url.URL, body
 // send performs req and converts any status outside want into *Error. On
 // success the caller owns resp.Body.
 func (c *Client) send(req *http.Request, want ...int) (*http.Response, error) {
-	resp, err := c.hc.Do(req)
+	return c.sendWith(c.hc, req, want...)
+}
+
+// sendWith is send through hc.
+func (c *Client) sendWith(hc *http.Client, req *http.Request, want ...int) (*http.Response, error) {
+	resp, err := hc.Do(req)
 	if err != nil {
 		if errors.Is(err, ErrRedirectRefused) {
 			// Not wrapped in *url.Error, which would read as a transient

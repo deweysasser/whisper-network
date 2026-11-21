@@ -1,4 +1,4 @@
-# Reusable workflow: build the worker and server images natively per
+# Reusable workflow: build the worker, server and downloader images natively per
 # architecture (no QEMU), then publish multi-arch manifests.
 #
 # Each target × architecture builds on a native runner with its own build
@@ -39,7 +39,7 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        target: [worker, server]
+        target: [worker, server, downloader]
         arch: [amd64, arm64]
         include:
           - arch: amd64
@@ -112,7 +112,7 @@ jobs:
       packages: write
     strategy:
       matrix:
-        target: [worker, server]
+        target: [worker, server, downloader]
     steps:
       - name: Download digests
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -132,7 +132,8 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # worker: <tag>[, latest, stable]; server: <tag>-server[, latest-server,
-      # stable-server]. Only final release tags (no '-' suffix, e.g. not
+      # stable-server]; downloader: <tag>-downloader[, latest-downloader,
+      # stable-downloader]. Only final release tags (no '-' suffix, e.g. not
       # v1.2.0-rc.1) move latest and stable.
       - name: Create and push the multi-arch manifest
         env:
@@ -150,7 +151,10 @@ jobs:
             exit 1
           fi
           suffix=""
-          if [[ "$TARGET" == "server" ]]; then suffix="-server"; fi
+          case "$TARGET" in
+            server) suffix="-server" ;;
+            downloader) suffix="-downloader" ;;
+          esac
           tags=(-t "${image}:${tag}${suffix}")
           if [[ "$RELEASE" == "true" && "$tag" != *-* ]]; then
             tags+=(-t "${image}:latest${suffix}" -t "${image}:stable${suffix}")

@@ -31,27 +31,43 @@ func IsNotRetryable(err error) (string, bool) {
 type Retried struct {
 	// PreviousError is the error the failed job carried.
 	PreviousError string
-	// State is the job's new state: preparing or queued.
+	// State is the job's new state: fetching, preparing or queued.
 	State api.JobState
 	// Tasks is how many tasks went back to pending.
 	Tasks int
 	// Retries is the job's retry count after this one.
 	Retries int
+	// Refetch is true when a URL job's media was gone, so its prepare and
+	// transcribe tasks and their results were discarded and it goes back to
+	// fetching. The caller must remove the job's blobs (after the commit).
+	Refetch bool
 }
 
 // retryBlocker returns why a job cannot be retried, or "" if it can: it
 // must be failed, and the media its retry reads must still be on disk (the
-// canonical audio once prepare succeeded, else the original upload).
+// canonical audio once prepare succeeded, else the original upload). A URL
+// job is never blocked by purged media: it is fetched again.
 func (j *Job) retryBlocker() string {
 	switch {
 	case j.State != api.JobFailed:
 		return "job is " + string(j.State) + "; only failed jobs can be retried"
+	case j.FetchURL != "":
+		return ""
 	case j.Canonical != nil && j.CanonicalPurgedAt != nil:
 		return "the job's audio has been purged; submit the media again"
 	case j.Canonical == nil && (j.OriginalPurgedAt != nil || j.Original.Bytes == 0):
 		return "the job's original upload has been purged; submit the media again"
 	}
 	return ""
+}
+
+// mediaPresent reports whether the media a retry reads is still on disk
+// (the canonical audio once prepare succeeded, else the original).
+func (j *Job) mediaPresent() bool {
+	if j.Canonical != nil {
+		return j.CanonicalPurgedAt == nil
+	}
+	return j.OriginalPurgedAt == nil && j.Original.Bytes > 0
 }
 
 // Retryable reports whether the job can be retried now (DESIGN.md §4.2).
@@ -64,7 +80,8 @@ func (j *Job) Retryable() bool { return j.retryBlocker() == "" }
 // completion time are cleared; it returns to preparing (prepare never
 // succeeded) or queued, and its retry count goes up. A job that is not
 // failed, or whose needed media has been purged, is a NotRetryableError and
-// nothing changes.
+// nothing changes. A URL job whose media is gone (never fetched, or purged)
+// is instead fetched again: see refetchJob.
 func (t *Tx) RetryJob(ctx context.Context, jobID string) (*Retried, error) {
 	tx := t.tx
 	j, err := getJob(ctx, tx, jobID)
@@ -73,6 +90,9 @@ func (t *Tx) RetryJob(ctx context.Context, jobID string) (*Retried, error) {
 	}
 	if why := j.retryBlocker(); why != "" {
 		return nil, &NotRetryableError{Reason: why}
+	}
+	if j.FetchURL != "" && !j.mediaPresent() {
+		return t.refetchJob(ctx, j)
 	}
 	out := &Retried{PreviousError: j.Error, State: api.JobQueued, Retries: j.Retries + 1}
 	if j.Canonical == nil {
@@ -95,6 +115,37 @@ func (t *Tx) RetryJob(ctx context.Context, jobID string) (*Retried, error) {
 		retries = retries + 1, updated_at = ? WHERE id = ? AND state = 'failed'`,
 		string(out.State), toMS(t.s.now()), jobID)
 	if err := mustAffect(res, err, "retry job "+jobID); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// refetchJob retries a URL job whose media is gone: its prepare and
+// transcribe tasks (and so their stored results) are deleted, the media
+// columns are cleared, the fetch task goes back to pending with a fresh
+// attempt budget (earlier leases stay for history but no longer count), and
+// the job returns to fetching. fetch_url and fetch_site are kept. The
+// caller removes the job's blob files.
+func (t *Tx) refetchJob(ctx context.Context, j *Job) (*Retried, error) {
+	tx := t.tx
+	now := toMS(t.s.now())
+	out := &Retried{PreviousError: j.Error, State: api.JobFetching, Tasks: 1, Retries: j.Retries + 1, Refetch: true}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM tasks WHERE job_id = ? AND seq <> ?`, j.ID, FetchSeq); err != nil {
+		return nil, fmt.Errorf("retry job %s: %w", j.ID, err)
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE tasks SET state = 'pending', attempts = 0, worker_id = NULL,
+		pending_since = ? WHERE job_id = ? AND seq = ?`, now, j.ID, FetchSeq)
+	if err := mustAffect(res, err, "retry job "+j.ID+": fetch task"); err != nil {
+		return nil, err
+	}
+	if err := reactivate(ctx, tx, j.QueueID, j.Weight); err != nil {
+		return nil, err
+	}
+	res, err = tx.ExecContext(ctx, `UPDATE jobs SET state = 'fetching', error = NULL, completed_at = NULL,
+		compute_ms = NULL, original_bytes = 0, original_sha256 = '', original_type = '', original_purged_at = NULL,
+		canonical_bytes = NULL, canonical_sha256 = NULL, audio_samples = NULL, canonical_purged_at = NULL,
+		retries = retries + 1, updated_at = ? WHERE id = ? AND state = 'failed'`, now, j.ID)
+	if err := mustAffect(res, err, "retry job "+j.ID); err != nil {
 		return nil, err
 	}
 	return out, nil

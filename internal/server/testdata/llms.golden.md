@@ -34,7 +34,7 @@ Any common audio or video format is accepted; the server converts it. The queue 
 | `weight` | no | `low`, `medium` (default) or `high`: relative priority among your queue's jobs. Use `low` for bulk backlogs. |
 | `prompt` | no | Up to 800 characters of context, written as **sentences**, naming people likely to speak, e.g. "This is a project planning meeting. Alice Chen and Bob Rivera discuss the launch schedule." A bare comma-separated list of names makes the transcript worse. |
 | `label` | no | A short name for the job, up to 200 characters. |
-| `source` | no | Where the media came from (a URL or ID). Recorded only; the server never fetches it. |
+| `source` | no | Where the media came from (a URL or ID). Recorded only; the server never fetches it. (To have a URL fetched, see "Submit a URL instead".) |
 | `metadata` | no | Any JSON object up to 8192 bytes, returned with the job to you and to tokens that may read the queue's transcripts (others see the job without it). Do not put secrets in it. |
 
 Send an `Idempotency-Key` header with a value unique to this submission (for example your own job ID). If the upload fails and you retry with the same key, you get the original job back instead of a duplicate.
@@ -50,10 +50,24 @@ Example:
       -F 'media=@meeting.mp4' \
       https://wn.example/queue/public
 
+## Submit a URL instead
+
+If your token has the `submit_url` grant on the queue, you can have a downloader worker fetch the media for you: `POST /queue/{queue}/fetch` with a JSON body holding the same fields as `params` above plus `url` (an `http` or `https` URL, up to 2048 bytes). `source` defaults to the URL. `Idempotency-Key` works as for uploads. The server never contacts the URL itself; a downloader worker does, so only URLs reachable from the public internet work (private addresses are refused), and pages that need a login do not.
+
+    curl -sS -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+      -d '{"model":"small.en","url":"https://example.com/talk.mp3"}' \
+      https://wn.example/queue/public/fetch
+
+Response `201 Created` with a job document, as for an upload; the job's `state` starts as `fetching`. Streaming sites are fetched with yt-dlp (audio only, a single video, no live streams); anything else is downloaded as a plain file. The fetched media is held to the same size limit as an upload (2 GiB, or the queue's lower one); larger media fails the job. If the fetch fails, the job is `failed` and its `error` holds the downloader's reason (for yt-dlp, its last `ERROR:` line), which may quote the URL; `POST /job/{id}/retry` fetches it again, which also works after the media has been purged. Fetches from a site can be rate limited or paused by the operator, so a URL job may stay `fetching` for a while. Besides the usual errors:
+
+- `403`: your token lacks `submit_url` on the queue.
+- `409` with problem type `no-downloader`: no downloader worker may fetch for this queue right now. Upload the file instead, or ask the operator.
+
 ## Wait for it
 
 `GET /job/{id}` returns the job document: everything describing the job, including your `prompt`, `metadata`, and `submitted_by` (who created it: `{kind, id, name}`). Anyone who can see a job sees all of this; only the transcript and result need read permission. Its `state` moves through:
 
+- `fetching`: a downloader worker is fetching the media from your URL (URL jobs only)
 - `preparing`: converting the media (only for non-canonical inputs)
 - `queued`: waiting for a worker
 - `running`: being transcribed (`tasks.done` / `tasks.total` shows progress for long recordings)
@@ -73,7 +87,7 @@ Both return `409` with problem type `not-done` until the job is `done`. For a fa
 
 ## Retry a failed job
 
-`POST /job/{id}/retry` (allowed for the job's creator) re-runs a `failed` job's unfinished tasks from the media the server kept; finished parts are kept. It returns `200` with the job document (state `queued` or `preparing`). It returns `409` with problem type `not-retryable` if the job is not failed or its media has been purged; the job document's `retryable` says which beforehand, and `media.kept_until` says how long a failed job's media is kept (about 24 hours, sooner if the server's disk fills).
+`POST /job/{id}/retry` (allowed for the job's creator) re-runs a `failed` job's unfinished tasks from the media the server kept; finished parts are kept. It returns `200` with the job document (state `queued`, `preparing`, or `fetching` when a URL job's media is gone and is fetched again). It returns `409` with problem type `not-retryable` if the job is not failed or, for an uploaded job, its media has been purged; the job document's `retryable` says which beforehand, and `media.kept_until` says how long a failed job's media is kept (about 24 hours, sooner if the server's disk fills).
 
 Whisper output is good but not perfect: names are often misspelled (the prompt helps), and occasionally a phrase repeats or a passage is dropped. Check against the audio before quoting someone.
 
@@ -89,6 +103,7 @@ Whisper can also get stuck repeating one line for many minutes. The server catch
 |---|---|---|
 | `400` | `bad-request` | Fix the request; do not retry unchanged. |
 | `408` | | The upload was too slow; retry with the same `Idempotency-Key`. |
+| `409` | `no-downloader` | URL jobs only: no downloader may fetch for the queue. Upload the file instead, or ask the operator. |
 | `413` | `too-large` | The file exceeds the upload limit. |
 | `422` | `media-invalid` | The media could not be decoded. |
 | `429` | `rate-limited` | Too many concurrent requests; wait for `Retry-After` seconds, then retry. |
@@ -101,6 +116,7 @@ The `whisper-network` binary includes a client:
 
     export WHISPER_TOKEN=wnc_...
     whisper-network submit --server https://wn.example --model small.en --label "weekly meeting" meeting.mp4
+    whisper-network submit --server https://wn.example --model small.en --url https://example.com/talk.mp3    # needs submit_url
     whisper-network status --server https://wn.example <job-id>
     whisper-network fetch  --server https://wn.example <job-id> -o meeting.txt
     whisper-network fetch  --server https://wn.example --partial <job-id>    # a failed job's transcript so far

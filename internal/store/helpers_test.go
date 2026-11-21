@@ -157,3 +157,41 @@ func (f *fixture) task(jobID string, seq int) (string, int) {
 		`SELECT state, attempts FROM tasks WHERE job_id = ? AND seq = ?`, jobID, seq).Scan(&state, &attempts))
 	return state, attempts
 }
+
+// downloader registers an active downloader worker with fetch on the given
+// queues, from the given egress key.
+func (f *fixture) downloader(sandbox api.SandboxLevel, egress string, queues ...int64) string {
+	w, err := f.s.RegisterWorker(f.ctx, f.token(), api.WorkerFacts{Hostname: "d", SandboxLevel: sandbox,
+		Kind: api.WorkerDownloader, Kinds: []api.TaskKind{api.KindFetch}})
+	require.NoError(f.t, err)
+	_, err = f.s.SetWorkerState(f.ctx, w.ID, api.WorkerActive, "user:1")
+	require.NoError(f.t, err)
+	require.NoError(f.t, f.s.SetWorkerEgressKey(f.ctx, w.ID, egress))
+	for _, q := range queues {
+		require.NoError(f.t, f.s.AddGrant(f.ctx, w.Principal(), api.RoleFetch, QueueScope(q), "user:1"))
+	}
+	return w.ID
+}
+
+// fetchingJob inserts a fetching job with its pending fetch task on queueID.
+func (f *fixture) fetchingJob(queueID int64, id string) {
+	f.t.Helper()
+	_, err := f.s.w.ExecContext(f.ctx, `INSERT INTO jobs (id, queue_id, client_id, state, model, language, created_at,
+		updated_at, fetch_url, fetch_site) VALUES (?, ?, 'c', 'fetching', 'm', 'en', 1, 1, 'https://x/y', 'x')`, id, queueID)
+	require.NoError(f.t, err)
+	_, err = f.s.w.ExecContext(f.ctx, `INSERT INTO tasks (job_id, seq, kind, cost, state) VALUES (?, ?, 'fetch', 1, 'pending')`,
+		id, FetchSeq)
+	require.NoError(f.t, err)
+}
+
+// fetchLease leases a fetching job's fetch task to a worker.
+func (f *fixture) fetchLease(jobID, workerID string) string {
+	f.t.Helper()
+	id := "l-" + jobID + "-" + workerID
+	_, err := f.s.w.ExecContext(f.ctx, `INSERT INTO leases (id, job_id, seq, worker_id, created_at, expires_at, egress_key)
+		VALUES (?, ?, ?, ?, ?, ?, 'e1')`, id, jobID, FetchSeq, workerID, toMS(f.clk.Now()), toMS(f.clk.Now().Add(time.Hour)))
+	require.NoError(f.t, err)
+	_, err = f.s.w.ExecContext(f.ctx, `UPDATE tasks SET state = 'leased' WHERE job_id = ? AND seq = ?`, jobID, FetchSeq)
+	require.NoError(f.t, err)
+	return id
+}

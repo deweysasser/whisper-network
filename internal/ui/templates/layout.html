@@ -21,6 +21,7 @@
     <a href="/ui/queues"{{if or (eq .Active "queues") (eq .Active "queue") (eq .Active "job")}} aria-current="page"{{end}}>Queues</a>
     {{- if .Nav.Users}}<a href="/ui/users"{{if eq .Active "users"}} aria-current="page"{{end}}>Users</a>{{end}}
     {{- if .Nav.Clients}}<a href="/ui/clients"{{if eq .Active "clients"}} aria-current="page"{{end}}>Clients</a>{{end}}
+    {{- if .Nav.Fetch}}<a href="/ui/fetch"{{if eq .Active "fetch"}} aria-current="page"{{end}}>Fetch</a>{{end}}
     {{- if .Nav.Audit}}<a href="/ui/audit"{{if eq .Active "audit"}} aria-current="page"{{end}}>Audit</a>{{end}}
   </nav>
   <div class="who">

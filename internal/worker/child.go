@@ -22,6 +22,10 @@ type childRun struct {
 	spec    sandbox.Spec
 	dir     string
 	timeout time.Duration
+	// stdout receives the child's standard output; nil discards it.
+	stdout io.Writer
+	// env is appended to the child's environment (after Config.ChildEnv).
+	env []string
 }
 
 // childResult is what a finished child left behind.
@@ -32,6 +36,9 @@ type childResult struct {
 
 // errChildTimeout reports a child killed for exceeding its wall-clock limit.
 var errChildTimeout = errors.New("child exceeded its time limit")
+
+// errChildStart marks a child that could not be started at all.
+var errChildStart = errors.New("child did not start")
 
 // children tracks running child PIDs for the RSS gauge.
 type children struct {
@@ -66,17 +73,20 @@ func (c *children) list() []int {
 
 // runChild runs r under sandbox-exec and waits for it. Cancelling ctx kills
 // the child; exceeding r.timeout kills it and returns errChildTimeout. A
-// non-zero exit returns an *exec.ExitError. The child's stdout is discarded
-// (whisper-cli may print transcript text there) and the tail of its stderr is
-// returned.
+// non-zero exit returns an *exec.ExitError. The child's stdout goes to
+// r.stdout or is discarded (whisper-cli may print transcript text there),
+// and the tail of its stderr is returned.
 func (w *Worker) runChild(ctx context.Context, r childRun) (childResult, error) {
 	ctx, cancel := context.WithTimeoutCause(ctx, r.timeout, errChildTimeout)
 	defer cancel()
 	cmd := sandbox.Command(ctx, w.cfg.Self, r.spec, r.argv...)
 	cmd.Dir = r.dir
-	cmd.Env = append(childEnv(os.Environ(), r.dir), w.cfg.ChildEnv...)
+	cmd.Env = append(append(childEnv(os.Environ(), r.dir), w.cfg.ChildEnv...), r.env...)
 	cmd.Stdin = nil
 	cmd.Stdout = io.Discard
+	if r.stdout != nil {
+		cmd.Stdout = r.stdout
+	}
 	tail := &tailBuffer{max: 2 * api.MaxStderrTail}
 	cmd.Stderr = tail
 	// After a kill, do not wait forever for grandchildren holding the pipe.
@@ -84,7 +94,7 @@ func (w *Worker) runChild(ctx context.Context, r childRun) (childResult, error) 
 
 	start := time.Now()
 	if err := cmd.Start(); err != nil {
-		return childResult{}, fmt.Errorf("starting %s: %w", filepath.Base(r.argv[0]), err)
+		return childResult{}, fmt.Errorf("%w: starting %s: %w", errChildStart, filepath.Base(r.argv[0]), err)
 	}
 	w.children.add(cmd.Process.Pid)
 	err := sandbox.Wait(cmd)

@@ -55,12 +55,13 @@ func TestLLMsCoversClientAPI(t *testing.T) {
 		name := strings.Split(pt.Field(i).Tag.Get("json"), ",")[0]
 		assert.Contains(t, doc, "`"+name+"`", "JobParams field %q is not documented", name)
 	}
-	for _, st := range []api.JobState{api.JobPreparing, api.JobQueued, api.JobRunning, api.JobDone, api.JobFailed} {
+	for _, st := range []api.JobState{api.JobPreparing, api.JobFetching, api.JobQueued, api.JobRunning, api.JobDone, api.JobFailed} {
 		assert.Contains(t, doc, "`"+string(st)+"`", "job state %q is not documented", st)
 	}
 	for _, ep := range []string{
 		"POST /queue/{queue}", "GET /queue/{queue}", "GET /job/{id}",
 		"GET /job/{id}/transcript", "GET /job/{id}/result", "DELETE /job/{id}",
+		"POST /queue/{queue}/fetch", "no-downloader", "submit_url",
 	} {
 		assert.Contains(t, doc, ep, "endpoint %s is not documented", ep)
 	}

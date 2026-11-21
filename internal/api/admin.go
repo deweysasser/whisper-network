@@ -126,3 +126,41 @@ type AuditList struct {
 	Entries    []AuditEntry `json:"entries"`
 	NextBefore int64        `json:"next_before,omitempty"`
 }
+
+// FetchPolicy is a per-site (optionally per-egress) download policy.
+// Durations are Go duration strings.
+type FetchPolicy struct {
+	Key            string    `json:"key"`
+	Site           string    `json:"site"`
+	EgressKey      string    `json:"egress_key,omitempty"`
+	Rules          []string  `json:"rules"`
+	Concurrency    int       `json:"concurrency"`
+	BackoffInitial string    `json:"backoff_initial"`
+	BackoffCap     string    `json:"backoff_cap"`
+	UpdatedBy      string    `json:"updated_by"`
+	UpdatedAt      time.Time `json:"updated_at"`
+	// Invalid marks a stored row that does not validate (a hand edit). It
+	// blocks the site it governs until a PUT repairs it or a DELETE removes
+	// it; InvalidReason says why. The other fields are as stored.
+	Invalid       bool   `json:"invalid,omitempty"`
+	InvalidReason string `json:"invalid_reason,omitempty"`
+}
+
+// FetchCooldown is an active pause on fetching a site from an egress.
+type FetchCooldown struct {
+	EgressKey string    `json:"egress_key"`
+	Site      string    `json:"site"`
+	Until     time.Time `json:"until"`
+	Level     int       `json:"level"`
+	Manual    bool      `json:"manual"`
+	SetBy     string    `json:"set_by"`
+	Reason    string    `json:"reason"`
+}
+
+// SetCooldownRequest manually starts a cooldown; Duration is a Go duration.
+type SetCooldownRequest struct {
+	EgressKey string `json:"egress_key"`
+	Site      string `json:"site"`
+	Duration  string `json:"duration"`
+	Reason    string `json:"reason"`
+}

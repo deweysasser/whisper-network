@@ -1,17 +1,20 @@
 package server
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/rs/zerolog"
 
 	"github.com/deweysasser/whisper-network/internal/api"
 	"github.com/deweysasser/whisper-network/internal/auth"
+	"github.com/deweysasser/whisper-network/internal/fetchpolicy"
 	"github.com/deweysasser/whisper-network/internal/obs"
 	"github.com/deweysasser/whisper-network/internal/store"
 )
@@ -38,6 +41,12 @@ type Ops struct {
 	// Notify, if set, wakes waiting claims after changes that can make work
 	// claimable.
 	Notify func()
+	// JobFinished, if set, is called after the commit for each job a change
+	// failed (the server logs job.failed and records its metrics).
+	JobFinished func(ctx context.Context, jobID string)
+	// PacingChanged, if set, is called after fetch policies or cooldowns
+	// change (the server recomputes its pacing wake-up and wakes claims).
+	PacingChanged func()
 	// PasswordSlot, if set, bounds concurrent password hashing (the server
 	// sets it to Server.PasswordSlot). Every hash Ops computes holds a slot
 	// for exactly the duration of the hash.
@@ -92,6 +101,16 @@ func SystemActor() Actor { return Actor{Name: store.SystemActor, Grant: store.Sy
 
 // userActor is the actor for a user acting on their own account.
 func userActor(u *store.User) Actor { return Actor{Name: "user:" + u.Username, Grant: u.Principal()} }
+
+// jobsFinished reports jobs a committed change failed.
+func (o *Ops) jobsFinished(ctx context.Context, ids []string) {
+	if o.JobFinished == nil {
+		return
+	}
+	for _, id := range ids {
+		o.JobFinished(ctx, id)
+	}
+}
 
 func (o *Ops) notify() {
 	if o.Notify != nil {
@@ -256,16 +275,32 @@ func (o *Ops) StorePrincipal(ctx context.Context, principal string) (string, aut
 }
 
 // checkGrantFits rejects grants that are well formed but meaningless for
-// the principal kind: process is the only role a worker can use, and only
-// workers can use it.
-func checkGrantFits(kind auth.PrincipalKind, g api.Grant) error {
+// the principal kind: process and fetch are the only roles a worker can
+// use, and only workers can use them. A processing worker takes process, a
+// downloader (wk, ignored for non-workers) takes fetch.
+func checkGrantFits(kind auth.PrincipalKind, wk api.WorkerKind, g api.Grant) error {
 	if err := auth.ValidateGrant(g); err != nil {
 		return badRequest(err.Error())
 	}
-	if (kind == auth.KindWorker) != (g.Role == api.RoleProcess) {
+	fits := g.Role != api.RoleProcess && g.Role != api.RoleFetch
+	if kind == auth.KindWorker {
+		fits = g.Role == workerRole(wk)
+	}
+	if !fits {
+		if kind == auth.KindWorker {
+			return badRequest(fmt.Sprintf("role %s cannot be granted to a %s worker", g.Role, cmp.Or(wk, api.WorkerProcessing)))
+		}
 		return badRequest(fmt.Sprintf("role %s cannot be granted to a %s", g.Role, kind))
 	}
 	return nil
+}
+
+// workerRole is the role a worker of kind holds on the queues it serves.
+func workerRole(k api.WorkerKind) api.Role {
+	if k == api.WorkerDownloader {
+		return api.RoleFetch
+	}
+	return api.RoleProcess
 }
 
 // storeGrant is a grant resolved to its stored scope, with its wire form
@@ -275,11 +310,12 @@ type storeGrant struct {
 	scope string
 }
 
-// resolveGrants checks that each grant fits kind and translates its scope.
-func (o *Ops) resolveGrants(ctx context.Context, kind auth.PrincipalKind, gs []api.Grant) ([]storeGrant, error) {
+// resolveGrants checks that each grant fits kind (and wk, for a worker) and
+// translates its scope.
+func (o *Ops) resolveGrants(ctx context.Context, kind auth.PrincipalKind, wk api.WorkerKind, gs []api.Grant) ([]storeGrant, error) {
 	out := make([]storeGrant, len(gs))
 	for i, g := range gs {
-		if err := checkGrantFits(kind, g); err != nil {
+		if err := checkGrantFits(kind, wk, g); err != nil {
 			return nil, err
 		}
 		scope, err := o.StoreScope(ctx, g.Scope)
@@ -312,7 +348,15 @@ func (o *Ops) UpdateGrants(ctx context.Context, a Actor, principal string, add, 
 	if err != nil {
 		return err
 	}
-	adds, err := o.resolveGrants(ctx, kind, add)
+	var wk api.WorkerKind
+	if id, ok := strings.CutPrefix(sp, "worker:"); ok && kind == auth.KindWorker {
+		w, err := o.Store.WorkerByID(ctx, id)
+		if err != nil {
+			return err
+		}
+		wk = w.Kind
+	}
+	adds, err := o.resolveGrants(ctx, kind, wk, add)
 	if err != nil {
 		return err
 	}
@@ -324,9 +368,15 @@ func (o *Ops) UpdateGrants(ctx context.Context, a Actor, principal string, add, 
 		}
 		removes[i] = storeGrant{wire: g, scope: scope}
 	}
-	var cancelled []string
+	type revoked struct {
+		role      api.Role
+		cancelled int
+	}
+	var cancelled []revoked
+	var anyCancelled bool
+	var failedJobs []string
 	err = o.change(ctx, a, func(tx *store.Tx, rec recorder) error {
-		cancelled = cancelled[:0]
+		cancelled, anyCancelled, failedJobs = cancelled[:0], false, failedJobs[:0]
 		for _, g := range adds {
 			if err := tx.AddGrant(ctx, sp, g.wire.Role, g.scope, a.Grant); err != nil {
 				return err
@@ -336,14 +386,25 @@ func (o *Ops) UpdateGrants(ctx context.Context, a Actor, principal string, add, 
 			}
 		}
 		for _, g := range removes {
-			ended, err := tx.RemoveGrant(ctx, sp, g.wire.Role, g.scope)
+			r, err := tx.RevokeGrant(ctx, sp, g.wire.Role, g.scope)
 			if err != nil {
 				return err
 			}
-			cancelled = append(cancelled, ended...)
+			if len(r.Cancelled) > 0 {
+				cancelled = append(cancelled, revoked{g.wire.Role, len(r.Cancelled)})
+			}
+			anyCancelled = anyCancelled || len(r.Cancelled) > 0 || len(r.Orphaned.Leases) > 0
+			failedJobs = append(failedJobs, r.Orphaned.Jobs...)
 			detail := any(g.wire)
-			if len(ended) > 0 {
-				detail = map[string]any{"role": g.wire.Role, "scope": g.wire.Scope, "cancelled_leases": len(ended)}
+			if len(r.Cancelled) > 0 || len(r.Orphaned.Jobs) > 0 {
+				d := map[string]any{"role": g.wire.Role, "scope": g.wire.Scope}
+				if len(r.Cancelled) > 0 {
+					d["cancelled_leases"] = len(r.Cancelled)
+				}
+				if len(r.Orphaned.Jobs) > 0 {
+					d["failed_jobs"] = r.Orphaned.Jobs
+				}
+				detail = d
 			}
 			if err := rec("grant.remove", principal, detail); err != nil {
 				return err
@@ -354,14 +415,17 @@ func (o *Ops) UpdateGrants(ctx context.Context, a Actor, principal string, add, 
 	if err != nil {
 		return err
 	}
-	if len(cancelled) > 0 {
-		o.Log.Info().Str(obs.FieldPrincipal, principal).Strs("cancelled_leases", cancelled).
-			Msg("leases cancelled: process grant revoked")
+	for _, c := range cancelled {
+		o.Log.Info().Str(obs.FieldPrincipal, principal).Int("cancelled_leases", c.cancelled).
+			Msgf("leases cancelled: %s grant revoked", c.role)
+	}
+	o.jobsFinished(ctx, failedJobs)
+	if anyCancelled {
 		o.notify() // their tasks are pending again
 		return nil
 	}
 	for _, g := range add {
-		if g.Role == api.RoleProcess {
+		if g.Role == api.RoleProcess || g.Role == api.RoleFetch {
 			o.notify()
 			break
 		}
@@ -385,16 +449,18 @@ func (o *Ops) ApproveWorker(ctx context.Context, a Actor, workerID string, queue
 			return err
 		}
 	}
+	role := workerRole(w.Kind)
 	err = o.change(ctx, a, func(tx *store.Tx, rec recorder) error {
-		if _, err := tx.SetWorkerState(ctx, workerID, api.WorkerActive, a.Name); err != nil {
+		// Becoming active orphans nothing; there is nothing to report.
+		if _, err := tx.ChangeWorkerState(ctx, workerID, api.WorkerActive, a.Name); err != nil {
 			return err
 		}
 		for _, sc := range scopes {
-			if err := tx.AddGrant(ctx, w.Principal(), api.RoleProcess, sc, a.Grant); err != nil {
+			if err := tx.AddGrant(ctx, w.Principal(), role, sc, a.Grant); err != nil {
 				return err
 			}
 		}
-		return rec("worker.approve", w.Principal(), map[string]any{"queues": nonNilStrings(queues)})
+		return rec("worker.approve", w.Principal(), map[string]any{"queues": nonNilStrings(queues), "role": role})
 	})
 	if err != nil {
 		return err
@@ -434,19 +500,24 @@ func (o *Ops) SetWorkerState(ctx context.Context, a Actor, workerID string, stat
 	default:
 		return badRequest("unsupported worker state " + string(state))
 	}
-	var cancelled []string
+	var ch store.WorkerStateChange
 	err = o.change(ctx, a, func(tx *store.Tx, rec recorder) error {
 		var err error
-		if cancelled, err = tx.SetWorkerState(ctx, workerID, state, a.Name); err != nil {
+		if ch, err = tx.ChangeWorkerState(ctx, workerID, state, a.Name); err != nil {
 			return err
 		}
-		return rec(action, w.Principal(), map[string]any{"from": w.State, "cancelled_leases": len(cancelled)})
+		detail := map[string]any{"from": w.State, "cancelled_leases": len(ch.Cancelled)}
+		if len(ch.Orphaned.Jobs) > 0 {
+			detail["failed_jobs"] = ch.Orphaned.Jobs
+		}
+		return rec(action, w.Principal(), detail)
 	})
 	if err != nil {
 		return err
 	}
 	obs.Info(&o.Log, ev).Str(obs.FieldWorkerID, w.ID).Str(obs.FieldHostname, w.Facts.Hostname).
-		Str(obs.FieldActor, a.Name).Int("cancelled_leases", len(cancelled)).Msg("worker state changed")
+		Str(obs.FieldActor, a.Name).Int("cancelled_leases", len(ch.Cancelled)).Msg("worker state changed")
+	o.jobsFinished(ctx, ch.Orphaned.Jobs)
 	if state != api.WorkerPaused {
 		o.notify()
 	}
@@ -533,7 +604,7 @@ func (o *Ops) CreateClient(ctx context.Context, a Actor, name string, grants []a
 	if name = strings.TrimSpace(name); name == "" || len(name) > 200 {
 		return nil, badRequest("client name must be 1-200 characters")
 	}
-	resolved, err := o.resolveGrants(ctx, auth.KindClient, grants)
+	resolved, err := o.resolveGrants(ctx, auth.KindClient, "", grants)
 	if err != nil {
 		return nil, err
 	}
@@ -601,7 +672,7 @@ func (o *Ops) CreateUser(ctx context.Context, a Actor, req api.CreateUserRequest
 	if !store.ValidQueueName(req.Username) { // same conservative grammar as queue names
 		return nil, badRequest("username must match [a-z0-9][a-z0-9-]{0,62}")
 	}
-	grants, err := o.resolveGrants(ctx, auth.KindUser, req.Grants)
+	grants, err := o.resolveGrants(ctx, auth.KindUser, "", req.Grants)
 	if err != nil {
 		return nil, err
 	}
@@ -748,4 +819,95 @@ func (o *Ops) RenameQueue(ctx context.Context, a Actor, q *store.Queue, name str
 		}
 		return rec("queue.rename", "queue:"+name, map[string]any{"from": q.Name})
 	})
+}
+
+func (o *Ops) pacingChanged() {
+	if o.PacingChanged != nil {
+		o.PacingChanged()
+	}
+}
+
+// fetchPolicyAudit is the audit detail of a fetch policy change. It names
+// sites and egress keys, never URLs.
+func fetchPolicyAudit(p fetchpolicy.Policy) map[string]any {
+	rules := make([]string, len(p.Rules))
+	for i, r := range p.Rules {
+		rules[i] = r.String()
+	}
+	d := map[string]any{"key": p.Key, "site": p.Site, "rules": rules, "concurrency": p.Concurrency,
+		"backoff_initial": fetchpolicy.CompactDuration(p.BackoffInitial), "backoff_cap": fetchpolicy.CompactDuration(p.BackoffCap)}
+	if p.EgressKey != "" {
+		d["egress"] = p.EgressKey
+	}
+	return d
+}
+
+// PutFetchPolicy creates or replaces a fetch policy (audited as
+// fetch_policy.put). An invalid policy is a 400.
+func (o *Ops) PutFetchPolicy(ctx context.Context, a Actor, p fetchpolicy.Policy) (created bool, err error) {
+	err = o.change(ctx, a, func(tx *store.Tx, rec recorder) error {
+		var err error
+		if created, err = tx.PutFetchPolicy(ctx, p, a.Name); err != nil {
+			return err
+		}
+		return rec("fetch_policy.put", "fetch_policy:"+p.Key, fetchPolicyAudit(p))
+	})
+	if err != nil {
+		return false, err
+	}
+	o.pacingChanged()
+	return created, nil
+}
+
+// DeleteFetchPolicy deletes a fetch policy (audited as fetch_policy.delete).
+// The '*' default is a 409, an unknown key a 404.
+func (o *Ops) DeleteFetchPolicy(ctx context.Context, a Actor, key string) error {
+	err := o.change(ctx, a, func(tx *store.Tx, rec recorder) error {
+		if err := tx.DeleteFetchPolicy(ctx, key); err != nil {
+			return err
+		}
+		return rec("fetch_policy.delete", "fetch_policy:"+key, map[string]any{"key": key})
+	})
+	if err != nil {
+		return err
+	}
+	o.pacingChanged()
+	return nil
+}
+
+func cooldownTarget(egress, site string) string { return "fetch_cooldown:" + egress + "/" + site }
+
+// SetCooldown manually cools (egress, site) down until until (audited as
+// fetch_cooldown.set). An empty key or site, or an until not in the future,
+// is a 400.
+func (o *Ops) SetCooldown(ctx context.Context, a Actor, egress, site string, until time.Time, reason string) error {
+	err := o.change(ctx, a, func(tx *store.Tx, rec recorder) error {
+		if err := tx.SetCooldown(ctx, egress, site, until, a.Name, reason); err != nil {
+			return err
+		}
+		return rec("fetch_cooldown.set", cooldownTarget(egress, site),
+			map[string]any{"egress": egress, "site": site, "until": until.UTC(), "reason": reason})
+	})
+	if err != nil {
+		return err
+	}
+	o.pacingChanged()
+	return nil
+}
+
+// ClearCooldown ends the cooldown of (egress, site) (audited as
+// fetch_cooldown.clear); one that is not set is a 404, and not audited.
+func (o *Ops) ClearCooldown(ctx context.Context, a Actor, egress, site string) error {
+	err := o.change(ctx, a, func(tx *store.Tx, rec recorder) error {
+		if err := tx.ClearCooldown(ctx, egress, site); err != nil {
+			return err
+		}
+		return rec("fetch_cooldown.clear", cooldownTarget(egress, site),
+			map[string]any{"egress": egress, "site": site})
+	})
+	if err != nil {
+		return err
+	}
+	o.pacingChanged()
+	return nil
 }

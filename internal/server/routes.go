@@ -18,6 +18,7 @@ func (s *Server) routes() http.Handler {
 
 	// Client API (§6.1).
 	mux.Handle("POST /queue/{q}", s.authed(anyHuman, s.handleUpload))
+	mux.Handle("POST /queue/{q}/fetch", s.authed(anyHuman, s.handleFetchSubmit))
 	mux.Handle("GET /queue/{q}", s.authed(anyHuman, s.handleListJobs))
 	mux.Handle("PATCH /queue/{q}", s.authed(anyHuman, s.handlePatchQueue))
 	mux.Handle("GET /job/{id}", s.authed(anyHuman, s.handleGetJob))
@@ -59,6 +60,13 @@ func (s *Server) routes() http.Handler {
 	mux.Handle("GET /admin/grants", s.authed(anyHuman, s.handleAdminListGrants))
 	mux.Handle("POST /admin/grants", s.authed(anyHuman, s.handleAdminGrant))
 	mux.Handle("DELETE /admin/grants", s.authed(anyHuman, s.handleAdminRevoke))
+	mux.Handle("GET /admin/fetch-policies", s.authed(anyHuman, s.handleAdminListFetchPolicies))
+	mux.Handle("GET /admin/fetch-policies/{key}", s.authed(anyHuman, s.handleAdminGetFetchPolicy))
+	mux.Handle("PUT /admin/fetch-policies/{key}", s.authed(anyHuman, s.handleAdminPutFetchPolicy))
+	mux.Handle("DELETE /admin/fetch-policies/{key}", s.authed(anyHuman, s.handleAdminDeleteFetchPolicy))
+	mux.Handle("GET /admin/fetch-cooldowns", s.authed(anyHuman, s.handleAdminListCooldowns))
+	mux.Handle("POST /admin/fetch-cooldowns", s.authed(anyHuman, s.handleAdminSetCooldown))
+	mux.Handle("DELETE /admin/fetch-cooldowns/{egress}/{site}", s.authed(anyHuman, s.handleAdminClearCooldown))
 	mux.Handle("GET /admin/audit", s.authed(anyHuman, s.handleAdminAudit))
 
 	// UI (§6.3). "/" redirects to it; the UI owns everything under /ui/.

@@ -137,8 +137,12 @@ func (s *Store) checkLive(l leaseRow, now time.Time) error {
 func (s *Store) endLease(ctx context.Context, tx *sql.Tx, l leaseRow, outcome api.LeaseOutcome,
 	retryable bool, reason string, stage api.FailureStage, now time.Time) (*LeaseEnd, error) {
 	if outcome != api.OutcomeFailed || !stage.Valid() && stage != api.StageLoop ||
-		stage == api.StagePreWork && !s.preWorkRefund() {
-		stage = "" // a pre-work failure then counts as an ordinary one
+		stage == api.StagePreWork && !s.preWorkRefund() ||
+		stage == api.StageRateLimited && l.Kind != api.KindFetch {
+		// Not a stage to honour: a pre-work failure then counts as an
+		// ordinary one, and so does a rate_limited report from anything
+		// but a fetch (only a site can rate-limit).
+		stage = ""
 	}
 	// A loop is the model's failure, not the worker's: it counts as an
 	// attempt but not toward the worker's breaker.
@@ -153,10 +157,15 @@ func (s *Store) endLease(ctx context.Context, tx *sql.Tx, l leaseRow, outcome ap
 		return nil, err
 	}
 	preWork := stage == api.StagePreWork
+	// A rate-limited fetch is the site's refusal, not the worker's or the
+	// input's: like pre-work it requeues with no attempt and no exclusion,
+	// but it is not a failure of the worker at all (no streak), and it sets
+	// a cooldown on its egress group x site.
+	rateLimited := stage == api.StageRateLimited
 	if err := countLeaseEnd(ctx, tx, l.WorkerID, outcome); err != nil {
 		return nil, err
 	}
-	pause, err := s.trackFailureStreak(ctx, tx, l, outcome, (retryable || preWork) && !loop, preWork, now)
+	pause, err := s.trackFailureStreak(ctx, tx, l, outcome, (retryable || preWork) && !loop && !rateLimited, preWork, now)
 	if err != nil {
 		return nil, err
 	}
@@ -172,19 +181,31 @@ func (s *Store) endLease(ctx context.Context, tx *sql.Tx, l leaseRow, outcome ap
 		return nil, err
 	}
 
+	if rateLimited {
+		if err := s.startRateLimitCooldown(ctx, tx, l, now); err != nil {
+			return nil, err
+		}
+	}
+
 	switch {
-	case (preWork || retryable && end.Attempt < s.cfg.MaxAttempts) && !failing:
+	case (preWork || rateLimited || retryable && end.Attempt < s.cfg.MaxAttempts) && !failing:
 		if err := reactivate(ctx, tx, l.QueueID, l.Weight); err != nil {
 			return nil, err
 		}
+		// A rate-limited task keeps its pending_since, so the queue
+		// view shows how long it has waited since it first became
+		// pending. (FailStranded measures a rate-limited fetch's wait
+		// from its first rate-limited lease end, MIN(ended_at).)
+		pendingSince := sql.NullInt64{Int64: toMS(now), Valid: !rateLimited}
 		if _, err := tx.ExecContext(ctx, `UPDATE tasks SET state = 'pending', attempts = ?,
-			error = COALESCE(?, error), pending_since = ? WHERE job_id = ? AND seq = ? AND state = 'leased'`,
-			end.Attempt, errText, toMS(now), l.JobID, l.Seq); err != nil {
+			error = COALESCE(?, error), pending_since = COALESCE(?, pending_since)
+			WHERE job_id = ? AND seq = ? AND state = 'leased'`,
+			end.Attempt, errText, pendingSince, l.JobID, l.Seq); err != nil {
 			return nil, fmt.Errorf("requeue task: %w", err)
 		}
 		end.Requeued = true
 		return end, nil
-	case preWork || retryable && end.Attempt < s.cfg.MaxAttempts:
+	case preWork || rateLimited || retryable && end.Attempt < s.cfg.MaxAttempts:
 		// The task could run again, but its job is failing.
 		if _, err := tx.ExecContext(ctx, `UPDATE tasks SET state = ?, attempts = ?, error = COALESCE(?, error)
 			WHERE job_id = ? AND seq = ? AND state = 'leased'`,
@@ -232,11 +253,22 @@ func failedAttempts(kind api.TaskKind, seq int, workers []string) string {
 	return msg
 }
 
+// countedStageSQL is a condition (over the leases table, aliased as alias,
+// or unqualified for "") that a lease's end counts against its task: it
+// failed or expired, and not before work started (pre-work) or because the
+// site refused (rate_limited), which are refunded.
+func countedStageSQL(alias string) string {
+	if alias != "" {
+		alias += "."
+	}
+	return alias + `outcome IN ('failed','expired') AND ` + alias + `stage IS NOT 'pre-work' AND ` +
+		alias + `stage IS NOT 'rate_limited'`
+}
+
 // countedFailureSQL is a condition (over leases, unqualified) that a lease
-// counts as a failed attempt: it failed, other than before work started, or
-// expired, since the job was last retried (leases.retry, DESIGN.md §4.2).
-const countedFailureSQL = `outcome IN ('failed','expired') AND stage IS NOT 'pre-work'
-	AND retry = (SELECT retries FROM jobs WHERE jobs.id = leases.job_id)`
+// counts as a failed attempt (countedStageSQL) since the job was last
+// retried (leases.retry, DESIGN.md §4.2).
+var countedFailureSQL = countedStageSQL("") + ` AND retry = (SELECT retries FROM jobs WHERE jobs.id = leases.job_id)`
 
 // failedOn returns the distinct workers that failed a task (not counting
 // pre-work failures) or let a lease on it expire, in the order of their first such lease. Their number is the
@@ -278,7 +310,8 @@ func (a LeaseAgeLimit) of(cost float64) time.Duration {
 // Heartbeat extends a live lease to now+ttl and returns the new expiry.
 // ErrLeaseGone if the lease is no longer live, or may no longer be kept
 // alive: its worker is neither active nor paused, the worker no longer
-// holds process on the lease's queue, or the lease is older than age
+// holds process (fetch, for a fetch lease) on the lease's queue, or the
+// lease is older than age
 // allows. The worker must stop; the lease then expires within ttl.
 func (s *Store) Heartbeat(ctx context.Context, leaseID, workerID string, ttl time.Duration, age LeaseAgeLimit) (time.Time, error) {
 	now := s.now()
@@ -292,17 +325,23 @@ func (s *Store) Heartbeat(ctx context.Context, leaseID, workerID string, ttl tim
 		var granted bool
 		var created int64
 		var cost float64
-		if err := tx.QueryRowContext(ctx, `SELECT w.state, `+processGrantSQL+`, l.created_at, t.cost
+		// A fetch lease needs fetch on its queue, any other process.
+		if err := tx.QueryRowContext(ctx, `SELECT w.state, CASE WHEN t.kind = 'fetch' THEN `+fetchGrantSQL+`
+			ELSE `+processGrantSQL+` END, l.created_at, t.cost
 			FROM leases l JOIN workers w ON w.id = l.worker_id JOIN jobs j ON j.id = l.job_id
 			JOIN tasks t ON t.job_id = l.job_id AND t.seq = l.seq WHERE l.id = ?`,
-			WorkerPrincipal(workerID), leaseID).Scan(&state, &granted, &created, &cost); err != nil {
+			WorkerPrincipal(workerID), WorkerPrincipal(workerID), leaseID).Scan(&state, &granted, &created, &cost); err != nil {
 			return fmt.Errorf("heartbeat: %w", err)
+		}
+		role := api.RoleProcess
+		if l.Kind == api.KindFetch {
+			role = api.RoleFetch
 		}
 		switch {
 		case state != api.WorkerActive && state != api.WorkerPaused:
 			return fmt.Errorf("lease %s: worker is %s: %w", l.ID, state, ErrLeaseGone)
 		case !granted:
-			return fmt.Errorf("lease %s: process no longer granted on its queue: %w", l.ID, ErrLeaseGone)
+			return fmt.Errorf("lease %s: %s no longer granted on its queue: %w", l.ID, role, ErrLeaseGone)
 		}
 		if limit := age.of(cost); limit > 0 && now.Sub(fromMS(created)) >= limit {
 			return fmt.Errorf("lease %s: older than its %v limit: %w", l.ID, limit, ErrLeaseGone)

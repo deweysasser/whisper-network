@@ -1,9 +1,11 @@
 package server
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -466,4 +468,53 @@ func TestBulkDeleteAndFilter(t *testing.T) {
 	es, err := h.st.QueryAudit(h.ctx, store.AuditFilter{ActionPrefix: "job.bulk_delete"})
 	require.NoError(t, err)
 	assert.Len(t, es, 3)
+}
+
+// failedURLJobWithBlobs inserts a failed URL job (through a second
+// connection) with blob files for its media and a transcript; original says
+// whether its original is still recorded as present.
+func (h *harness) failedURLJobWithBlobs(id string, original bool) {
+	h.t.Helper()
+	h.fetchingJob(id)
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(h.dir, "wn.db")+"?_pragma=busy_timeout(5000)")
+	require.NoError(h.t, err)
+	defer db.Close()
+	bytes := 0
+	if original {
+		bytes = 5
+	}
+	_, err = db.ExecContext(h.ctx, `UPDATE jobs SET state = 'failed', error = 'boom', completed_at = 2,
+		original_bytes = ? WHERE id = ?`, bytes, id)
+	require.NoError(h.t, err)
+	_, err = db.ExecContext(h.ctx, `UPDATE tasks SET state = 'failed' WHERE job_id = ?`, id)
+	require.NoError(h.t, err)
+	for _, name := range []string{blobs.Original, blobs.Canonical, blobs.Transcript} {
+		require.NoError(h.t, h.blobs.WriteFile(id, name, []byte("x")))
+	}
+}
+
+// TestRetryRefetchRemovesBlobs: retrying a URL job whose media is gone
+// removes its stale blobs and sends it back to fetching; one whose original
+// is still present keeps them and is prepared again.
+func TestRetryRefetchRemovesBlobs(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+
+	h.failedURLJobWithBlobs("jgone", false)
+	assert.True(t, h.job("jgone").Retryable)
+	var got api.Job
+	h.expect("POST", "/job/jgone/retry", h.admin, nil, http.StatusOK, &got)
+	assert.Equal(t, api.JobFetching, got.State)
+	_, err := h.blobs.ReadFile("jgone", blobs.Canonical)
+	assert.Error(t, err, "stale canonical audio removed")
+	_, err = h.blobs.ReadFile("jgone", blobs.Transcript)
+	assert.Error(t, err, "stale transcript removed")
+	assert.Equal(t, api.JobFetching, h.job("jgone").State)
+
+	h.failedURLJobWithBlobs("jkeep", true)
+	h.expect("POST", "/job/jkeep/retry", h.admin, nil, http.StatusOK, &got)
+	assert.Equal(t, api.JobPreparing, got.State)
+	b, err := h.blobs.ReadFile("jkeep", blobs.Original)
+	require.NoError(t, err)
+	assert.Equal(t, "x", string(b))
 }

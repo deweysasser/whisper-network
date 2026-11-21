@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"errors"
 	"strconv"
 )
 
@@ -23,6 +24,18 @@ type Spec struct {
 	// inherits only /dev/null and pipes, so it holds no socket to start
 	// from.
 	DenyNet bool
+	// ConnectPorts relaxes DenyNet for a child that must reach one local
+	// service (a downloader's egress proxy): it may open TCP connections
+	// to these ports, on any address, and nothing else. Valid only with
+	// DenyNet. The seccomp filter then lets socket(2) create AF_INET and
+	// AF_INET6 SOCK_STREAM sockets with protocol 0 or IPPROTO_TCP (no
+	// MPTCP, UDP, raw, Unix, netlink or socketpair), and Landlock (ABI 4+)
+	// refuses bind(2) and every TCP connect(2) except to these ports;
+	// listen(2), accept(2) and MSG_FASTOPEN sends are refused too. Below
+	// ABI 4 Landlock cannot restrict TCP, so the spec fails closed: every
+	// socket is refused as under plain DenyNet, with a warning, and
+	// [ProbeDownloader] reports less than full.
+	ConnectPorts []uint16
 
 	// AddressSpace is RLIMIT_AS in bytes; 0 leaves it unchanged.
 	AddressSpace uint64
@@ -68,6 +81,19 @@ func (s Spec) Confines() bool {
 	return s.RestrictsFS() || s.DenyNet
 }
 
+// Validate reports a spec that cannot be applied as written.
+func (s Spec) Validate() error {
+	if len(s.ConnectPorts) > 0 && !s.DenyNet {
+		return errors.New("sandbox: connect ports require deny-net")
+	}
+	for _, p := range s.ConnectPorts {
+		if p == 0 {
+			return errors.New("sandbox: connect port 0")
+		}
+	}
+	return nil
+}
+
 // RestrictsFS reports whether the spec asks for a filesystem restriction.
 // A spec naming no paths leaves the filesystem alone.
 func (s Spec) RestrictsFS() bool {
@@ -88,6 +114,7 @@ const (
 	flagRO         = "ro"
 	flagRW         = "rw"
 	flagDenyNet    = "deny-net"
+	flagConnect    = "connect-port"
 	flagAS         = "rlimit-as"
 	flagFSize      = "rlimit-fsize"
 	flagNoFile     = "rlimit-nofile"
@@ -113,6 +140,9 @@ func (s Spec) Args() []string {
 	}
 	if s.DenyNet {
 		a = append(a, "--"+flagDenyNet)
+	}
+	for _, p := range s.ConnectPorts {
+		add(flagConnect, strconv.FormatUint(uint64(p), 10))
 	}
 	if s.AddressSpace > 0 {
 		add(flagAS, strconv.FormatUint(s.AddressSpace, 10))

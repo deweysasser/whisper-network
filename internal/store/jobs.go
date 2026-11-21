@@ -87,7 +87,10 @@ type Job struct {
 	LastDownloadedAt  *time.Time
 	// Retries counts how many times the failed job was retried.
 	Retries int
-	Tasks   api.TaskCounts
+	// FetchURL and FetchSite are a URL job's URL and its site key; empty
+	// for uploads.
+	FetchURL, FetchSite string
+	Tasks               api.TaskCounts
 }
 
 // Terminal reports whether the job is done or failed.
@@ -172,6 +175,48 @@ func (s *Store) CreateJob(ctx context.Context, nj NewJob) (job *Job, created boo
 
 // CreateJob is Store.CreateJob inside the transaction.
 func (t *Tx) CreateJob(ctx context.Context, nj NewJob) (job *Job, created bool, err error) {
+	return t.createJob(ctx, nj, nil)
+}
+
+// NewFetchJob holds the fields of a URL job to create.
+type NewFetchJob struct {
+	// ID is optional; when empty the store generates one.
+	ID             string
+	QueueID        int64
+	ClientID       string // owner principal id
+	IdempotencyKey string // optional
+	Params         api.JobParams
+	// URL is the media to download and Site its policy site key
+	// (fetchpolicy.SiteKey), both computed and validated by the caller.
+	URL, Site string
+}
+
+// CreateFetchJob creates a URL job: state fetching, with one fetch task at
+// FetchSeq costing Config.FetchCost. Idempotency and the scheduler's
+// reactivation rule are as for CreateJob.
+func (s *Store) CreateFetchJob(ctx context.Context, nj NewFetchJob) (job *Job, created bool, err error) {
+	err = s.InTx(ctx, func(tx *Tx) error {
+		job, created, err = tx.CreateFetchJob(ctx, nj)
+		return err
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return job, created, nil
+}
+
+// CreateFetchJob is Store.CreateFetchJob inside the transaction.
+func (t *Tx) CreateFetchJob(ctx context.Context, nj NewFetchJob) (job *Job, created bool, err error) {
+	if nj.URL == "" || nj.Site == "" {
+		return nil, false, fmt.Errorf("%w: url job needs a url and a site", ErrInvalid)
+	}
+	return t.createJob(ctx, NewJob{ID: nj.ID, QueueID: nj.QueueID, ClientID: nj.ClientID,
+		IdempotencyKey: nj.IdempotencyKey, Params: nj.Params}, &nj)
+}
+
+// createJob creates an upload job, or with fetch set a URL job (whose nj
+// carries no media).
+func (t *Tx) createJob(ctx context.Context, nj NewJob, fetch *NewFetchJob) (job *Job, created bool, err error) {
 	s, tx := t.s, t.tx
 	p := nj.Params
 	if p.Weight == "" {
@@ -218,6 +263,12 @@ func (t *Tx) CreateJob(ctx context.Context, nj NewJob) (job *Job, created bool, 
 	}
 	now := toMS(s.now())
 	state := api.JobPreparing
+	var fetchURL, fetchSite sql.NullString
+	if fetch != nil {
+		state = api.JobFetching
+		fetchURL = sql.NullString{String: fetch.URL, Valid: true}
+		fetchSite = sql.NullString{String: fetch.Site, Valid: true}
+	}
 	var canonBytes, canonSamples sql.NullInt64
 	var canonSHA sql.NullString
 	if c := nj.Canonical; c != nil {
@@ -232,30 +283,47 @@ func (t *Tx) CreateJob(ctx context.Context, nj NewJob) (job *Job, created bool, 
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO jobs (id, queue_id, client_id, idempotency_key, state, weight,
 		model, language, prompt, label, source, metadata, original_bytes, original_sha256, original_type,
-		canonical_bytes, canonical_sha256, audio_samples, created_at, updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		canonical_bytes, canonical_sha256, audio_samples, created_at, updated_at, fetch_url, fetch_site)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		nj.ID, nj.QueueID, nj.ClientID, sql.NullString{String: nj.IdempotencyKey, Valid: nj.IdempotencyKey != ""},
 		string(state), string(p.Weight), p.Model, p.Language, p.Prompt, p.Label, p.Source, meta,
-		nj.Original.Bytes, nj.Original.SHA256, nj.Original.Type, canonBytes, canonSHA, canonSamples, now, now)
+		nj.Original.Bytes, nj.Original.SHA256, nj.Original.Type, canonBytes, canonSHA, canonSamples, now, now, fetchURL, fetchSite)
 	if isUnique(err) {
 		return nil, false, fmt.Errorf("create job %s: %w", nj.ID, ErrConflict)
 	}
 	if err != nil {
 		return nil, false, fmt.Errorf("create job: %w", err)
 	}
-	if nj.Canonical == nil {
+	switch {
+	case fetch != nil:
 		if _, err := tx.ExecContext(ctx, `INSERT INTO tasks (job_id, seq, kind, cost, state, pending_since)
-			VALUES (?,0,?,?,?,?)`, nj.ID, string(api.KindPrepare), s.cfg.PrepareCost, string(api.TaskPending), now); err != nil {
-			return nil, false, fmt.Errorf("create prepare task: %w", err)
+			VALUES (?,?,?,?,?,?)`, nj.ID, FetchSeq, string(api.KindFetch), s.cfg.FetchCost, string(api.TaskPending),
+			now); err != nil {
+			return nil, false, fmt.Errorf("create fetch task: %w", err)
 		}
-	} else if err := s.insertTranscribeTasks(ctx, tx, nj.ID, p.Model, nj.Ranges); err != nil {
-		return nil, false, err
+	case nj.Canonical == nil:
+		if err := s.insertPrepareTask(ctx, tx, nj.ID); err != nil {
+			return nil, false, err
+		}
+	default:
+		if err := s.insertTranscribeTasks(ctx, tx, nj.ID, p.Model, nj.Ranges); err != nil {
+			return nil, false, err
+		}
 	}
 	job, err = getJob(ctx, tx, nj.ID)
 	if err != nil {
 		return nil, false, err
 	}
 	return job, true, nil
+}
+
+func (s *Store) insertPrepareTask(ctx context.Context, tx *sql.Tx, jobID string) error {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO tasks (job_id, seq, kind, cost, state, pending_since)
+		VALUES (?,0,?,?,?,?)`, jobID, string(api.KindPrepare), s.cfg.PrepareCost, string(api.TaskPending),
+		toMS(s.now())); err != nil {
+		return fmt.Errorf("create prepare task: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) insertTranscribeTasks(ctx context.Context, tx *sql.Tx, jobID, model string, rs []SampleRange) error {
@@ -275,6 +343,7 @@ const jobSelect = `SELECT j.id, j.queue_id, q.name, j.client_id, COALESCE(j.idem
 	j.original_type, j.original_purged_at, j.canonical_bytes, j.canonical_sha256, j.audio_samples,
 	j.canonical_purged_at, j.created_at, j.updated_at, j.started_at, j.completed_at, j.compute_ms,
 	COALESCE(j.error, ''), j.download_count, j.first_downloaded_at, j.last_downloaded_at, j.retries,
+	COALESCE(j.fetch_url, ''), COALESCE(j.fetch_site, ''),
 	COUNT(t.seq), COALESCE(SUM(t.state = 'pending'), 0), COALESCE(SUM(t.state = 'leased'), 0),
 	COALESCE(SUM(t.state = 'done'), 0), COALESCE(SUM(t.state = 'failed'), 0),
 	COALESCE(SUM(t.state = 'cancelled'), 0), COALESCE(SUM(t.compute_ms), 0)
@@ -289,7 +358,7 @@ func scanJob(row interface{ Scan(...any) error }) (*Job, error) {
 		&j.Model, &j.Language, &j.Prompt, &j.Label, &j.Source, &meta, &j.Original.Bytes, &j.Original.SHA256,
 		&j.Original.Type, &origPurged, &canonBytes, &canonSHA, &samples, &canonPurged, &created, &updated,
 		&started, &completed, &computeMS, &j.Error, &j.DownloadCount, &firstDL, &lastDL, &j.Retries,
-		&j.Tasks.Total, &j.Tasks.Pending, &j.Tasks.Leased, &j.Tasks.Done, &j.Tasks.Failed, &j.Tasks.Cancelled, &taskCompute)
+		&j.FetchURL, &j.FetchSite, &j.Tasks.Total, &j.Tasks.Pending, &j.Tasks.Leased, &j.Tasks.Done, &j.Tasks.Failed, &j.Tasks.Cancelled, &taskCompute)
 	if err != nil {
 		return nil, err
 	}
@@ -354,10 +423,10 @@ func (o JobSort) Valid() bool { return o == "" || o == SortCreated || o == SortS
 
 // jobStateRankSQL and jobStateKeySQL (over j = jobs) are the state order's
 // group and the time within the group. They must match the expressions of
-// the jobs_queue_state_order index (migration 0009) exactly.
+// the jobs_queue_state_order index (migrations 0009, 0012) exactly.
 const (
 	jobStateRankSQL = `(CASE j.state WHEN 'running' THEN 0 WHEN 'queued' THEN 1 WHEN 'preparing' THEN 1 ` +
-		`WHEN 'failed' THEN 2 ELSE 3 END)`
+		`WHEN 'fetching' THEN 1 WHEN 'failed' THEN 2 ELSE 3 END)`
 	jobStateKeySQL = `(CASE WHEN j.state IN ('failed','done') THEN -COALESCE(j.completed_at, j.created_at) ` +
 		`ELSE j.created_at END)`
 )
@@ -368,7 +437,7 @@ func (j *Job) stateOrder() (rank, key int64) {
 	switch j.State {
 	case api.JobRunning:
 		return 0, toMS(j.CreatedAt)
-	case api.JobQueued, api.JobPreparing:
+	case api.JobQueued, api.JobPreparing, api.JobFetching:
 		return 1, toMS(j.CreatedAt)
 	}
 	rank, t := int64(3), j.CreatedAt
@@ -770,7 +839,7 @@ func (s *Store) SettleFailingJobs(ctx context.Context) ([]string, error) {
 	var out []string
 	err := s.write(ctx, func(tx *sql.Tx) error {
 		out = nil
-		rows, err := tx.QueryContext(ctx, `SELECT j.id FROM jobs j WHERE j.state IN ('preparing','queued','running')
+		rows, err := tx.QueryContext(ctx, `SELECT j.id FROM jobs j WHERE j.state IN ('fetching','preparing','queued','running')
 			AND EXISTS (SELECT 1 FROM tasks t WHERE t.job_id = j.id AND t.state = 'failed')
 			AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.job_id = j.id AND l.ended_at IS NULL)`)
 		if err != nil {

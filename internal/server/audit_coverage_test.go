@@ -202,6 +202,16 @@ func TestAuditCoverage(t *testing.T) {
 	assert.Greater(t, es[0].ID, mark)
 	assert.Equal(t, "client:"+ownerID, es[0].Actor)
 
+	// Fetch policies and cooldowns.
+	step("fetch_policy.put", adminName, "fetch_policy:example.com", httpOK("PUT", "/admin/fetch-policies/example.com",
+		api.FetchPolicy{Rules: []string{"1/1m"}, Concurrency: 1, BackoffInitial: "1m", BackoffCap: "1h"}, 201, nil))
+	step("fetch_policy.delete", adminName, "fetch_policy:example.com",
+		httpOK("DELETE", "/admin/fetch-policies/example.com", nil, 204, nil))
+	step("fetch_cooldown.set", adminName, "fetch_cooldown:label:home/example.com", httpOK("POST", "/admin/fetch-cooldowns",
+		api.SetCooldownRequest{EgressKey: "label:home", Site: "example.com", Duration: "1h", Reason: "test"}, 201, nil))
+	step("fetch_cooldown.clear", adminName, "fetch_cooldown:label:home/example.com",
+		httpOK("DELETE", "/admin/fetch-cooldowns/label%3Ahome/example.com", nil, 204, nil))
+
 	assertAuditClean(t, h, secrets)
 }
 

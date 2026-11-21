@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/deweysasser/whisper-network/internal/api"
 	"github.com/deweysasser/whisper-network/internal/client"
+	"github.com/deweysasser/whisper-network/internal/egress"
 	"github.com/deweysasser/whisper-network/internal/models"
 	"github.com/deweysasser/whisper-network/internal/obs"
 )
@@ -28,6 +30,9 @@ var (
 	// ErrUnknownWorker means the server does not accept this worker's
 	// credentials (401). The worker does not silently re-register.
 	ErrUnknownWorker = errors.New("server does not recognize this worker's credentials")
+	// ErrEgressProxyStopped means a downloader's egress proxy stopped
+	// accepting connections while the worker ran: it can fetch nothing.
+	ErrEgressProxyStopped = errors.New("the downloader's egress proxy stopped")
 )
 
 // Worker is one worker process. Create it with New and call Run once.
@@ -42,6 +47,19 @@ type Worker struct {
 	tools tools
 	// offered are the whisper models in facts, smallest first.
 	offered []models.Model
+
+	// Downloader state: the filtering proxy yt-dlp is pointed at, the
+	// filtered clients for the egress probe and for plain GET fetches, and
+	// the probe's trigger.
+	proxy         *egress.Proxy
+	egressClient  *http.Client
+	fetchClient   *http.Client
+	egressTrigger chan struct{}
+	egressMu      sync.Mutex
+	egressIP      string
+	// noProxyConnect: the fetch child's sandbox cannot let it reach the
+	// proxy (Linux below Landlock ABI 4), so fetch leases are refused.
+	noProxyConnect bool
 
 	mem      *memBudget
 	cache    *ModelCache
@@ -61,11 +79,13 @@ type Worker struct {
 
 // tools are the resolved child binaries and their versions.
 type tools struct {
+	ytdlp, ytdlpVersion          string // downloader only
+	deno                         string // downloader only; "" if absent or unusable
 	whisper, ffmpeg              string // absolute paths, "" if absent
 	engineVersion, ffmpegVersion string
-	// whisperRO and ffmpegRO are what each tool's sandbox may read besides
-	// the system paths (see toolReadOnly).
-	whisperRO, ffmpegRO []string
+	// whisperRO, ffmpegRO and ytdlpRO are what each tool's sandbox may
+	// read besides the system paths (see toolReadOnly, ytdlpReadOnly).
+	whisperRO, ffmpegRO, ytdlpRO []string
 }
 
 // New validates cfg and returns a worker.
@@ -78,15 +98,27 @@ func New(cfg Config) (*Worker, error) {
 		numCPU = runtime.NumCPU()
 	}
 	return &Worker{
-		cfg:          cfg,
-		log:          cfg.Logger,
-		sys:          System{Root: cfg.SysRoot, NumCPU: numCPU},
-		pollInterval: cfg.PausedPoll,
+		cfg:           cfg,
+		log:           cfg.Logger,
+		sys:           System{Root: cfg.SysRoot, NumCPU: numCPU},
+		pollInterval:  cfg.PausedPoll,
+		egressTrigger: make(chan struct{}, 1),
 	}, nil
 }
 
 // Facts returns the facts probed by Run (zero before Run probes).
-func (w *Worker) Facts() api.WorkerFacts { return w.facts }
+func (w *Worker) Facts() api.WorkerFacts { return w.currentFacts() }
+
+// currentFacts is the probed facts with the latest egress IP.
+func (w *Worker) currentFacts() api.WorkerFacts {
+	f := w.facts
+	w.egressMu.Lock()
+	defer w.egressMu.Unlock()
+	if w.egressIP != "" {
+		f.EgressIP = w.egressIP
+	}
+	return f
+}
 
 // ID returns the worker ID once registered, else "".
 func (w *Worker) ID() string {
@@ -127,6 +159,17 @@ func (w *Worker) Run(ctx context.Context) error {
 	if err := w.checkDedicatedChildUID(); err != nil {
 		return err
 	}
+	if w.cfg.Downloader {
+		// Before the probe: the sandbox self-test connects to the proxy's
+		// port and would otherwise listen on it itself. Not bound to ctx:
+		// with --drain, fetches running at the shutdown signal still need
+		// it; it closes when Run returns, after the slots.
+		stop, err := w.startEgress(context.WithoutCancel(ctx))
+		if err != nil {
+			return err
+		}
+		defer stop()
+	}
 	if err := w.probe(ctx); err != nil {
 		return err
 	}
@@ -140,6 +183,10 @@ func (w *Worker) Run(ctx context.Context) error {
 	w.fatal = fatal
 	if err := w.awaitActive(runCtx); err != nil {
 		return w.result(ctx, runCtx, err)
+	}
+
+	if w.proxy != nil {
+		go w.watchProxy(runCtx)
 	}
 
 	workCtx := runCtx
@@ -163,6 +210,13 @@ func (w *Worker) Run(ctx context.Context) error {
 	w.log.Info().Int("slots", w.facts.Slots).Strs("models", w.facts.Models).
 		Strs("kinds", kindStrings(w.facts.Kinds)).Msg("worker active; starting slots")
 	var wg sync.WaitGroup
+	if w.cfg.Downloader && w.egressClient != nil && w.cfg.EgressProbe != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w.runEgressProbe(runCtx)
+		}()
+	}
 	for i := range w.facts.Slots {
 		wg.Add(1)
 		go func() {
@@ -172,6 +226,22 @@ func (w *Worker) Run(ctx context.Context) error {
 	}
 	wg.Wait()
 	return w.result(ctx, runCtx, nil)
+}
+
+// watchProxy stops the worker when its egress proxy stops (a permanent
+// accept error) before ctx ends: without it every fetch would fail.
+func (w *Worker) watchProxy(ctx context.Context) {
+	select {
+	case <-ctx.Done():
+	case <-w.proxy.Done():
+		if ctx.Err() == nil {
+			err := ErrEgressProxyStopped
+			if perr := w.proxy.Err(); perr != nil {
+				err = fmt.Errorf("%w: %w", ErrEgressProxyStopped, perr)
+			}
+			w.fail(err)
+		}
+	}
 }
 
 // result maps how Run ended to its return value.
@@ -200,7 +270,7 @@ func (w *Worker) fail(err error) {
 
 // isFatal reports errors that must stop the worker.
 func isFatal(err error) bool {
-	return errors.Is(err, ErrRejected) || errors.Is(err, ErrUnknownWorker) ||
+	return errors.Is(err, ErrRejected) || errors.Is(err, ErrUnknownWorker) || errors.Is(err, ErrEgressProxyStopped) ||
 		client.IsRejected(err) || client.IsUnauthorized(err)
 }
 

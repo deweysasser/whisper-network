@@ -27,7 +27,7 @@ func (w *Worker) slot(runCtx, workCtx context.Context, n int) {
 		if w.load.enabled() && !w.waitForLoad(runCtx, &sl, log) {
 			return
 		}
-		off, res, err := w.mem.reserve(runCtx, w.facts.Kinds, w.offered, w.cfg.Limits.PrepareMemory)
+		off, res, err := w.mem.reserve(runCtx, w.facts.Kinds, w.offered, w.cfg.Limits.PrepareMemory, w.cfg.Limits.FetchMemory)
 		if err != nil {
 			return
 		}
@@ -113,8 +113,11 @@ func (w *Worker) refuse(log zerolog.Logger, l *api.Lease, need, avail int64) {
 
 // leaseMemory is the memory a lease's work needs.
 func (w *Worker) leaseMemory(l *api.Lease) int64 {
-	if l.Kind == api.KindPrepare {
+	switch l.Kind {
+	case api.KindPrepare:
 		return w.cfg.Limits.PrepareMemory
+	case api.KindFetch:
+		return w.cfg.Limits.FetchMemory
 	}
 	if m, ok := w.cfg.Catalog.Lookup(l.Model); ok {
 		return m.PeakRSS

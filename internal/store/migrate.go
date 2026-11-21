@@ -2,7 +2,10 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"database/sql/driver"
 	"embed"
+	"errors"
 	"fmt"
 	"io/fs"
 	"sort"
@@ -62,12 +65,22 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	for _, m := range ms {
-		if err := retryBusy(ctx, DefaultBusyTimeout, func() error { return s.applyMigration(ctx, m, len(ms)) }); err != nil {
+		if err := retryBusy(ctx, migrationBusyLimit, func() error { return s.applyMigration(ctx, m, len(ms)) }); err != nil {
 			return err
 		}
 	}
 	return nil
 }
+
+// migrationBusyLimit bounds how long an opener keeps trying to take the
+// write lock for a migration step. Each attempt already waits busy_timeout;
+// the lock is not fair, so while another opener applies the steps one after
+// another (each in its own transaction) a waiter can lose every race for
+// longer than that, and the steps themselves are slow under load. A waiter
+// that keeps trying finds the database migrated once the other opener is
+// done (applyMigration checks the version before locking), so the limit only
+// has to outlast a whole migration run, not one step.
+const migrationBusyLimit = 60 * time.Second
 
 // retryBusy runs op until it returns something other than SQLITE_BUSY or
 // limit has passed. It exists for one case the busy_timeout handler does not
@@ -95,8 +108,58 @@ func retryBusy(ctx context.Context, limit time.Duration, op func() error) error 
 	}
 }
 
-func (s *Store) applyMigration(ctx context.Context, m migration, latest int) error {
-	tx, err := s.w.BeginTx(ctx, nil)
+// restoreForeignKeys turns foreign key enforcement back on for conn. If
+// that fails, conn is marked bad so the pool discards it rather than hand
+// out a connection with enforcement off.
+func restoreForeignKeys(conn *sql.Conn) error {
+	_, err := conn.ExecContext(context.Background(), "PRAGMA foreign_keys=ON")
+	if err == nil {
+		return nil
+	}
+	_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+	return fmt.Errorf("restoring foreign_keys (connection discarded): %w", err)
+}
+
+// foreignKeysOffDirective, as the first line of a migration, runs it with
+// foreign key enforcement off, which SQLite's table rebuild procedure needs
+// (https://sqlite.org/lang_altertable.html, "Making Other Kinds Of Table
+// Schema Changes"). PRAGMA foreign_keys cannot change inside a transaction,
+// so it is set on the dedicated connection before BEGIN; foreign_key_check
+// must come back empty before COMMIT; enforcement is restored in every path.
+const foreignKeysOffDirective = "-- whisper:foreign-keys-off"
+
+func (m migration) foreignKeysOff() bool {
+	first, _, _ := strings.Cut(m.sql, "\n")
+	return strings.TrimSpace(first) == foreignKeysOffDirective
+}
+
+func (s *Store) applyMigration(ctx context.Context, m migration, latest int) (err error) {
+	conn, err := s.w.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("migration %s: conn: %w", m.name, err)
+	}
+	defer func() { _ = conn.Close() }()
+	// Lock-free fast path: in WAL mode this read never waits for a writer.
+	// Anything already applied (by this process earlier, or by a concurrent
+	// opener) needs no transaction. The version is read again inside the
+	// transaction below, which is the check that counts.
+	var seen int
+	if err := conn.QueryRowContext(ctx, "PRAGMA user_version").Scan(&seen); err == nil && seen >= m.version && seen <= latest {
+		return nil
+	}
+	if m.foreignKeysOff() {
+		if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys=OFF"); err != nil {
+			return fmt.Errorf("migration %s: foreign_keys off: %w", m.name, err)
+		}
+		defer func() {
+			// Use a fresh context: ctx may be cancelled, and a pooled
+			// connection must never go back with enforcement off.
+			if rerr := restoreForeignKeys(conn); rerr != nil {
+				err = errors.Join(err, fmt.Errorf("migration %s: %w", m.name, rerr))
+			}
+		}()
+	}
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("migration %s: begin: %w", m.name, err)
 	}
@@ -113,6 +176,20 @@ func (s *Store) applyMigration(ctx context.Context, m migration, latest int) err
 	}
 	if _, err := tx.ExecContext(ctx, m.sql); err != nil {
 		return fmt.Errorf("migration %s: %w", m.name, err)
+	}
+	if m.foreignKeysOff() {
+		rows, err := tx.QueryContext(ctx, "PRAGMA foreign_key_check")
+		if err != nil {
+			return fmt.Errorf("migration %s: foreign_key_check: %w", m.name, err)
+		}
+		violations := rows.Next()
+		_ = rows.Close()
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("migration %s: foreign_key_check: %w", m.name, err)
+		}
+		if violations {
+			return fmt.Errorf("migration %s: foreign_key_check found violations", m.name)
+		}
 	}
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", m.version)); err != nil {
 		return fmt.Errorf("migration %s: set version: %w", m.name, err)

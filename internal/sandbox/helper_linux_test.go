@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -39,6 +40,28 @@ func runHelper(args []string) int {
 	case "fsize":
 		signal.Ignore(syscall.SIGXFSZ)
 		fmt.Println(classify(os.WriteFile(args[1], make([]byte, 1<<20), 0o600)))
+	case "dial-nonblock":
+		// connect(2) on a SOCK_NONBLOCK socket: EINPROGRESS, then the
+		// result from SO_ERROR once writable.
+		fmt.Println(classify(dialNonblock(args[1])))
+	case "tfo":
+		// TCP Fast Open: sendto(2) with MSG_FASTOPEN connects without
+		// connect(2).
+		fmt.Println(classify(sendFastOpen(args[1])))
+	case "listen":
+		fmt.Println(classify(listenTCP()))
+	case "accept":
+		// accept(2) on stdin: ENOTSOCK unless a filter refuses it first.
+		_, _, err := unix.Accept(0)
+		fmt.Println(classify(err))
+	case "bind":
+		fmt.Println(classify(bindTCP(args[1])))
+	case "raw":
+		fmt.Println(classify(socketOnly(unix.AF_INET, unix.SOCK_RAW, unix.IPPROTO_ICMP)))
+	case "netlink":
+		fmt.Println(classify(socketOnly(unix.AF_NETLINK, unix.SOCK_RAW, unix.NETLINK_ROUTE)))
+	case "sctp":
+		fmt.Println(classify(socketOnly(unix.AF_INET, unix.SOCK_STREAM, unix.IPPROTO_SCTP)))
 	case "mptcp":
 		fmt.Println(classify(dialInet(unix.SOCK_STREAM, unix.IPPROTO_MPTCP, args[1])))
 	case "udp":
@@ -52,6 +75,31 @@ func runHelper(args []string) int {
 			unix.Close(fds[1])
 		}
 		fmt.Println(classify(err))
+	case "socketpair-dgram":
+		fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_DGRAM, 0)
+		if err == nil {
+			unix.Close(fds[0])
+			unix.Close(fds[1])
+		}
+		fmt.Println(classify(err))
+	case "socketpair-escape":
+		// socketpair-escape <path>: from a Unix stream pair, try to
+		// connect to and send to a pathname socket. "ok" means it got out.
+		fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+		if err != nil {
+			fmt.Println(classify(err))
+			break
+		}
+		cerr := unix.Connect(fds[0], &unix.SockaddrUnix{Name: args[1]})
+		serr := unix.Sendto(fds[0], []byte("x"), 0, &unix.SockaddrUnix{Name: args[1]})
+		switch {
+		case cerr == nil:
+			fmt.Println("ok: connected")
+		case serr == nil:
+			fmt.Println("ok: sent")
+		default:
+			fmt.Println("contained")
+		}
 	case "dgram":
 		fmt.Println(classify(sendUnixDgram(args[1])))
 	case "unshare":
@@ -189,4 +237,75 @@ func capLines() string {
 		}
 	}
 	return strings.Join(out, "\n")
+}
+
+// inetSockaddr parses addr into a socket address and its family.
+func inetSockaddr(addr string) (int, unix.Sockaddr, error) {
+	ap, err := netip.ParseAddrPort(addr)
+	if err != nil {
+		return 0, nil, err
+	}
+	if ap.Addr().Is4() {
+		return unix.AF_INET, &unix.SockaddrInet4{Port: int(ap.Port()), Addr: ap.Addr().As4()}, nil
+	}
+	return unix.AF_INET6, &unix.SockaddrInet6{Port: int(ap.Port()), Addr: ap.Addr().As16()}, nil
+}
+
+func dialNonblock(addr string) error {
+	fam, sa, err := inetSockaddr(addr)
+	if err != nil {
+		return err
+	}
+	fd, err := unix.Socket(fam, unix.SOCK_STREAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, unix.IPPROTO_TCP)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+	if err := unix.Connect(fd, sa); err != nil && !errors.Is(err, unix.EINPROGRESS) {
+		return err
+	}
+	pfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLOUT}}
+	if _, err := unix.Poll(pfd, 2000); err != nil {
+		return err
+	}
+	if v, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_ERROR); err != nil {
+		return err
+	} else if v != 0 {
+		return unix.Errno(v)
+	}
+	return nil
+}
+
+func sendFastOpen(addr string) error {
+	fam, sa, err := inetSockaddr(addr)
+	if err != nil {
+		return err
+	}
+	fd, err := unix.Socket(fam, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+	return unix.Sendto(fd, []byte("probe"), unix.MSG_FASTOPEN, sa)
+}
+
+func bindTCP(addr string) error {
+	fam, sa, err := inetSockaddr(addr)
+	if err != nil {
+		return err
+	}
+	fd, err := unix.Socket(fam, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+	return unix.Bind(fd, sa)
+}
+
+func socketOnly(domain, typ, proto int) error {
+	fd, err := unix.Socket(domain, typ|unix.SOCK_CLOEXEC, proto)
+	if err == nil {
+		unix.Close(fd)
+	}
+	return err
 }

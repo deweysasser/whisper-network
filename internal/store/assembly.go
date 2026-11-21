@@ -42,7 +42,7 @@ func (s *Store) JobOutputs(ctx context.Context, jobID string) (*JobOutputs, erro
 	}
 	rows, err := s.r.QueryContext(ctx, `SELECT seq, kind, state = 'done', COALESCE(start_sample, 0),
 		COALESCE(end_sample, 0), result, COALESCE(engine_version, ''), COALESCE(worker_id, ''), COALESCE(compute_ms, 0)
-		FROM tasks WHERE job_id = ? AND (state = 'done' OR kind = 'transcribe') ORDER BY seq`, jobID)
+		FROM tasks WHERE job_id = ? AND kind != 'fetch' AND (state = 'done' OR kind = 'transcribe') ORDER BY seq`, jobID)
 	if err != nil {
 		return nil, fmt.Errorf("job outputs: %w", err)
 	}

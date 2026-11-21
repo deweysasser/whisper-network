@@ -215,7 +215,7 @@ func TestDeleteRejectedWorker(t *testing.T) {
 // then reopens it so migrations 3 onward, including the backfill, run again.
 func (f *fixture) rollBackToV2() {
 	f.t.Helper()
-	_, err := f.s.w.ExecContext(f.ctx, `
+	_, err := f.s.w.ExecContext(f.ctx, undo0012+`
 		DROP TABLE worker_stats;
 		DROP INDEX IF EXISTS leases_task_failures;
 		ALTER TABLE leases DROP COLUMN heartbeat_at;

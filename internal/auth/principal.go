@@ -40,8 +40,8 @@ func WorkerScope(workerID string) string { return workerScope + workerID }
 
 // ValidateGrant reports whether g is a well-formed grant: a known role with a
 // scope that role accepts. admin and client_admin take only "*"; worker_admin
-// takes "*" or "worker:<id>"; queue_admin, submit, view_all, read_all,
-// delete_all and process take only "queue:<name>".
+// takes "*" or "worker:<id>"; queue_admin, submit, submit_url, view_all, read_all,
+// delete_all, process and fetch take only "queue:<name>".
 func ValidateGrant(g api.Grant) error {
 	ok := false
 	switch g.Role {
@@ -50,7 +50,7 @@ func ValidateGrant(g api.Grant) error {
 	case api.RoleWorkerAdmin:
 		ok = g.Scope == scopeAll || nonEmptySuffix(g.Scope, workerScope)
 	case api.RoleQueueAdmin, api.RoleSubmit, api.RoleViewAll, api.RoleReadAll,
-		api.RoleDeleteAll, api.RoleProcess:
+		api.RoleDeleteAll, api.RoleProcess, api.RoleFetch, api.RoleSubmitURL:
 		ok = nonEmptySuffix(g.Scope, queuePrefix)
 	default:
 		return &ForbiddenError{Reason: "unknown role " + string(g.Role)}

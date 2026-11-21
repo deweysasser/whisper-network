@@ -21,6 +21,13 @@ package server
 //	GET    /admin/grants?principal=P       P's grants                            admin, or P itself
 //	POST   /admin/grants                   api.PrincipalGrant → 204              CanGrantTo
 //	DELETE /admin/grants?principal=&role=&scope=  → 204                          CanGrantTo
+//	GET    /admin/fetch-policies           []api.FetchPolicy                     admin
+//	GET    /admin/fetch-policies/{key}     api.FetchPolicy; 404 if none           admin
+//	PUT    /admin/fetch-policies/{key}     api.FetchPolicy → 200 (201 created)   admin; the path key wins
+//	DELETE /admin/fetch-policies/{key}     → 204; 409 for "*"                    admin
+//	GET    /admin/fetch-cooldowns          []api.FetchCooldown in force          admin
+//	POST   /admin/fetch-cooldowns          api.SetCooldownRequest → 201          admin
+//	DELETE /admin/fetch-cooldowns/{egress}/{site}  → 204 (egress percent-encoded) admin
 //	GET    /admin/audit?before=&limit=&action=&actor=&target=&since=&until=
 //	                                       api.AuditList, newest first           admin
 //
@@ -41,6 +48,7 @@ import (
 
 	"github.com/deweysasser/whisper-network/internal/api"
 	"github.com/deweysasser/whisper-network/internal/auth"
+	"github.com/deweysasser/whisper-network/internal/fetchpolicy"
 	"github.com/deweysasser/whisper-network/internal/store"
 )
 
@@ -345,4 +353,201 @@ func ParseAuditFilter(q url.Values) (store.AuditFilter, error) {
 		}
 	}
 	return f, nil
+}
+
+// handleAdminListFetchPolicies lists every stored fetch policy in key order,
+// the invalid ones too (marked, with the reason, so they can be repaired).
+func (s *Server) handleAdminListFetchPolicies(w http.ResponseWriter, r *http.Request, p *Principal) error {
+	if !auth.Can(p.Principal, auth.ActManageFetchPolicy, auth.Resource{}) {
+		return s.deny(r, p, "admin required")
+	}
+	rows, err := s.st.FetchPolicyRows(r.Context())
+	if err != nil {
+		return err
+	}
+	out := make([]api.FetchPolicy, len(rows))
+	for i, row := range rows {
+		out[i] = fetchPolicyAPI(row)
+	}
+	writeJSON(w, http.StatusOK, out)
+	return nil
+}
+
+// handleAdminGetFetchPolicy is GET /admin/fetch-policies/{key}: one stored
+// policy, valid or not.
+func (s *Server) handleAdminGetFetchPolicy(w http.ResponseWriter, r *http.Request, p *Principal) error {
+	if !auth.Can(p.Principal, auth.ActManageFetchPolicy, auth.Resource{}) {
+		return s.deny(r, p, "admin required")
+	}
+	row, err := s.st.FetchPolicyRow(r.Context(), r.PathValue("key"))
+	if err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusOK, fetchPolicyAPI(row))
+	return nil
+}
+
+// fetchPolicyAPI is the wire form of a stored fetch policy row, durations in
+// compact form ("10m").
+func fetchPolicyAPI(r store.FetchPolicyRow) api.FetchPolicy {
+	rules := r.Rules
+	if rules == nil {
+		rules = []string{}
+	}
+	return api.FetchPolicy{Key: r.Key, Site: r.Site, EgressKey: r.EgressKey, Rules: rules,
+		Concurrency:    r.Concurrency,
+		BackoffInitial: fetchpolicy.CompactDuration(time.Duration(r.BackoffInitialS) * time.Second),
+		BackoffCap:     fetchpolicy.CompactDuration(time.Duration(r.BackoffCapS) * time.Second),
+		UpdatedBy:      r.UpdatedBy, UpdatedAt: r.UpdatedAt, Invalid: r.Invalid != "", InvalidReason: r.Invalid}
+}
+
+// policyFromRequest builds the store policy for PUT /admin/fetch-policies/{key}.
+// Site and egress come from the key; a body that names others is a 400.
+func policyFromRequest(key string, req api.FetchPolicy) (fetchpolicy.Policy, error) {
+	site, egress, _ := strings.Cut(key, "@")
+	if req.Key != "" && req.Key != key {
+		return fetchpolicy.Policy{}, badRequest("body key " + strconv.Quote(req.Key) + " contradicts the path key")
+	}
+	if req.Site != "" && req.Site != site {
+		return fetchpolicy.Policy{}, badRequest("body site " + strconv.Quote(req.Site) + " contradicts the key")
+	}
+	if req.EgressKey != "" && req.EgressKey != egress {
+		return fetchpolicy.Policy{}, badRequest("body egress_key " + strconv.Quote(req.EgressKey) + " contradicts the key")
+	}
+	return ParseFetchPolicy(key, req.Rules, req.Concurrency, req.BackoffInitial, req.BackoffCap)
+}
+
+// ParseFetchPolicy builds a store policy from its wire fields: rules as
+// "N/DUR" strings, durations as Go duration strings; site and egress come
+// from key (split on the first '@'). Errors are 400s whose detail is safe to
+// show; the policy's own invariants are checked when it is stored.
+func ParseFetchPolicy(key string, rules []string, concurrency int, backoffInitial, backoffCap string) (fetchpolicy.Policy, error) {
+	site, egress, _ := strings.Cut(key, "@")
+	fp := fetchpolicy.Policy{Key: key, Site: site, EgressKey: egress, Concurrency: concurrency}
+	for _, rs := range rules {
+		ru, err := fetchpolicy.ParseRule(rs)
+		if err != nil {
+			return fp, badRequest("rule " + strconv.Quote(rs) + ": " + err.Error())
+		}
+		fp.Rules = append(fp.Rules, ru)
+	}
+	var err error
+	if fp.BackoffInitial, err = time.ParseDuration(backoffInitial); err != nil {
+		return fp, badRequest("backoff_initial: " + err.Error())
+	}
+	if fp.BackoffCap, err = time.ParseDuration(backoffCap); err != nil {
+		return fp, badRequest("backoff_cap: " + err.Error())
+	}
+	return fp, nil
+}
+
+func (s *Server) handleAdminPutFetchPolicy(w http.ResponseWriter, r *http.Request, p *Principal) error {
+	if !auth.Can(p.Principal, auth.ActManageFetchPolicy, auth.Resource{}) {
+		return s.deny(r, p, "admin required")
+	}
+	var req api.FetchPolicy
+	if err := decodeJSON(w, r, &req, false); err != nil {
+		return err
+	}
+	key := r.PathValue("key")
+	fp, err := policyFromRequest(key, req)
+	if err != nil {
+		return err
+	}
+	created, err := s.ops.PutFetchPolicy(r.Context(), p.Actor(), fp)
+	if err != nil {
+		return err
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	// Echo the stored policy, with its editor and time.
+	row, err := s.st.FetchPolicyRow(r.Context(), key)
+	if err != nil {
+		return err
+	}
+	writeJSON(w, status, fetchPolicyAPI(row))
+	return nil
+}
+
+func (s *Server) handleAdminDeleteFetchPolicy(w http.ResponseWriter, r *http.Request, p *Principal) error {
+	if !auth.Can(p.Principal, auth.ActManageFetchPolicy, auth.Resource{}) {
+		return s.deny(r, p, "admin required")
+	}
+	if err := s.ops.DeleteFetchPolicy(r.Context(), p.Actor(), r.PathValue("key")); err != nil {
+		return err
+	}
+	w.WriteHeader(http.StatusNoContent)
+	return nil
+}
+
+func (s *Server) handleAdminListCooldowns(w http.ResponseWriter, r *http.Request, p *Principal) error {
+	if !auth.Can(p.Principal, auth.ActManageFetchPolicy, auth.Resource{}) {
+		return s.deny(r, p, "admin required")
+	}
+	cs, err := s.st.FetchCooldowns(r.Context(), s.now())
+	if err != nil {
+		return err
+	}
+	if cs == nil {
+		cs = []api.FetchCooldown{}
+	}
+	writeJSON(w, http.StatusOK, cs)
+	return nil
+}
+
+// maxCooldown caps a manual cooldown (the longest rate window).
+const maxCooldown = 168 * time.Hour
+
+// ParseCooldownDuration parses a manual cooldown's Go duration: positive and
+// at most maxCooldown. Errors are 400s.
+func ParseCooldownDuration(s string) (time.Duration, error) {
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, badRequest("duration: " + err.Error())
+	}
+	if d <= 0 || d > maxCooldown {
+		return 0, badRequest("duration must be positive and at most " + maxCooldown.String())
+	}
+	return d, nil
+}
+
+func (s *Server) handleAdminSetCooldown(w http.ResponseWriter, r *http.Request, p *Principal) error {
+	if !auth.Can(p.Principal, auth.ActManageFetchPolicy, auth.Resource{}) {
+		return s.deny(r, p, "admin required")
+	}
+	var req api.SetCooldownRequest
+	if err := decodeJSON(w, r, &req, false); err != nil {
+		return err
+	}
+	d, err := ParseCooldownDuration(req.Duration)
+	if err != nil {
+		return err
+	}
+	until := s.now().Add(d)
+	if err := s.ops.SetCooldown(r.Context(), p.Actor(), req.EgressKey, req.Site, until, req.Reason); err != nil {
+		return err
+	}
+	// Echo the stored row: an automatic cooldown it replaced keeps its level.
+	cd, err := s.st.FetchCooldown(r.Context(), req.EgressKey, req.Site)
+	if err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusCreated, cd)
+	return nil
+}
+
+// handleAdminClearCooldown clears a cooldown. The egress key (e.g.
+// "label:home", "ip:2001:db8::1") may be percent-encoded; PathValue returns
+// it decoded.
+func (s *Server) handleAdminClearCooldown(w http.ResponseWriter, r *http.Request, p *Principal) error {
+	if !auth.Can(p.Principal, auth.ActManageFetchPolicy, auth.Resource{}) {
+		return s.deny(r, p, "admin required")
+	}
+	if err := s.ops.ClearCooldown(r.Context(), p.Actor(), r.PathValue("egress"), r.PathValue("site")); err != nil {
+		return err
+	}
+	w.WriteHeader(http.StatusNoContent)
+	return nil
 }

@@ -61,10 +61,22 @@ func TestServerCmdDefaultsAndConfig(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 3, scfg.WorkerFailureLimit, "the worker circuit breaker is on by default")
 	assert.Equal(t, 2, scfg.MaxAttempts)
+	assert.Equal(t, api.SandboxFull, scfg.FetchMinSandbox, "--fetch-min-sandbox defaults to full")
+	assert.Equal(t, int64(512<<20), scfg.FetchMaxBytes, "fetches are capped by --max-upload-bytes")
 	w, mf, err := c.storeTuning()
 	require.NoError(t, err)
 	assert.Equal(t, sched.ClassWeights{Low: 1, Medium: 3, High: 9}, w)
 	assert.Equal(t, map[string]float64{"small.en": 1, "large-v3-turbo": 3}, mf)
+}
+
+func TestServerCmdFetchMinSandbox(t *testing.T) {
+	opts, err := parse(t, "server", "--fetch-min-sandbox", "fs-only")
+	require.NoError(t, err)
+	scfg, err := opts.Server.storeConfig()
+	require.NoError(t, err)
+	assert.Equal(t, api.SandboxFSOnly, scfg.FetchMinSandbox)
+	_, err = parse(t, "server", "--fetch-min-sandbox", "partial")
+	assert.Error(t, err)
 }
 
 func TestServerCmdFailedRetention(t *testing.T) {

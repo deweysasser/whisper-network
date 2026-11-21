@@ -19,6 +19,8 @@ func Can(p Principal, a Action, r Resource) bool {
 	switch a {
 	case ActSubmitJob:
 		return admin || p.onQueue(api.RoleSubmit, r.Queue)
+	case ActSubmitURL:
+		return admin || p.onQueue(api.RoleSubmitURL, r.Queue)
 	case ActListQueue:
 		return VisibilityOn(p, r.Queue) != SeesNone
 	case ActViewJob, ActViewJobContent:
@@ -46,7 +48,8 @@ func Can(p Principal, a Action, r Resource) bool {
 	case ActViewClient:
 		return admin || p.holds(api.RoleClientAdmin, scopeAll) ||
 			(p.Kind == KindClient && p.ID != "" && p.ID == r.ClientID)
-	case ActSetQueueWeight, ActCreateQueue, ActGrantRoles, ActCreateUser, ActViewAudit:
+	case ActSetQueueWeight, ActCreateQueue, ActGrantRoles, ActCreateUser, ActViewAudit,
+		ActManageFetchPolicy:
 		return admin
 	case ActViewJobWorkers:
 		return admin || p.onQueue(api.RoleQueueAdmin, r.Queue) || p.workerAdminFor(r.WorkerID)
@@ -60,7 +63,9 @@ func Can(p Principal, a Action, r Resource) bool {
 func canWorker(p Principal, a Action, r Resource) bool {
 	switch a {
 	case ActLeaseTask:
-		return p.onQueue(api.RoleProcess, r.Queue)
+		// Per-kind eligibility (fetch only to downloaders, process only to
+		// processing workers) is enforced by the claim, not here.
+		return p.onQueue(api.RoleProcess, r.Queue) || p.onQueue(api.RoleFetch, r.Queue)
 	case ActViewWorker, ActUpdateWorker:
 		return p.ID != "" && p.ID == r.WorkerID
 	case ActFetchModel:
@@ -89,7 +94,7 @@ const (
 
 // VisibilityOn returns which jobs of queue p may list (DESIGN.md §5.3): all
 // for admin, queue_admin, view_all or read_all (a reader may see what it may
-// read); its own for submit; otherwise none. Workers never see jobs.
+// read); its own for submit or submit_url; otherwise none. Workers never see jobs.
 func VisibilityOn(p Principal, queue string) Visibility {
 	if p.Kind != KindUser && p.Kind != KindClient {
 		return SeesNone
@@ -98,7 +103,7 @@ func VisibilityOn(p Principal, queue string) Visibility {
 		p.onQueue(api.RoleViewAll, queue) || p.onQueue(api.RoleReadAll, queue) {
 		return SeesAll
 	}
-	if p.onQueue(api.RoleSubmit, queue) {
+	if p.onQueue(api.RoleSubmit, queue) || p.onQueue(api.RoleSubmitURL, queue) {
 		return SeesOwn
 	}
 	return SeesNone

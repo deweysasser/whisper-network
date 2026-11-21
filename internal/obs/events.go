@@ -29,6 +29,10 @@ const (
 	EventAuthDenied       Event = "auth.denied"
 	EventAdminChange      Event = "admin.change"
 	EventReaperRun        Event = "reaper.run"
+	EventFetchSubmitted   Event = "fetch.submitted"
+	EventFetchDone        Event = "fetch.done"
+	EventFetchRateLimited Event = "fetch.rate_limited"
+	EventFetchCooldown    Event = "fetch.cooldown"
 )
 
 // Event field names. They are flat (no nesting) and identical on server and
@@ -83,4 +87,29 @@ const (
 	FieldLandlockABI    = "landlock_abi"
 	FieldFailures       = "failures"
 	FieldJobs           = "jobs"
+	// FieldSite is a fetch's policy site key (never its URL).
+	FieldSite        = "site"
+	FieldEgressKey   = "egress_key"
+	FieldFetchMethod = "fetch_method"
+	// FieldYtDlpOutcome is how a yt-dlp run was classified (ok,
+	// unsupported, rate_limited, permanent, transient).
+	FieldYtDlpOutcome = "yt_dlp_outcome"
+	FieldUntil        = "until"
+	// FieldCooldownLevel is a fetch cooldown's backoff level ("level" is
+	// the log level's key) and FieldManual whether an admin set it.
+	FieldCooldownLevel = "cooldown_level"
+	FieldManual        = "manual"
+	// FieldPolicyKeys lists fetch policy keys.
+	FieldPolicyKeys = "policy_keys"
+	// FieldErrorClass is a log-safe class of an egress error (timeout,
+	// refused, dns, status, body, other), never its text.
+	FieldErrorClass   = "error_class"
+	FieldYtDlpVersion = "yt_dlp_version"
+	FieldEgressGroup  = "egress_group"
+	// FieldEgressIPKnown says whether a downloader's egress probe found
+	// its public IP (the IP itself is not logged).
+	FieldEgressIPKnown = "egress_ip_known"
+	FieldProxyPort     = "proxy_port"
+	// FieldRefetch says a retry also re-runs a URL job's fetch.
+	FieldRefetch = "refetch"
 )

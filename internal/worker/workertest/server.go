@@ -48,6 +48,10 @@ type Server struct {
 	inputCutAt     int
 	resultFailures int // remaining result PUTs to fail
 	resultStatus   int
+	earlyFailures  int // remaining result PUTs to fail before reading the body
+	earlyStatus    int
+	stallResults   bool
+	unstall        chan struct{}
 	modelDelay     time.Duration
 	ackDelay       time.Duration // between accepting a result and answering
 	modelGets      map[string]int
@@ -85,6 +89,10 @@ type Task struct {
 	OmitSize bool
 	// InputURL, if set, replaces the lease's input_url.
 	InputURL string
+	// URL, Site and MaxOutputBytes are a fetch lease's url, site and byte
+	// cap (0: none).
+	URL, Site      string
+	MaxOutputBytes int64
 
 	State    api.TaskState
 	Attempts int
@@ -94,6 +102,16 @@ type Task struct {
 	ComputeMS     string
 	FFmpegVersion string
 	Failures      []api.FailureReport
+	// Fetched and FetchMethod are an accepted fetch result and its
+	// X-Fetch-Method.
+	Fetched     []byte
+	FetchMethod string
+	// AbortedResults counts result PUTs whose body broke off (a chunked
+	// body that never ended cleanly); nothing of them is kept.
+	AbortedResults int
+	// ResultsStarted counts result PUTs whose handler started (headers
+	// received), whatever became of them.
+	ResultsStarted int
 }
 
 // Lease is the server's record of a lease.
@@ -217,6 +235,25 @@ func (s *Server) FailResults(n, status int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.resultFailures, s.resultStatus = n, status
+}
+
+// FailResultsEarly makes the next n result uploads fail with status at
+// once, without reading the body: the answer arrives mid-stream.
+func (s *Server) FailResultsEarly(n, status int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.earlyFailures, s.earlyStatus = n, status
+}
+
+// StallResults makes every result upload stop reading its body until the
+// client goes away or the test ends.
+func (s *Server) StallResults(t testing.TB) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stallResults = true
+	s.unstall = make(chan struct{})
+	ch := s.unstall
+	t.Cleanup(func() { close(ch) }) // before the server's Close
 }
 
 // SlowResultAcks makes the server accept each result (ending the lease as
@@ -512,6 +549,9 @@ func (s *Server) leaseLocked(t *Task, wk *Worker) api.Lease {
 		if t.OmitSize {
 			l.InputBytes = 0
 		}
+	case api.KindFetch:
+		l.Seq = 0
+		l.URL, l.Site, l.MaxOutputBytes = t.URL, t.Site, t.MaxOutputBytes
 	case api.KindTranscribe:
 		l.AudioSamples = int64(max(len(t.Input)-44, 0) / media.BytesPerSample)
 		if t.LeaseAudioSamples > 0 {
@@ -624,8 +664,33 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request, l *Lease, _ *
 }
 
 func (s *Server) result(w http.ResponseWriter, r *http.Request, l *Lease, t *Task, _ *Worker) {
+	s.mu.Lock()
+	t.ResultsStarted++
+	early, status, stall, unstall := s.earlyFailures > 0, s.earlyStatus, s.stallResults, s.unstall
+	if early {
+		s.earlyFailures--
+	}
+	s.mu.Unlock()
+	if early {
+		s.mu.Lock()
+		s.resultPuts++
+		s.mu.Unlock()
+		problem(w, status, api.ProblemInternal, "")
+		return
+	}
+	if stall {
+		select {
+		case <-r.Context().Done():
+		case <-unstall:
+		}
+		return
+	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		// The upload broke off: keep nothing, as the real server does.
+		s.mu.Lock()
+		t.AbortedResults++
+		s.mu.Unlock()
 		return
 	}
 	s.mu.Lock()
@@ -662,6 +727,13 @@ func (s *Server) result(w http.ResponseWriter, r *http.Request, l *Lease, t *Tas
 		}
 		s.mu.Lock()
 		t.Transcript = &res
+	case api.KindFetch:
+		if r.Header.Get("Content-Type") != "application/octet-stream" {
+			problem(w, http.StatusUnsupportedMediaType, api.ProblemBadRequest, "")
+			return
+		}
+		s.mu.Lock()
+		t.Fetched, t.FetchMethod = body, r.Header.Get(api.HeaderFetchMethod)
 	}
 	t.State = api.TaskDone
 	s.endLocked(l, api.OutcomeDone, false)

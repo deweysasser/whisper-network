@@ -261,6 +261,11 @@ func (w *Worker) leaseDisk(l *api.Lease) int64 {
 	case api.KindPrepare:
 		in := max(l.InputBytes, 0)
 		return in + min(in, w.prepareOutputCap(l)) + diskSlack
+	case api.KindFetch:
+		// The download's size is unknown in advance; the child is bound by
+		// RLIMIT_FSIZE and the server's output cap, and the disk meter sees
+		// the real usage. Only the slack is charged up front.
+		return diskSlack
 	case api.KindTranscribe:
 		need := int64(len(media.WAVHeader(0))) + max(l.AudioSamples, 0)*media.BytesPerSample + diskSlack
 		for _, name := range []string{l.Model, l.VADModel} {

@@ -23,7 +23,7 @@ The motivating workload is a large backlog of recordings. Hundreds of hours of a
 
 ### Goals
 
-- One Go binary with two modes: `server` and `worker`.
+- One Go binary with two modes: `server` and `worker` (a worker is either a processing worker or, with `--downloader`, a downloader, §7.6).
 - Zero-config worker start: `whisper-network worker --server https://…`.
 - No shared filesystem. Media and results move over HTTP.
 - **The system absorbs the media work.** Clients upload whatever they have, and conversion happens inside the service.
@@ -34,11 +34,13 @@ The motivating workload is a large backlog of recordings. Hundreds of hours of a
 - First-class observability: JSONL logs for VictoriaLogs, Prometheus-format metrics both scrapeable and pushable.
 - SQLite metadata plus a local blob directory. One volume to back up.
 
+- **URL jobs.** A client holding `submit_url` may submit a media URL instead of an upload (§6.1). **The server still never fetches anything a client names**: only downloader workers do (§7.6), under a sandbox and an SSRF filter, and the bytes come back as the job's original.
+
 ### Non-goals (v1)
 
 - High availability or multiple server replicas. One server, one SQLite file.
 - Speaker diarization, translation, or any engine other than whisper.cpp.
-- Fetching media from URLs. The service never fetches anything a client names.
+- Downloading video (URL jobs fetch audio only), playlists, channels, live streams, or client-supplied credentials, cookies, headers or yt-dlp options. Operator-supplied cookies on a downloader are the only per-site authentication.
 - Push notifications to clients. Clients poll.
 - **Enrollment tokens.** Every worker is approved explicitly by a human. Deferred, not planned.
 - Multi-tenant hostile isolation between queue admins. Queue admins are trusted operators.
@@ -119,9 +121,9 @@ Trade-off: the worker image ships three binaries (`whisper-network`, `whisper-cl
 |---|---|---|
 | **Queue** | human-readable name, `[a-z0-9][a-z0-9-]{0,62}` | `public` is created at bootstrap. Has a `weight` (admin-set). Can be renamed but not deleted while it has jobs. |
 | **Job** | UUIDv7 | Client-facing. Owns the media, parameters, `weight` class, metadata, the assembled transcript and the download log. |
-| **Task** | `{job}/{seq}` | Internal. `kind` is `prepare` (seq 0, optional) or `transcribe` (seq 1…N, a sample range of the canonical audio). |
+| **Task** | `{job}/{seq}` | Internal. `kind` is `fetch` (seq −1, URL jobs only), `prepare` (seq 0, optional) or `transcribe` (seq 1…N, a sample range of the canonical audio). |
 | **Lease** | random 128-bit ID | One attempt by one worker at one task. Expires unless heartbeated. Fencing token. |
-| **Worker** | server-assigned UUID | Registered machine. States: pending, active, paused, rejected. |
+| **Worker** | server-assigned UUID | Registered machine. States: pending, active, paused, rejected. Its **kind** (`processing` or `downloader`) is fixed at registration (§7.6). |
 | **User** | username | Human UI login. |
 | **Client** | ID plus bearer token | API principal. Created by a user in the UI or via `POST /client`. |
 | **Grant** | (principal, role, scope) | All authorization data lives here. |
@@ -153,10 +155,10 @@ The breaker complements **retry elsewhere** (below): retry elsewhere moves a fai
 **Job** (derived from its tasks, but stored for cheap querying)
 
 ```
- preparing ──▶ queued ──▶ running ──▶ done
-     │            │          │
-     └────────────┴──────────┴──▶ failed     (a task failed for good, and no lease of the job is live any more)
- failed ──retry──▶ preparing (prepare never succeeded) | queued     (its retained media still present)
+ fetching ──▶ preparing ──▶ queued ──▶ running ──▶ done      (fetching: URL jobs only; uploads start at preparing or queued)
+     │            │            │          │
+     └────────────┴────────────┴──────────┴──▶ failed     (a task failed for good, and no lease of the job is live any more)
+ failed ──retry──▶ fetching (URL job whose media is gone) | preparing (prepare never succeeded) | queued     (its retained media still present)
  any state ──DELETE──▶ (row and blobs removed; active leases cancelled)
 ```
 
@@ -181,6 +183,22 @@ The breaker complements **retry elsewhere** (below): retry elsewhere moves a fai
 The retry and the reaper's media purge both run under the job lock, and the reaper purges only a job it re-reads as `done` or `failed`, so a purge can never remove the media of a job that a retry has just made live.
 
 `preparing` is skipped when the upload is already canonical. Transcribe tasks are created when the canonical audio is accepted.
+
+**URL jobs: the `fetching` state and the `fetch` task.** A job created by `POST /queue/{q}/fetch` (§6.1) starts in `fetching` with one `fetch` task (seq **−1**, so seq 0 stays the prepare task and a fetch task sorts before it), holding the URL and its **site key** (§8.6). Only a downloader leases it (§7.6); its result is the fetched media (`PUT /lease/{id}/result`, streamed, §6.2). The server stores it exactly as an upload (`.part`, hash, size cap, fsync, rename), refuses it if it is a web page or API answer rather than media (HTML, XML, JSON or text, sniffed from the leading bytes), then makes the upload's ingest decision: the canonical fast path (`queued`, transcribe tasks) or `preparing` with a prepare task. A fetch task takes part in weighted fair queueing like any other (§8.2). **A fetch claim sets `jobs.started_at`** (not the first prepare or transcribe claim), so `wait_s` measures the time to fetch start for a URL job.
+
+A fetch failure is handled like any other: the worker's reason becomes the task and job error, and its `stderr_tail` is logged with `task.failed`. For a yt-dlp failure the reason ends with yt-dlp's last `ERROR:` line and the tail is yt-dlp's stderr; for a plain GET it carries the Go error text. Both may quote the URL, so they reach the job's error and the server's logs (§10.1). A result the server itself rejects fails with `invalid result: ` and one of `not media`, `too large` or `unusable media`.
+
+| Downloader outcome | Reported as | Server action |
+|---|---|---|
+| Rate limited or bot check (HTTP 429; yt-dlp's `HTTP Error 429: Too Many Requests`, `Sign in to confirm you're not a bot` or YouTube's session rate limit, matched only as yt-dlp phrases them at the start of an `ERROR:` message, so page data quoted later in it cannot put a site into cooldown) | `stage: "rate_limited"` | Requeue without using an attempt or excluding the worker; it does **not** count toward the worker's failure streak; the (egress group, site) pair goes into cooldown (§8.6). |
+| Media gone, private, geo-blocked, 404/410, unsupported content | `retryable: false` | Fail the job at once (the input's fault). |
+| Network error, 5xx, timeout | `retryable: true`, stage `input` | The normal attempt and retry-elsewhere rules. |
+| yt-dlp missing, sandbox setup failure, work directory error, egress proxy down, a sandbox that cannot permit proxy connects (Linux below Landlock ABI 4, §7.6) | stage `pre-work` | The pre-work rules above (refunded, counts toward the breaker). |
+| Result too large (`413`), not media (`422`), media ffmpeg-class validation refuses | decided by the server | The lease fails non-retryably with the reason above. |
+
+A fetch task that is only ever rate limited would requeue forever, so `--retry-wait-limit` applies: **the wait is measured from the first `rate_limited` refusal of the current retry** (not from the last), and past it the job fails (`rate limited`). If the last eligible downloader for a queue disappears (grant revoked, worker rejected or deleted, or below the fetch sandbox floor) while URL jobs are `fetching`, those jobs fail with `no downloader holds fetch on queue X`, in the same transaction where practical, with a reaper sweep as the backstop.
+
+**Retrying a URL job.** While its retained media (original or canonical audio) is on disk a retry follows the upload rules above. When the media is gone (the fetch never succeeded, or retention purged it) a retry **re-fetches** from the stored URL: the job returns to `fetching`, its canonical audio, transcribe tasks and their results are discarded and a new fetch task is created. A failed URL job is therefore `retryable` until job retention removes its row. The new fetch may yield different bytes; that is accepted.
 
 **Task**
 
@@ -237,6 +255,10 @@ CREATE TABLE workers (
   cpu_model TEXT, cores INTEGER, mem_bytes INTEGER, os TEXT, arch TEXT,
   engine_version TEXT, ffmpeg_version TEXT,
   sandbox_level TEXT,                     -- 'full' | 'fs-only' | 'none' (§7.4)
+  kind TEXT NOT NULL DEFAULT 'processing' CHECK (kind IN ('processing','downloader')),  -- fixed at registration (§7.6)
+  egress_key TEXT NOT NULL DEFAULT 'unknown',                                    -- downloaders (§8.6)
+  egress_group TEXT NOT NULL DEFAULT '', egress_ip TEXT NOT NULL DEFAULT '',     -- '' when not reported
+  ytdlp_version TEXT NOT NULL DEFAULT '',     -- facts' yt_dlp_version
   slots INTEGER, models TEXT,             -- JSON
   registered_at INTEGER NOT NULL, decided_by TEXT, decided_at INTEGER,
   last_seen_at INTEGER, gauges TEXT,      -- JSON, latest gauges from a heartbeat or claim
@@ -252,7 +274,7 @@ CREATE TABLE grants (
 CREATE TABLE jobs (
   id TEXT PRIMARY KEY, queue_id INTEGER NOT NULL REFERENCES queues,
   client_id TEXT NOT NULL, idempotency_key TEXT,
-  state TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('fetching','preparing','queued','running','done','failed')),
   weight TEXT NOT NULL DEFAULT 'medium' CHECK (weight IN ('low','medium','high')),
   model TEXT NOT NULL, language TEXT NOT NULL, prompt TEXT, label TEXT, source TEXT,
   metadata TEXT,                          -- opaque client JSON, ≤ 8 KiB
@@ -265,15 +287,16 @@ CREATE TABLE jobs (
   first_downloaded_at INTEGER, last_downloaded_at INTEGER,
   download_count INTEGER NOT NULL DEFAULT 0,
   retries INTEGER NOT NULL DEFAULT 0,        -- times the failed job was retried (§4.2)
+  fetch_url TEXT, fetch_site TEXT,           -- URL jobs only: the URL and its site key (§8.6); NULL for uploads
   UNIQUE (client_id, idempotency_key));
 CREATE INDEX jobs_queue_state ON jobs (queue_id, state, created_at);
 CREATE INDEX jobs_queue_state_order ON jobs (queue_id,       -- ?sort=state (§6.1)
-  (CASE state WHEN 'running' THEN 0 WHEN 'queued' THEN 1 WHEN 'preparing' THEN 1 WHEN 'failed' THEN 2 ELSE 3 END),
+  (CASE state WHEN 'running' THEN 0 WHEN 'queued' THEN 1 WHEN 'preparing' THEN 1 WHEN 'fetching' THEN 1 WHEN 'failed' THEN 2 ELSE 3 END),
   (CASE WHEN state IN ('failed','done') THEN -COALESCE(completed_at, created_at) ELSE created_at END), id);
 
 CREATE TABLE tasks (
   job_id TEXT NOT NULL REFERENCES jobs ON DELETE CASCADE, seq INTEGER NOT NULL,
-  kind TEXT NOT NULL CHECK (kind IN ('prepare','transcribe')),
+  kind TEXT NOT NULL CHECK (kind IN ('fetch','prepare','transcribe')),
   start_sample INTEGER, end_sample INTEGER,   -- NULL for prepare
   cost REAL NOT NULL,                         -- scheduling cost (§8.2)
   state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
@@ -288,7 +311,8 @@ CREATE TABLE leases (
   worker_id TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
   ended_at INTEGER, outcome TEXT,             -- done | expired | released | failed | cancelled
   heartbeat_at INTEGER,                       -- latest heartbeat, NULL until the first (UI only)
-  stage TEXT,                                 -- failed only: pre-work | input | child, as reported (§4.2)
+  stage TEXT,                                 -- failed only: pre-work | input | child | rate_limited, as reported (§4.2)
+  egress_key TEXT,                            -- fetch leases: the egress group it ran from (§8.6)
   retry INTEGER NOT NULL DEFAULT 0,           -- the job's retries when claimed; only the current retry's failures count (§4.2)
   FOREIGN KEY (job_id, seq) REFERENCES tasks ON DELETE CASCADE);
 CREATE INDEX leases_live ON leases (expires_at) WHERE ended_at IS NULL;
@@ -323,6 +347,20 @@ CREATE TABLE sched_vtime (                    -- §8.2
   vtime REAL NOT NULL DEFAULT 0,
   PRIMARY KEY (queue_id, class));
 
+CREATE TABLE fetch_policies (                 -- per-site fetch policy (§8.6); seeded, then edited in the UI
+  key TEXT PRIMARY KEY,                       -- site, or site@egress_key; '*' is the default
+  site TEXT NOT NULL, egress_key TEXT,        -- NULL: every egress
+  rules TEXT NOT NULL,                        -- JSON array of "N/DURATION"
+  concurrency INTEGER NOT NULL, backoff_initial_s INTEGER NOT NULL, backoff_cap_s INTEGER NOT NULL,
+  updated_by TEXT NOT NULL, updated_at INTEGER NOT NULL);
+CREATE TABLE fetch_starts (                   -- fetch claims, for rate windows (not tied to jobs, so deleting jobs cannot reset a window)
+  egress_key TEXT NOT NULL, site TEXT NOT NULL, started_at INTEGER NOT NULL);
+CREATE TABLE fetch_cooldowns (                -- active pauses per (egress group, site)
+  egress_key TEXT NOT NULL, site TEXT NOT NULL, until INTEGER NOT NULL,
+  level INTEGER NOT NULL DEFAULT 0, manual INTEGER NOT NULL DEFAULT 0,
+  set_by TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (egress_key, site));
+
 CREATE TABLE audit (
   ts INTEGER NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
   target TEXT, detail TEXT);
@@ -330,7 +368,7 @@ CREATE TABLE audit (
 
 Notes:
 - Timestamps are Unix milliseconds in UTC.
-- Migrations are embedded (`embed.FS`), applied on start, and versioned with `PRAGMA user_version`.
+- Migrations are embedded (`embed.FS`), applied on start, and versioned with `PRAGMA user_version`. **Migration 0012** (URL downloads) rebuilds `jobs` and `tasks` (SQLite cannot alter a CHECK) with the `-- whisper:foreign-keys-off` directive, which runs that migration with foreign keys off, following SQLite's documented rebuild procedure; it also adds the worker, lease and fetch-pacing columns and tables above and seeds the two default policies (§8.6). Servers opening the same database concurrently skip already-applied migrations lock-free.
 - Invariant: at most one live lease per task (`ended_at IS NULL`). The claim transaction enforces it, and a test pins it (§11).
 - **Worker counters** (`worker_stats`) are updated in the transaction that ends a lease, so they always agree with task outcomes. A completion (transcribe result or accepted prepare) counts its task by kind, its compute time, its audio (transcribe only, so prepare time does not skew the realtime factor) and its job, if no other task of that job is already done by the worker. That check needs no extra table: a done task never changes state or worker again and goes only with its job, so each (worker, job) pair counts once. `failed` and `expired` leases count as failures and expiries (pre-work failures included); a release or a cancellation (worker rejected, grant revoked, job deleted) counts as nothing. They are durable and built in; the Prometheus metrics (§10.2) stay for time series. `GET /admin/workers` returns them as `stats`; the workers table summarises them (tasks done, audio hours, average realtime factor, failure rate) and each worker's page shows them in full. They go with the worker when it is deleted (pruned, or deleted on demand once rejected, §4.2); the `worker.prune` or `worker.delete` audit entry keeps them.
 - **Fleet throughput** (`throughput`) is counted the same way: a completed transcribe task adds its audio to the bucket of the minute it completed, for its job's queue, in the transaction that ends its lease. It does not refer to the job, so deleting a job (which clients do as soon as they have the transcript) does not change it, and a job split into many tasks contributes as each one completes. The table holds at most one row per minute and queue with work, and the reaper deletes rows past 24 h (§8.5), so it does not grow with traffic. The migration that added it backfilled from the done leases then kept. Prometheus already has the same total as a counter (`whisper_worker_audio_seconds_total`, §10.2); this table is the durable, server-side figure the dashboard reads.
@@ -357,18 +395,20 @@ Notes:
 | Role | Scope | Allows |
 |---|---|---|
 | `admin` | `*` | Everything, including creating users and queues, **setting queue weights**, and granting roles. |
-| `queue_admin` | `queue:X` | Approve or reject workers **for queue X** (i.e. grant `process` on X), grant and revoke `submit`, `view_all`, `delete_all` and `process` on X, list all jobs on X and read their status documents (as `view_all`), delete any job on X. **Does not read transcripts**: the transcript and result need `read_all` as well. Cannot grant or revoke `queue_admin` (queue admins cannot make or remove other queue admins) or `read_all`. Cannot change X's weight, because weight is a fleet-wide resource decision. |
+| `queue_admin` | `queue:X` | Approve or reject workers **for queue X** (i.e. grant `process` on X), grant and revoke `submit`, `submit_url`, `view_all`, `delete_all`, `process` and `fetch` on X, list all jobs on X and read their status documents (as `view_all`), delete any job on X. **Does not read transcripts**: the transcript and result need `read_all` as well. Cannot grant or revoke `queue_admin` (queue admins cannot make or remove other queue admins) or `read_all`. Cannot change X's weight, because weight is a fleet-wide resource decision. |
 | `worker_admin` | `*` or `worker:W` | Approve, pause, resume and reject the worker(s) in scope, and delete them once rejected. With scope `*`, may also grant `worker_admin` on `worker:<id>`. Cannot grant queue access unless also `queue_admin` for that queue. |
 | `submit` (client) | `queue:X` | Create jobs on X. See, read and delete its own jobs on X. |
 | `view_all` | `queue:X` | List all jobs on X and read their full status documents (`GET /queue/X`, `GET /job/{id}`): state, timings, task counts, label, source, weight, model, errors, `prompt`, `metadata` and `submitted_by`. Not the transcript or result (`403`). For monitoring and management: operators, dashboards, agents that track or review what other agents submitted. |
 | `read_all` | `queue:X` | Read the transcript and result of every job on X (`GET /job/{id}/transcript`, `GET /job/{id}/result`). Implies `view_all` on X (a reader can list and see what it may read). Granted and revoked only by `admin`. |
 | `delete_all` (client) | `queue:X` | Delete any job on X. *Open item; see §13.* |
 | `client_admin` | `*` | Create and revoke clients via `POST /client`. When creating a client it may hand on grants it holds itself (no escalation); this re-delegation applies only at creation. Revoking a client requires authority over every grant that client holds. |
-| `process` (worker) | `queue:X` | Lease tasks (prepare and transcribe) from X. |
+| `process` (worker) | `queue:X` | Lease tasks (prepare and transcribe) from X. Only a processing worker may hold it. |
+| `submit_url` (client) | `queue:X` | Create URL jobs on X (`POST /queue/X/fetch`). The same own-job rights as `submit` (see, read, delete, retry). It does not imply `submit`, nor `submit` it. Grantable by `admin` and `queue_admin` on X, and delegable at client creation like the other queue roles. |
+| `fetch` (worker) | `queue:X` | Lease fetch tasks from X. Only a downloader may hold it. Granted by `queue_admin` on X: approving a downloader for a queue is the same kind of trust decision as `process`. Revoking it cancels the downloader's live fetch leases on that queue, as for `process`. |
 
 **Approving a worker is two separate acts.** Lifecycle is `worker_admin`. Data access is `queue_admin`. Data access is the trust decision, because a worker receives that queue's media. The UI shows both on one approval screen, together with the worker's `sandbox_level`. Clicking "Approve for queues A, B" works only if the actor holds both rights for every queue chosen.
 
-A worker in `active` state with no `process` grants is legal and simply idle.
+A worker in `active` state with no `process` (or, for a downloader, `fetch`) grants is legal and simply idle. **Worker kind is fixed at registration** (`kind: "downloader"` in the facts, stored immutably on the worker row): the server refuses `fetch` grants to processing workers and `process` grants to downloaders, and the claim enforces the same split independently of grants (`fetch` tasks go only to downloaders, `prepare` and `transcribe` only to processing workers).
 
 **Seeing a job is not reading its transcript.** Who may do what with a job on queue X:
 
@@ -383,7 +423,7 @@ A worker in `active` state with no `process` grants is legal and simply idle.
 
 The transcript and result are the sensitive part of a job: engine output from untrusted media, which can carry meeting content and prompt injection. Everything describing the job (prompt, metadata, who submitted it) is visible to anyone who can see the job, so a manager can review what was submitted; reading the output is a separate grant, and `queue_admin` (which manages a queue's workers and access) does not imply it. A database created before `read_all` existed is migrated (schema version 3) by giving every existing `view_all` and `queue_admin` grant a `read_all` grant on the same queue, so upgraded deployments keep the access they had; revoke those `read_all` grants to narrow it.
 
-**Grant management.** Granting to, or revoking from, an existing principal requires `admin`, or `queue_admin` on queue X for `submit`, `view_all`, `delete_all` and `process` on `queue:X` (not `read_all`: a queue admin does not itself read transcripts, so it cannot hand that out), or (for `worker_admin` on `worker:<id>` only) `worker_admin` on `*`. Revoking needs exactly the authority that granting would. Revoking a worker's `process` grant also cancels, in the same transaction, the worker's live leases on every queue it no longer holds `process` on (outcome `cancelled`; the task requeues without using an attempt, as on rejection), so withdrawn access to a queue's media takes effect at once. Holding a role never by itself lets you hand it on: re-delegating your own grants is allowed only when creating a client (`client_admin`, above). Revoking a client's token requires `client_admin` plus authority over every grant the client holds, so a client admin cannot revoke a client more privileged than itself. Grant listings do not reveal whether a principal exists.
+**Grant management.** Granting to, or revoking from, an existing principal requires `admin`, or `queue_admin` on queue X for `submit`, `submit_url`, `view_all`, `delete_all`, `process` and `fetch` on `queue:X` (not `read_all`: a queue admin does not itself read transcripts, so it cannot hand that out), or (for `worker_admin` on `worker:<id>` only) `worker_admin` on `*`. Revoking needs exactly the authority that granting would. Revoking a worker's `process` grant also cancels, in the same transaction, the worker's live leases on every queue it no longer holds `process` on (outcome `cancelled`; the task requeues without using an attempt, as on rejection), so withdrawn access to a queue's media takes effect at once. Holding a role never by itself lets you hand it on: re-delegating your own grants is allowed only when creating a client (`client_admin`, above). Revoking a client's token requires `client_admin` plus authority over every grant the client holds, so a client admin cannot revoke a client more privileged than itself. Grant listings do not reveal whether a principal exists.
 
 #### 5.2.1 Audit
 
@@ -405,7 +445,9 @@ Every change to authorization or to stored state that a person, client or worker
 | `worker.pause` (auto) | The circuit breaker pauses a worker (§4.2); the detail carries the `reason`, `failures` and `jobs` | `system` |
 | `worker.delete` | A rejected worker is deleted on demand (API or UI, single or "Delete all rejected", one entry per worker). Like `worker.prune`, the detail keeps the worker's final counters if it did any work | the acting principal |
 | `worker.prune` | The reaper deletes a pending worker past `--pending-worker-ttl` or a rejected worker past `--rejected-worker-retention` (one entry per worker) | `system` |
-| `job.create` | A job is created by upload (a replayed idempotency key is not a new entry) | the submitting principal |
+| `job.create` | A job is created by upload or URL (a replayed idempotency key is not a new entry). A URL job's detail carries the site key, never the URL | the submitting principal |
+| `fetch_policy.put` / `fetch_policy.delete` | A fetch policy is created, replaced or deleted (§8.6) | the acting administrator |
+| `fetch_cooldown.set` / `fetch_cooldown.clear` | An administrator sets or clears a cooldown (§8.6) | the acting administrator |
 | `job.delete` | A job is deleted by its owner, by a principal with `delete_all`/`admin`, or by retention | the deleting principal, or `system` |
 | `job.purge_media` | An original upload or canonical audio is deleted (§8.5) | `system` |
 | `job.retry` | A failed job is retried (§4.2); the detail carries the `previous_error` | the retrying principal |
@@ -434,16 +476,21 @@ All bodies are JSON unless noted. Errors use RFC 9457 `application/problem+json`
 | Method & path | Purpose | Auth |
 |---|---|---|
 | `POST /queue/{q}` | Create a job. Multipart body: part `params` (JSON) and part `media` (any audio or video). Optional `Idempotency-Key` header. Returns `201` with `Location: /job/{id}` and the job JSON. | `submit` on q |
-| `GET /queue/{q}` | List visible jobs. Query: `state`, `since` (created or updated after), `limit`, `cursor`, `sort`, `order` (below). | `submit`, `view_all` or `read_all` on q |
+| `POST /queue/{q}/fetch` | Create a URL job (below): JSON body of the job params plus `url`. Optional `Idempotency-Key`. Returns `201` with `Location: /job/{id}` and the job JSON in state `fetching`; `409 no-downloader` when no eligible downloader exists. | `submit_url` on q |
+| `GET /queue/{q}` | List visible jobs. Query: `state`, `since` (created or updated after), `limit`, `cursor`, `sort`, `order` (below). | `submit`, `submit_url`, `view_all` or `read_all` on q |
 | `POST /queue/{q}/bulk` | Retry or delete many jobs of q (below). | per job, as the single-job action |
 | `PATCH /queue/{q}` | Change `weight`, `description` or `max_upload_bytes`. | `admin` (weight); `queue_admin` (the others) |
 | `GET /job/{id}` | Job status (below), including `prompt`, `metadata` and `submitted_by`. | owner, or `view_all`, `read_all` or `queue_admin` on its queue |
 | `GET /job/{id}/transcript` | `text/plain` transcript with the provenance header. Records a download. `409` if not done, unless `?partial=1` (§8.4). | owner, or `read_all` on its queue |
 | `GET /job/{id}/result` | JSON segments with absolute times, for consumers that want structure. Also records a download. | same |
 | `DELETE /job/{id}` | Delete the job, its blobs and live leases. `204`. | owner, `delete_all`, or `queue_admin` |
-| `POST /job/{id}/retry` | Retry a failed job (§4.2). `200` with the job document; `409 not-retryable` if not failed or its media was purged. | owner, `queue_admin`, or `admin` |
+| `POST /job/{id}/retry` | Retry a failed job (§4.2). `200` with the job document; `409 not-retryable` if not failed or its media was purged (a URL job is fetched again instead). | owner, `queue_admin`, or `admin` |
 | `POST /client` | Create a client with a set of grants (a subset of the caller's). Returns the token once. | `client_admin` |
 | `GET /client/{id}`, `DELETE /client/{id}` | Inspect or revoke. | `client_admin` or self (GET) |
+
+**URL jobs: `POST /queue/{q}/fetch`.** The body is the job params below (`model`, `language`, `weight`, `prompt`, `label`, `metadata`, `source`) plus `url`. `source` defaults to the URL. The server does **no network access** to validate: the scheme must be `http` or `https`, there must be no userinfo and a host, the length is at most `api.MaxSourceLen` (2048), and the host must have a registrable domain (it becomes the site key, §8.6) or be an IP literal (keyed by its canonical form, e.g. `127.0.0.1` or `2001:db8::1`). It does **not** judge address ranges, not even of IP literals: the downloader's egress filter is the single place that decision is made (§13), so a downloader run with `--allow-private-egress` can fetch `http://192.168.1.10/…`. Error details never quote the URL.
+
+**No downloader: `409`, problem type `no-downloader`**, when no worker holds `fetch` on the queue (or `*`) that is `active` or `paused` and at or above `--fetch-min-sandbox` (§11.1). A downloader that is merely offline does not trigger it: the job waits like any queued task. The `fetch` lease carries `url`, `site` and `max_output_bytes` (below). CLI: `whisper-network submit --url URL` (other flags as for a file).
 
 **Job create params**
 
@@ -454,7 +501,7 @@ All bodies are JSON unless noted. Errors use RFC 9457 `application/problem+json`
   "weight": "medium",                // optional: low | medium | high (default medium)
   "prompt": "This is a project planning meeting. Alice and Bob discuss the budget. …",   // ≤ 800 chars
   "label": "meeting-2026-01-15",
-  "source": "https://youtube.com/watch?v=…",   // recorded, never fetched
+  "source": "https://youtube.com/watch?v=…",   // recorded only; a URL job is submitted as "url" (above)
   "metadata": { "requester": "…", "session": "…" }   // opaque, ≤ 8 KiB
 }
 ```
@@ -481,7 +528,7 @@ The document is the same for everyone who may see the job (§5.2), including `pr
 
 The document also carries `retries` (how many times the job was retried), `retryable` (a failed job whose retained media is present) and, for a failed job with its media, `media.kept_until` (when failed-job retention lets the reaper purge it; a full disk can purge it sooner, §8.5). `media.audio_purged` is true once the audio a retry would need is gone: the canonical audio, or for a job that never got canonical audio, its original.
 
-**List order** (#67). `GET /queue/{q}` lists oldest first by default, unchanged for existing clients and cursors. `sort=created&order=desc` lists newest first (`order=asc` is the default). `sort=state` lists running jobs, then `queued` and `preparing`, both oldest first (the scheduling order), then `failed`, then `done`, both most recently finished first; `order` does not apply to it. Paging is by keyset: a cursor encodes its order's key (`created_at, id`, or the state group, the time within the group and `id`), the page is chosen on the jobs table alone, and the state order is served by the expression index `jobs_queue_state_order` (no sort step, checked by a test of the query plan). A cursor of one order is rejected (`400`) by another. Under `sort=state` a job that changes state between two pages moves to its new group, so it can be listed twice (it moved to a later group) or not at all (it moved to an earlier one); jobs that keep their state are never skipped or repeated. The UI's queue page defaults to `sort=state`, has an order control, and remembers the choice per browser in a cookie.
+**List order** (#67). `GET /queue/{q}` lists oldest first by default, unchanged for existing clients and cursors. `sort=created&order=desc` lists newest first (`order=asc` is the default). `sort=state` lists running jobs, then `queued`, `preparing` and `fetching`, all oldest first (the scheduling order), then `failed`, then `done`, both most recently finished first; `order` does not apply to it. Paging is by keyset: a cursor encodes its order's key (`created_at, id`, or the state group, the time within the group and `id`), the page is chosen on the jobs table alone, and the state order is served by the expression index `jobs_queue_state_order` (no sort step, checked by a test of the query plan). A cursor of one order is rejected (`400`) by another. Under `sort=state` a job that changes state between two pages moves to its new group, so it can be listed twice (it moved to a later group) or not at all (it moved to an earlier one); jobs that keep their state are never skipped or repeated. The UI's queue page defaults to `sort=state`, has an order control, and remembers the choice per browser in a cookie.
 
 **Bulk retry and delete** (#68). `POST /queue/{q}/bulk` with `{"action": "retry"|"delete", "job_ids": [...]}` or `{"action": …, "filter": {"state": "failed", "since": "<RFC 3339>", "cursor": "…"}}`, plus optional `"dry_run": true`. A filter selects as `GET /queue/{q}` would, oldest first, among the jobs the caller can see; `state` is required. At most 500 jobs per request: `job_ids` beyond that is `400`, and a larger filter selection returns `next_cursor` to continue. Each job is authorized as its single-job action (retry: owner, `queue_admin`, `admin`; delete: owner, `delete_all`, `queue_admin`, `admin`), so a bulk request never widens what the caller could do one job at a time; each runs in its own transaction, so one job's failure does not undo the others. The response lists every job's outcome, `retried`, `deleted`, `skipped` with a `reason` (`media purged`, `not failed`), `forbidden` (visible but not allowed), or `not_found` (unknown, on another queue, or not visible: as for single jobs, existence is not revealed), plus `counts` by outcome; a dry run reports `would_retry` / `would_delete` and changes nothing. Each changed job gets its own `job.retry` / `job.delete` audit entry and the request one `job.bulk_retry` / `job.bulk_delete` summary entry on the queue (none for a dry run). Retried jobs re-enter the fair scheduler like any other queued job. The UI's queue page has a checkbox per row, "select all on this page", and, with a state filter set, "all N matching"; it asks for confirmation with the count and then shows the per-job outcomes and a summary such as `3 retried, 1 skipped: media purged`. The CLI is `whisper-network retry --queue Q [--since T] [--dry-run]` and `whisper-network delete --queue Q --state S [--dry-run]`.
 
@@ -503,13 +550,15 @@ The document also carries `retries` (how many times the job was retried), `retry
 | `GET /worker/{id}` | Own state and grants; config hints (heartbeat interval, poll interval). | that worker, or an admin |
 | `POST /worker/{id}/gauges` | Report the gauges (§10.2) without claiming: sent by a worker whose host is too busy to take work (§7.3), so it stays seen and shows why it is idle. `204`. | active or paused worker |
 | `PATCH /worker/{id}` | Update facts (engine versions, models, slots, sandbox level) after restart or upgrade. | that worker |
-| `POST /worker/{id}/leases?wait=30s` | Claim one task. Body: `{"kinds":["prepare","transcribe"],"models":["small.en"],"gauges":{…}}`, describing what this slot can run **right now** given free memory and disk. The optional `gauges` are the same readings a heartbeat carries (§10.2): heartbeats only flow while a lease is held, so an idle worker reports through its claims. Returns `201` with the lease, or `204` on timeout. | active worker |
+| `POST /worker/{id}/leases?wait=30s` | Claim one task. A downloader's body asks for `"kinds":["fetch"]`; it needs no models. Body: `{"kinds":["prepare","transcribe"],"models":["small.en"],"gauges":{…}}`, describing what this slot can run **right now** given free memory and disk. The optional `gauges` are the same readings a heartbeat carries (§10.2): heartbeats only flow while a lease is held, so an idle worker reports through its claims. Returns `201` with the lease, or `204` on timeout. | active worker |
 | `GET /lease/{id}/input` | Prepare: the original bytes. Transcribe: a WAV stream (16 kHz mono s16) decoded from the canonical FLAC for this task's sample range. `Range` is supported for prepare; transcribe input is regenerated on retry. | lease holder, live lease |
 | `POST /lease/{id}/heartbeat` | Extend the lease. Optional body: worker gauges (§10.2). Returns `200 {expires_at}`, or `410` if expired, cancelled or the job was deleted, or if the lease may not be extended any more: the worker is neither active nor paused, no longer holds `process` on the lease's queue, or the lease is past its maximum age (§8.3). The worker must then kill the child. | lease holder |
-| `PUT /lease/{id}/result` | Prepare: body is the canonical FLAC (`audio/flac`). Transcribe: segments JSON. Idempotent for the same lease. `410` if the lease is no longer live; `422` if validation fails (counts as a failed attempt). | lease holder |
+| `PUT /lease/{id}/result` | Prepare: body is the canonical FLAC (`audio/flac`). Transcribe: segments JSON. Fetch: the fetched media, streamed (chunked, length unknown up front), with `X-Fetch-Method: yt-dlp\|http`; `413` past the lease's byte cap, `422 not-media` for a web page or API answer. Idempotent for the same lease. `410` if the lease is no longer live; `422` if validation fails (counts as a failed attempt). | lease holder |
 | `POST /lease/{id}/failure` | `{"reason":"…","stderr_tail":"…","retryable":true,"stage":"child"}`. Ends the lease; the task requeues for another worker if attempts remain and `retryable` (§8.2). `stage` (optional: `pre-work`, `input`, `child`) says how far the worker got; a `pre-work` failure requeues without using an attempt or excluding the worker (§4.2). | lease holder |
 | `DELETE /lease/{id}` | Voluntary release on graceful shutdown. Does not consume an attempt. | lease holder |
 | `GET /models/{name}` | Model file (ggml), sha256 in `ETag`. The server keeps a cache, filled from upstream on first request and pinned by hash. | any active worker |
+
+**Fetch lease and result.** A fetch lease (`kind: "fetch"`, seq −1) carries `url`, `site` and `max_output_bytes` instead of an input: **`max_output_bytes` is the minimum of the queue's upload limit and the server's `--max-upload-bytes`**; `0` means no cap at either level, so the downloader is uncapped on its side. The server enforces its cap again while receiving (never above `--max-upload-bytes`), so the downloader's count is an early abort, not the guard. A claim of a fetch lease records the start for pacing (§8.6) in the claim transaction; the start stands even if the downloader then refuses the lease (a pre-work failure) or releases it, so such a lease still uses a rate-window slot. The result is streamed to disk exactly like an upload, so a failed upload means a re-fetch on retry; the downloader never writes the media to local disk.
 
 **Registration facts**
 
@@ -518,11 +567,11 @@ The document also carries `retries` (how many times the job was retried), `retry
   "cpu_model": "Example CPU", "cores": 8, "mem_bytes": 8589934592,
   "os": "linux", "arch": "amd64",
   "engine_version": "whisper.cpp 1.9.5", "ffmpeg_version": "7.1.1",
-  "sandbox_level": "full", "kinds": ["prepare","transcribe"],
+  "sandbox_level": "full", "kind": "processing", "kinds": ["prepare","transcribe"],
   "slots": 1, "models": ["small.en", "large-v3-turbo"] }
 ```
 
-The description defaults to `$WHISPER_DESCRIPTION` or the hostname.
+The description defaults to `$WHISPER_DESCRIPTION` or the hostname. A downloader registers `"kind": "downloader"`, `"kinds": ["fetch"]` and adds `yt_dlp_version`, `egress_group` and `egress_ip` (§8.6); it reports no models, whisper or ffmpeg versions.
 
 **Lease** (claim response)
 
@@ -543,6 +592,18 @@ The description defaults to `$WHISPER_DESCRIPTION` or the hostname.
 
 The server validates the result: segment times must be monotonic, within the task's duration, with bounded text size. Times are converted to absolute using the task's start sample.
 
+**Fetch administration (admin only, audited).** Like queue weights these are fleet-wide decisions, so they need `admin`; they are the only way to configure fetch policy (no config file or flag).
+
+| Method & path | Purpose |
+|---|---|
+| `GET /admin/fetch-policies` | All admin. List every policy row, including invalid ones (`invalid: true` with `invalid_reason`). Durations come back in compact form (`10m`, `12h`). |
+| `GET /admin/fetch-policies/{key}` | One policy row, valid or not (`404` if there is none). |
+| `PUT /admin/fetch-policies/{key}` | Create or replace a policy: `{rules: ["1/3m", …], concurrency, backoff_initial, backoff_cap}`. `key` is a site (`youtube.com`), or `site@egress_key` (`youtube.com@label:home`), or `*`. Effective immediately. Also the repair for an invalid row. `200` with the stored row, as `GET` returns it (`201` when created); the path's key wins over one in the body. |
+| `DELETE /admin/fetch-policies/{key}` | Delete a policy: `204` (`409` for `*`, which cannot be deleted). Also removes an invalid row. |
+| `GET /admin/fetch-cooldowns` | Active cooldowns per (egress key, site). |
+| `POST /admin/fetch-cooldowns` | Start a manual cooldown: `{egress_key, site, duration, reason}`, `duration` a Go duration, positive and at most `168h`. `201` with the stored row (an automatic cooldown it replaces keeps its level). A manual cooldown never shortens one already in force. |
+| `DELETE /admin/fetch-cooldowns/{egress}/{site}` | Clear one (also resets its backoff level): `204`. `{egress}` is percent-encoded (egress keys contain `:`). |
+
 ### 6.3 UI (`/ui`)
 
 `/` redirects to `/ui`. Pages:
@@ -553,6 +614,7 @@ The server validates the result: segment times must be monotonic, within the tas
 - **Queues**: create, edit (weight is admin-only) and list jobs; per-queue grants. The job list's Workers column names the workers holding a running job's live leases, or for a done or failed job the workers that completed its tasks, each linking to the worker's page (subject to §5.3). The job list is ordered by state by default, with an order control (state, newest, oldest) remembered per browser in a cookie (§6.1, list order), and has per-row checkboxes for bulk retry and delete (§6.1, bulk): "select all on this page" is a small script (`/ui/static/queue.js`, no inline code under the CSP), and with a state filter set "all N matching" acts on the whole filter. A bulk action always asks for confirmation with the count, then shows each job's outcome and a summary.
 - **Pending work.** For those who see all of a queue's jobs, the queue page summarizes its pending tasks: the count by kind, the audio still to transcribe, the longest wait, and a table by kind, model and weight class with **why they are waiting**; it shows how many workers are eligible (active, seen in the last 3 minutes, holding `process` on the queue) and their slots in use, with a warning when none is. Each job row counts pending, leased and failed tasks and, when tasks are pending with none leased, how long they have waited. A task's wait is measured from `tasks.pending_since`, set when it is created and whenever it goes back to pending (a requeued lease, a job retry). The reasons are best effort, judged in memory against the queue's eligible workers the way a claim would offer the task: no eligible worker; none offering the job's model; prepare needing a worker at the minimum sandbox level; every able worker already failed it (retry elsewhere, §8.2); every able worker's slots busy; hosts deferring for load. None means it is waiting its turn. Reasons never name a worker.
 - **Jobs**: filters, detail view (finished tasks; each running task's worker, lease age, last heartbeat and attempt; and every pending, failed or cancelled task with how long it has waited, its attempts, its last failure and the worker it failed on, and why it is waiting), delete, transcript download; for a failed job, **Retry** (§4.2) while its media is kept and "files kept until …"; for a job that is not done, the partial transcript (§8.4) to those who may read it.
+- **Fetch** (`/ui/fetch`, admin): the fetch policies (list, add, edit, delete; invalid rows are flagged with their reason and repaired or deleted here), the active cooldowns per (egress group, site) with manual set and clear, and the downloaders. Handlers sit on the admin API above. The Workers page shows a worker's kind and its egress group; the Queues grant screens offer `submit_url` and `fetch`; job pages show the `fetching` state.
 - **Users and clients**: create, disable, grant roles, mint tokens (shown once).
 - **Audit log**: every approval, grant, weight change, deletion and token mint.
 - **Names and links.** Workers, jobs and API clients are shown by name wherever they appear (tables, the audit log's actors and targets, grant lists, failure reasons), with a short id after the name and the full id in a tooltip, linked to their page: a worker by its description, else its hostname (`tc-3 (54990ea1…2f33)`); a job by its label, else its source, else only its short id (labels over 60 characters are cut, the full label in the tooltip); a client by its name, marked "(revoked)" if it is. One template (`ref`) renders them all, and each page resolves its ids in one query per kind. Visibility follows §5.3: a worker is named only to those who may see who processes the job (elsewhere, those who may list it), others read "a worker"; a job's label and link only to those who may see the job (others get its short id, unlinked); a client's name only to client admins (others read "a client"), except as a job's submitter: every viewer of the job sees the submitting client's name, as in the API's `submitted_by`, linked only for client admins. A pruned worker shows its id, unlinked, "(removed)"; a deleted job "(deleted)". A client's page shows its details (created by and when, last use, revocation, roles), its permissions while it is not revoked, and its recent audit activity.
@@ -565,7 +627,7 @@ The server validates the result: segment times must be monotonic, within the tas
 ### 7.1 Lifecycle
 
 1. Load `state/credentials.json` from the state dir (default `/var/lib/whisper-network`). If it is missing, `POST /worker` and save it with mode 0600.
-2. Probe facts: cores (cgroup quota aware), memory (cgroup limit aware), `whisper-cli --version`, `ffmpeg -version`, available models, and the sandbox level (§7.4).
+2. Probe facts: cores (cgroup quota aware), memory (cgroup limit aware), `whisper-cli --version`, `ffmpeg -version`, available models, and the sandbox level (§7.4). A downloader (§7.6) probes yt-dlp and its sandbox level instead.
 3. While `pending`, poll `GET /worker/{id}` with backoff (30 s → 5 min). Log the ID and description once, so the operator knows what to approve.
 4. Once `active`, start N slot goroutines (§7.3).
 5. On SIGTERM: stop claiming, then by default `DELETE` every live lease and kill the children, so tasks requeue immediately instead of waiting out the lease timeout. With `--drain`, finish running tasks first.
@@ -671,6 +733,23 @@ Confidence that this holds across the fleet's kernels: medium-high for kernels w
 - **macOS:** Docker on Apple Silicon has no Metal, which costs a large factor. The worker therefore also ships as a native darwin/arm64 binary and finds `whisper-cli`/`ffmpeg` on `$PATH` (Homebrew). There is no Landlock on macOS, so `sandbox_level: none` and macOS workers get no prepare tasks under the default policy. That suits them, since they are best spent on transcription.
 - **Windows:** the worker is not supported and refuses to start: there is no confinement for its child processes (issue #26). The server and client CLI build for Windows.
 - **GPU** workers are out of scope for v1. The slot model generalizes to them (one slot per GPU, a different `peak_rss` budget), so nothing in the API blocks it.
+
+### 7.6 Downloader workers (URL jobs)
+
+`whisper-network worker --downloader` runs the same binary as a different kind of worker. It registers with `kind: downloader` (immutable), offers only `fetch`, needs no ffmpeg, whisper-cli or models (a processing worker needs no yt-dlp), and defaults to 2 slots. Its trust posture is separate from a processing worker's: it talks to arbitrary hosts the client named, but never decodes media.
+
+- **yt-dlp is required.** A downloader without a working yt-dlp reports a `pre-work` failure on every fetch lease (so the circuit breaker pauses it) rather than acting as a GET-only fetcher that would turn a YouTube page into HTML "media". `--yt-dlp` names the binary.
+- **Streaming, no local disk.** yt-dlp writes the media to stdout (`-o -`), and the downloader pipes it straight into the result `PUT`, counting bytes against the cap. A plain GET does the same.
+- **yt-dlp invocation is fixed** (clients influence only the URL): `--ignore-config --no-playlist --match-filter "!is_live" -f bestaudio --use-extractors default,-generic --no-cache-dir --no-part -o - --proxy http://127.0.0.1:<port> -- <url>`. `-f bestaudio` takes one audio-only stream (no ffmpeg merge); the URL follows `--` so it can never be read as an option. **yt-dlp 2022.11 or later** is required: `--use-extractors default,-generic` is how yt-dlp disables its generic extractor (`--no-generic-extractor` does not exist), so that "no extractor matched" is a reliable signal. Cookies come only from the operator's `--yt-dlp-cookies FILE`, copied into the lease directory per run, never from clients.
+- **Plain GET fallback only when yt-dlp reports the URL as unsupported** (an `Unsupported URL` or `No suitable extractor` error and nothing sent). Any other yt-dlp error is classified (§4.2) and never falls back, so a supported site's failure cannot feed its HTML to prepare as "media". The GET goes through the same egress filter and the same port allowlist as the proxy (80 and 443), follows at most 10 redirects (each hop filtered, ports included; only `http` and `https`), must get its response header within a minute, is closed when its connection moves no byte for 2 minutes (as the proxy's idle limit), and is bounded by `--fetch-timeout` (default 2 h, upload included).
+- **Content check.** Before streaming, the downloader refuses a body that is not media: a `Content-Type` of `text/*`, JSON, XML, `xhtml` or JavaScript, or leading bytes that are not media by the one shared check (`media.NotMedia`): UTF-16 text (a byte order mark followed by UTF-16 ASCII, checked first because `FF FE` is also an MPEG frame sync), else media by container signature passes, else a leading `<` or `{` past a UTF-8 BOM and whitespace, else what the sniffer calls text, JSON or XML. It reports `retryable: false`. The server applies the same check on receipt (§4.2).
+- **Failures are classified for control and reported in full.** Stage and retryability come from yt-dlp's own verdicts (its `ERROR:` lines, with the URL redacted so a URL cannot pick the verdict; progress and warning lines, which echo URL-controlled data, are ignored). The failure report carries the full details: yt-dlp's last `ERROR:` line in the reason, its stderr tail in `stderr_tail`, or a plain GET's error text. Routine worker logs name the site, not the URL; a failure's report and its `task.failed` event may quote it (§10.1).
+- **Egress proxy (SSRF filter, §13).** The downloader runs a small loopback HTTP proxy, on a random port, that resolves the host itself and dials only through the address filter. It allows only `CONNECT` and plain `GET`/`HEAD`, and only to ports 80 and 443: the port allowlist belongs to the filtering dialer, which the plain GET (and each of its redirects) uses in-process too. The egress probe's client may also reach its own URL's port. The proxy's port is never 80, 443 or the server's port (the worker picks another), so an egress firewall that allows only those (§13) also blocks the fetch child's direct path around the proxy. A proxy that stops accepting (a permanent accept error) stops the worker, which then exits with an error; fetches meanwhile are refused as pre-work.
+- **Sandbox profile.** yt-dlp runs under `sandbox-exec` like any child (§7.4), with these differences. The network is **not** denied wholesale: the spec sets `DenyNet` with `ConnectPorts = [proxy port]`, so the seccomp filter lets `socket(2)` create only `AF_INET`/`AF_INET6` stream sockets with protocol 0 or TCP (no MPTCP, UDP, raw, Unix or netlink), and `socketpair(2)` create only `AF_UNIX` stream pairs, which are connected to each other from birth (a `connect` on one fails with `EISCONN`, and a Unix stream socket refuses a destination address on `sendto`), so they reach nothing but their other end; runtimes need them for in-process wakeups (deno's signal driver aborts without one; Python's asyncio uses one). Datagram pairs stay refused. Landlock (**ABI ≥ 4, Linux ≥ 6.7**) refuses `bind(2)` and every TCP `connect(2)` except to that port. `listen`, `accept` and TCP Fast Open sends (`MSG_FASTOPEN` on `sendto`/`sendmsg`/`sendmmsg`, a connect Landlock's connect hook does not see) are refused by the **seccomp filter**, not by Landlock. DNS (UDP) is therefore blocked inside the child: all name resolution happens in the proxy. Filesystem: read-only system paths, the CA certificates and OpenSSL configuration (`/etc/ssl/certs`, `/etc/ssl/openssl.cnf`, `/etc/ca-certificates`, `/etc/pki/tls/certs`, `/etc/pki/tls/openssl.cnf`, `/etc/pki/ca-trust`; not `/etc/ssl` or `/etc/pki` whole, whose `private/` directories hold host keys), the timezone, the yt-dlp tree (its virtualenv and interpreter when outside the system paths), deno's when installed, and the per-run cookies copy; read-write only the lease's work directory. `RLIMIT_FSIZE` is 256 MiB (the media goes to stdout, so files are small), plus the usual file and process limits, lowest priority, and the fetch timeout. **No `RLIMIT_AS` by default**: deno's V8 reserves tens of GiB of address space at startup and aborts under a 4 GiB limit (measured with deno 2.9.8), which would break every YouTube fetch; `--fetch-address-space` sets one for operators who want it (memory accounting and cgroup limits are unaffected either way). **Below Landlock ABI 4 the child gets no sockets at all** (the spec fails closed, with a warning), and the startup probe (`sandbox.ProbeDownloader`) reports a level below `full`. A downloader there **refuses every fetch lease as pre-work without running yt-dlp** (one warning at startup), rather than burning attempts on fetches that can only fail; this holds whatever `--fetch-min-sandbox` says. A downloader's probe states `full` only when the filesystem is restricted **and** TCP connect is limited to the proxy port: the self-test connects to the proxy port and fails every other attempt, including `listen` and a TCP Fast Open send to another port (`tcp_fastopen`, which also catches a seccomp filter whose argument offsets are wrong on an architecture).
+- **Sandbox floor.** The server's `--fetch-min-sandbox` (default `full`, as defined above) gates fetch leases as `--prepare-min-sandbox` gates prepare: fetch tasks go only to downloaders at or above it, and `409 no-downloader` counts only such downloaders. The operator can lower it, but that only helps a downloader whose fetch child is not network-confined at all (non-Linux, where no seccomp or Landlock is applied: level `none`); on Linux below ABI 4 the downloader refuses the leases itself (above), and with the floor lowered it would be offered them and refuse each as pre-work until the circuit breaker pauses it (§4.2). §13 states what lowering it costs.
+- **Egress identity.** `--egress-group NAME` and `--egress-probe URL` (§8.6) say which outbound address the downloader shares; `--allow-private-egress` disables the address filter for operators with LAN sources (logged as a warning at startup).
+- **Image.** The `downloader` Docker target (`<tag>-downloader`) is the binary on Debian with a pinned, checksum-verified yt-dlp standalone release and a pinned deno (the JavaScript runtime some yt-dlp extractors need); no ffmpeg, no whisper-cli. Its build ends with a smoke test, the hidden `whisper-network downloader-selftest`: it starts the egress proxy, resolves the tools as a downloader does, requires the probe to report `full`, and runs `deno eval` and `yt-dlp --version` under the exact fetch child spec and default limits; the image does not build if either cannot run there. A Linux Go test does the same with whatever yt-dlp and deno are installed. A weekly workflow bumps the yt-dlp pin by pull request, because sites break extractors often; it verifies the release's `SHA2-256SUMS` against its `SHA2-256SUMS.sig` with yt-dlp's release key, committed in the repository (`deploy/yt-dlp-release-key.asc`), before taking any checksum from it.
+- **Cookies.** `--yt-dlp-cookies` is readable by the fetch child, so it is the most valuable thing a compromised yt-dlp can exfiltrate (§13), and it makes the downloader a confused deputy: anyone with `submit_url` on a queue it serves can fetch whatever that account can see. Use a throwaway account's cookies, if any.
 
 ---
 
@@ -813,6 +892,26 @@ Not implemented: a separate retention for a failed prepare's original beyond the
 
 Every purge, deletion and prune the reaper makes is audited with actor `system` (§5.2.1).
 
+### 8.6 Fetch scheduling: sites, egress groups and pacing
+
+Fetch tasks are claimed through the same fair-queueing claim (§8.2) with extra eligibility rules, all evaluated inside the claim's transaction so concurrent claims cannot both take the last slot.
+
+**Site key.** The registrable domain (eTLD+1, `publicsuffix`) of the submitted URL's host, with a small alias table (`youtu.be`, `youtube-nocookie.com`, `m.youtube.com` and similar map to `youtube.com`). Redirects do not change it. The site key, not the URL, is what logs, metric labels and audit details carry.
+
+**Egress groups.** Downloaders with the same **egress key** are one group, treated by the scheduler as one IP. The effective key is, in order: `label:NAME` from `--egress-group`; else `ip:A.B.C.D` from `--egress-probe URL` (an endpoint that returns the downloader's public address, re-probed every 10 minutes and on errors); else `ip:` + the source address the server sees, if it is public (what a downloader may dial); else `unknown`, one shared conservative group. The worker page shows it.
+
+**Policies.** A policy is keyed by site, optionally narrowed to one egress group (`youtube.com@label:home`); the most specific wins, and `*` is the default for unlisted sites. A policy holds zero or more **rate rules** `N/WINDOW` (a Go duration, minimum `1s`, maximum `168h`; rules stack, e.g. `1/30s`, `40/1h`, `300/24h`), each a sliding window over fetch starts per egress group; a **concurrency** limit (in-flight fetches per group); and a **backoff** (initial cooldown and cap after a rate limit). Manual limits matter because automatic backoff alone is too late: YouTube blocks an address for about 12 h once tripped, so the server stays under the limit proactively. Policies live in SQLite and are managed **only in the UI or the admin API** (§6.2): there is no file or flag, changes take effect at once, and each is audited. The migration **seeds** `*` (no rate rules, concurrency 2, backoff 5 min doubling to a 6 h cap) and `youtube.com` (`1/3m`, concurrency 1, backoff from 12 h to a 24 h cap).
+
+**Invalid rows fail closed.** The admin API never writes a row that does not validate, but a hand edit might. Such a row blocks what it governs: its site (or its site on that egress, for `site@egress`) is never claimable, it never falls back to a less specific policy, and an invalid `*` blocks every site. It is listed with `invalid: true` and the reason (`GET /admin/fetch-policies`, the UI), counted by `whisper_fetch_invalid_policies`, logged once per change, and repaired with a `PUT` or removed with a `DELETE`.
+
+**Claim eligibility.** A downloader may claim a fetch task for (its egress key, the task's site) only if a valid policy governs the pair (none: blocked, fail closed), no cooldown is active, the in-flight count is under the policy's concurrency, every rate rule has room, the task is on a queue the downloader holds `fetch` on, it is at or above the fetch sandbox floor, and it has not failed that task before (retry elsewhere, §8.2). The claim records the start (`fetch_starts`) and the lease's egress key in the same transaction. The start counts against the rate rules even if the downloader then refuses the lease as pre-work or releases it: pacing errs toward fetching less. A pending fetch task blocked only by time (a rate window, a cooldown) wakes waiting claims through one resettable timer at the earliest moment pacing frees it; concurrency needs no timer because the lease end that frees a slot notifies.
+
+**Rotation.** When several groups' downloaders are long-polling for a site, the one whose group fetched that site **least recently** goes first (a group that never fetched it counts as earliest; equal last starts do not block each other). **Rotation counts only downloaders that are waiting now and could take the task**: the server tracks each long-polling downloader (worker, egress key, the sandbox level its claim reports), and a group is preferred only if pacing allows it and one of *its waiting* downloaders is active, holds the grant, meets the sandbox floor and has not failed that task. A group whose granted downloaders are busy or offline, and whose waiting one cannot serve the site, never holds the others back. After a fetch claim made while more than one group was waiting, the server wakes the waiting claims: the new start changes which group is least recent, so a claim rotation held back looks again instead of sleeping out its long poll.
+
+**Backoff.** A `rate_limited` outcome starts a cooldown for the (group, site) pair of `backoff_initial × 2^level`, capped at the policy's cap (the `*` policy's values, or a built-in fallback, if the governing policy is unusable, so a rate limit always cools the pair down). **Automatic escalation ignores bursts**: further `rate_limited` reports within one minute of the cooldown just set (concurrent fetches that all hit the same block) change nothing, so one incident does not climb the ladder. A successful fetch resets the level (an expired automatic cooldown is removed; an active one keeps its end but drops to level 0). **A manual cooldown is never shortened** by an automatic one; an administrator can set one (an address known to be blocked) or clear one in the UI or API.
+
+**Observability.** Events: `fetch.submitted`, `fetch.done` (site, egress key, method `yt-dlp` or `http`, bytes, duration), `fetch.rate_limited`, `fetch.cooldown`. Metrics (site labels are bounded to the sites named by a policy, else `other`): `whisper_fetch_total{site,outcome}`, `whisper_fetch_bytes_total{site}`, `whisper_fetch_cooldowns`, `whisper_fetch_blocked_tasks` (pending fetch tasks held back by pacing from every active downloader) and `whisper_fetch_invalid_policies`.
+
 ---
 
 ## 9. Example client integration: a batch automation client
@@ -873,11 +972,11 @@ Every line also carries `service="whisper-network"`, `mode` (`server`/`worker`),
 | event | level | Emitted by | Key fields |
 |---|---|---|---|
 | `http.request` | info (debug for heartbeats) | server | `method`, `route` (pattern, e.g. `/job/{id}`, never the raw path), `status`, `duration_ms`, `bytes_in`, `bytes_out`, `principal`, `remote` |
-| `job.created` | info | server | `job_id`, `queue`, `weight`, `model`, `bytes`, `original_type`, `fast_path`, `source` |
+| `job.created` | info | server | `job_id`, `queue`, `weight`, `model`, `bytes`, `original_type`, `fast_path`, `source`; a URL job has `site` instead of `source`, `bytes` or `original_type` |
 | `job.prepared` | info | server | `job_id`, `audio_s`, `tasks`, `canonical_bytes` |
 | `job.done` / `job.failed` | info / warn | server | `job_id`, `queue`, `wait_s`, `elapsed_s`, `compute_s`, `error` |
 | `job.deleted` / `job.purged` | info | server | `job_id`, `actor` / `what` |
-| `job.retried` | info | server | `job_id`, `actor`, `state`, `tasks`, `retries`, `previous_error` |
+| `job.retried` | info | server | `job_id`, `actor`, `state`, `tasks`, `retries`, `previous_error`, `refetch` (a URL job fetched again, §4.2) |
 | `task.leased` | info | server | `job_id`, `task_seq`, `task_kind`, `lease_id`, `worker_id`, `queue`, `cost`, `vtime` |
 | `lease.expired` / `lease.released` | warn / info | server | `lease_id`, `worker_id`, `attempt` |
 | `task.done` / `task.failed` | info / warn | server + worker | `lease_id`, `compute_ms`, `audio_s`, `rtf`, `error`, `stderr_tail` (≤ 4 KiB); a task the reaper fails at the retry wait limit (§8.2) has no lease and carries `failed_on` (the workers) |
@@ -887,8 +986,14 @@ Every line also carries `service="whisper-network"`, `mode` (`server`/`worker`),
 | `auth.denied` | warn | server | `principal`, `route`, `reason` |
 | `admin.change` | info | server | `actor`, `action`, `target` (mirrors the audit table) |
 | `reaper.run` | debug | server | counts per action |
+| `fetch.submitted` | info | server | `job_id`, `queue`, `site` |
+| `fetch.done` | info | server | `lease_id`, `job_id`, `worker_id`, `site`, `egress_key`, `fetch_method` (`yt-dlp` / `http`), `bytes`, `original_type`, `fast_path`, `duration_ms` |
+| `fetch.rate_limited` | warn | server | `lease_id`, `job_id`, `worker_id`, `site`, `egress_key` |
+| `fetch.cooldown` | warn | server | `site`, `egress_key`, `until`, `cooldown_level`, `manual` |
 
-**Never logged:** tokens, passwords, cookies, `Authorization` headers, prompt text, transcript text, or the contents of `metadata` (which carries requester names). Their lengths may be logged. `source` URLs are logged, because they are the redo key and are not secret.
+Unnamed downloader and fetch messages carry: `policy_keys` (server: invalid fetch policy rows, logged when the set changes); `yt_dlp_version`, `egress_group`, `egress_ip_known` (downloader registration); `proxy_port` (egress proxy started); `error_class` (`refused`, `dns`, `timeout`, `status`, `body`, `other`: a failed egress probe); `yt_dlp_outcome` (`ok`, `unsupported`, `rate_limited`, `permanent`, `transient`: a finished yt-dlp run).
+
+**Never logged:** tokens, passwords, cookies, `Authorization` headers, prompt text, transcript text, or the contents of `metadata` (which carries requester names). Their lengths may be logged. `source` URLs of uploads are logged, because they are the redo key and are not secret. **A URL job's URL is never logged** (it defaults into `source` and is job content that can carry credentials in its query string): the worker, the server, the audit log and metric labels carry the **site key** instead, and fetch and URL-job events carry no `source` or URL field at all (the `job.created` event for a URL job omits `source`, which defaults to the URL). The `obs.IsForbiddenField` rules apply to every new field name. The exception is a failed fetch: its `task.failed` event carries the worker's reason and `stderr_tail` in full (§4.2), which may quote the URL.
 
 **Shipping.** stdout only, and a collector ships it. That might be vlagent, Vector, Fluent Bit or the Docker log driver; it sets `_stream_fields`. Workers on ad-hoc machines may have no collector at all. That is acceptable, because everything about a task that matters fleet-wide is already logged by the server: lease events, results, and failures with the stderr tail. Direct push from the binary (`--log-push-url`) is deferred until a fleet machine actually needs it.
 
@@ -940,7 +1045,7 @@ It was chosen over `prometheus/client_golang` because push is native, and it is 
 | `whisper_worker_info` | gauge (=1) | `worker`, `hostname`, `description`, `version`, `engine_version`, `ffmpeg_version`, `sandbox_level`, `arch` | Join target; `version` is the worker's whisper-network version, for skew alerts |
 | `whisper_worker_last_seen_timestamp_seconds` | gauge | `worker` | Dead-worker alert |
 | `whisper_worker_slots` / `whisper_worker_slots_busy` | gauge | `worker` | Utilization |
-| `whisper_fleet_slots` | gauge | `state` (`in_use`, `available`, `deferred`, `paused`), `kind` (`all`, `transcribe`, `prepare`) | Fleet capacity, as the dashboard's Capacity tile: slots of active workers seen in 10 min, from their last heartbeat; `deferred` are free slots on hosts deferring for load, `available` the other free ones; `paused` (kind `all`) counts paused workers' slots. A worker offering both kinds counts in both; `prepare` needs `--prepare-min-sandbox` |
+| `whisper_fleet_slots` | gauge | `state` (`in_use`, `available`, `deferred`, `paused`), `kind` (`all`, `transcribe`, `prepare`) | Fleet capacity, as the dashboard's Capacity tile: slots of active workers seen in 10 min, from their last heartbeat; `deferred` are free slots on hosts deferring for load, `available` the other free ones; `paused` (kind `all`) counts paused workers' slots. A worker offering both kinds counts in both; `prepare` needs `--prepare-min-sandbox`; downloaders count only in kind `all` |
 | `whisper_worker_audio_seconds_total` | counter | `worker`, `model` | Throughput per machine (resets with the process; the durable per-worker totals are the `worker_stats` counters, §4.3) |
 | `whisper_worker_child_rss_bytes` | gauge | `worker` | Memory sizing (§7.3) |
 | `whisper_worker_models_bytes` / `whisper_worker_work_bytes` | gauge | `worker` | Disk use under `--state`: model cache, lease work directories |
@@ -957,6 +1062,11 @@ It was chosen over `prometheus/client_golang` because push is native, and it is 
 | `whisper_failed_jobs_retryable` | gauge | — | Failed jobs whose media is kept, so they can be retried |
 | `whisper_data_free_bytes` | gauge | — | Disk alert |
 | `whisper_db_tx_seconds` | histogram | `op` | SQLite contention, if it ever appears |
+| `whisper_fetch_total` | counter | `site`, `outcome` (`done`, `failed`, `rate_limited`, `not_media`, `too_large`, `invalid`, `released`, `expired`) | Fetch lease outcomes (§8.6). `site` is a site named by a fetch policy, else `other`, never a URL |
+| `whisper_fetch_bytes_total` | counter | `site` | Bytes of media fetched |
+| `whisper_fetch_cooldowns` | gauge | — | (egress, site) cooldowns in force |
+| `whisper_fetch_blocked_tasks` | gauge | — | Pending fetch tasks pacing holds back from every active downloader |
+| `whisper_fetch_invalid_policies` | gauge | — | Fetch policy rows that do not validate (they block their sites, §8.6) |
 | `go_*`, `process_*` | — | — | From the library |
 
 **Suggested alerts** (vmalert / Prometheus rules, shipped as `deploy/alerts.yml`)
@@ -1005,6 +1115,7 @@ Every flag has an env var equivalent (`WHISPER_*`). There is no config file in v
 | `--class-weights` | `low=1,medium=2,high=4` | |
 | `--model-factors` | `small.en=1,large-v3-turbo=3` | |
 | `--prepare-min-sandbox` | `full` | `full` / `fs-only` / `none` |
+| `--fetch-min-sandbox` | `full` | `full` / `fs-only` / `none`: the least sandbox level a downloader needs to get fetch tasks. For a downloader `full` means the filesystem is restricted **and** TCP connect is limited to its egress proxy port by Landlock network rules (ABI ≥ 4, Linux ≥ 6.7), so the proxy cannot be bypassed by name resolution or another port (§7.6, §13). Lowering it accepts the residual in §13; it only helps a downloader with no network confinement at all (non-Linux), since a Linux one below ABI 4 refuses fetch leases itself |
 | `--max-upload-bytes` | 2 GiB | A queue may set a lower cap; a queue cap above this is refused (400), and uploads are clamped to it regardless |
 | `--min-free-bytes` | 1 GiB | Uploads that would take free disk below this are refused (507) |
 | `--audio-retention` / `--job-retention` | 24h / 720h | §8.5 |
@@ -1044,6 +1155,14 @@ Every flag has an env var equivalent (`WHISPER_*`). There is no config file in v
 | `--max-host-load` | 70 | Percent. Slots stop claiming while the host's CPU use by other processes is above this; running tasks continue. `0` disables. Linux only (§7.3) |
 | `--max-host-load-resume` | 60 | Percent; a slot resumes claiming below this. At most `--max-host-load` |
 | `--kinds` | `prepare,transcribe` | e.g. `transcribe` only, to keep ffmpeg off a machine |
+| `--downloader` | off | Run as a downloader (§7.6): fetch URL jobs with yt-dlp instead of processing media. Fixed at registration; needs yt-dlp, not ffmpeg or whisper-cli. Defaults to 2 slots |
+| `--yt-dlp` | on `$PATH` | yt-dlp binary (downloader; 2022.11 or later) |
+| `--yt-dlp-cookies` | unset | Operator cookies file passed to yt-dlp (downloader); copied into each lease's directory |
+| `--egress-group` | unset | Name of the egress this downloader shares with others that leave through the same address (downloader, §8.6) |
+| `--egress-probe` | unset | URL that returns this downloader's public address, e.g. `https://api.ipify.org` (downloader, optional, §8.6) |
+| `--allow-private-egress` | off | Disable the SSRF filter: let the downloader reach loopback, private, link-local and similar addresses (downloader, §13) |
+| `--fetch-timeout` | 2h | Time limit of one fetch, upload included (downloader) |
+| `--fetch-address-space` | 0 (none) | `RLIMIT_AS` of the yt-dlp child and the deno it runs (downloader). deno reserves tens of GiB of address space at startup, so a low limit breaks YouTube; leave it unset unless you have measured (§7.6) |
 | `--whisper-cli` / `--ffmpeg` | on `$PATH` | |
 | `--drain` | false | Graceful shutdown finishes running tasks first |
 | `--debug` / `--quiet` / `--output-format` | off / off / `auto` | Template flags (§10.1) |
@@ -1060,7 +1179,8 @@ docker run -d -v wn-state:/var/lib/whisper-network --cpu-shares 128 --memory 6g 
 
 - The server should sit behind a TLS-terminating proxy (Traefik or Caddy) or use `--tls-*`. Worker and client tokens must not cross untrusted networks in cleartext.
 - Backups: `sqlite3 .backup` (or `VACUUM INTO`) plus the `blobs/` directory. Media is transient, so backing up transcripts and the DB is enough.
-- `deploy/` ships an example compose file with VictoriaMetrics, VictoriaLogs and vmalert, wired to the flags above. It doubles as the integration-test environment.
+- A downloader (§7.6) runs from the `<tag>-downloader` image: `docker run -d -v wn-dl:/var/lib/whisper-network ghcr.io/…/whisper-network:<tag>-downloader worker --downloader --server https://wn.example`. Put it on its own network with the egress firewall of §13 (outbound TCP only to 80, 443 and the server's port, plus DNS). It then needs the same two approvals as a worker: lifecycle (`worker_admin`) and the `fetch` grant on each queue it may serve (`queue_admin`), and clients need `submit_url` on those queues.
+- `deploy/` ships an example compose file with VictoriaMetrics, VictoriaLogs and vmalert, wired to the flags above, plus a downloader service. It doubles as the integration-test environment.
 
 ### 11.3 Capacity sanity check
 
@@ -1082,6 +1202,7 @@ Server load is trivial. 50 workers × 4 slots heartbeating every 30 s is about 7
 | Worker | A fake `whisper-cli`/`ffmpeg` (a test helper binary via `TestMain` re-exec) that emits canned output, sleeps, crashes or hangs on cue. Covers heartbeat-driven cancellation, SIGTERM release, and resuming an interrupted download. |
 | Sandbox | Linux-only tests: the child cannot read `credentials.json`, cannot open TCP (on ABI ≥ 4), and cannot write outside tmp. Skipped with a reason where the kernel lacks support. |
 | Observability | A golden test captures the log output of a full job run and asserts the event names and required fields, and that no forbidden field (token, prompt, transcript) appears. A metrics test scrapes `/metrics` and asserts the presence and labels of the catalog. |
+| Fetch | The egress filter has table tests for every refused range and form (IPv4-mapped, CGNAT, ULA, zone IDs), DNS-rebinding (a name that resolves differently per lookup) and redirect cases; a fake yt-dlp in `workertest` covers invocation, classification (unsupported, rate-limited, permanent, live) and URL redaction; `store` tests cover claim eligibility, rotation, cooldowns and invalid-policy fail-closed; an end-to-end test submits a URL served by a local test server through a downloader started with `--allow-private-egress`. Sandbox tests (Linux, ABI ≥ 4) check that the child connects only to the proxy port, and a BPF matrix test checks the fetch seccomp filter's decisions. Real tools: the downloader image build runs `downloader-selftest` (the real deno and yt-dlp under the exact fetch child spec), and a Linux Go test does the same with whatever yt-dlp and deno are installed (skipped when absent). |
 | Integration | The `deploy/` compose stack: one server, two workers, real ffmpeg and whisper.cpp on a 2-minute MP4, with VictoriaLogs/VictoriaMetrics receiving data. Runs nightly in CI, not per-PR. |
 
 Code is structured for testability: clock, ID generator, process runner and scheduler snapshot are interfaces or values injected at construction. There are no package-level globals; the metrics `Set` is injected too, rather than using the library's default global set.
@@ -1109,6 +1230,39 @@ Code is structured for testability: clock, ID generator, process runner and sche
 | Cleartext tokens | TLS required outside localhost (warning plus docs). Optional `--require-tls` refuses to start without it. |
 | Disk exhaustion | Per-queue upload caps, `/readyz` free-space check, refusing new uploads below a threshold (`507`), and a disk alert. |
 | Model-file tampering | Pinned sha256 per model, verified on the server before caching and on the worker before use. |
+| SSRF: a client-supplied URL reaches internal services (metadata endpoints, loopback, LAN) | **The server never connects to a client URL.** Only downloaders fetch, and all their egress (plain GET in-process, yt-dlp through `--proxy`) passes an address filter that **resolves the host itself and judges the address actually dialled**, so DNS rebinding and redirects cannot slip past a pre-check: it refuses loopback, RFC 1918, CGNAT (100.64/10), link-local, unique-local IPv6 (fc00::/7), multicast, unspecified, reserved and documentation ranges, SIIT (`::ffff:0:0:0/96`), ORCHIDv2 (`2001:20::/28`), Teredo, and the IPv4 forms embedded in IPv4-mapped, NAT64 and 6to4 addresses. Each redirect hop (at most 10) is filtered again. **Only ports 80 and 443**, for the proxy and the plain GET alike, redirects included (the allowlist is the dialer's). `--allow-private-egress` turns the filter off for operators who need LAN sources (warning at startup). The server does not judge IP literals either: one filter, one policy |
+| A compromised or malicious yt-dlp (or a media-site response that exploits it) | yt-dlp runs only on downloaders, under `sandbox-exec` (§7.6): Landlock filesystem rules (work directory only), a seccomp filter that allows only TCP stream sockets and self-connected Unix stream pairs, Landlock network rules limiting `connect` to the proxy port (ABI ≥ 4), no `listen`/`accept`/TCP Fast Open (seccomp), no UDP so no DNS, no other Unix sockets, `no_new_privs`, rlimits and a wall-clock timeout. Its stdout is the media and nothing else; the downloader never decodes it (a prepare worker does, under its own sandbox). Below the fetch sandbox floor a downloader is not offered fetch tasks |
+| A downloader or yt-dlp leaks a client's URL (credentials in a query string, private video IDs) | The URL is job content, visible to whoever can see the job. It is never put in a metric label or audit detail, and routine logs carry the site key instead. A failed fetch's reason and stderr tail are kept in full for diagnosis (§4.2), so they can quote the URL in the job's error and in `task.failed` log events: restrict log access accordingly |
+| Fetching as a way to hammer or get the fleet blocked by a site | Per-(egress group, site) rate rules, concurrency and cooldowns set by `admin` only, enforced in the claim; rate-limit outcomes escalate a cooldown without burning attempts or tripping the circuit breaker (§8.6). Invalid policy rows fail closed |
+| A fetched page (HTML, JSON) is fed to prepare as "media" | The downloader's content check and the server's sniff on receipt both refuse text, HTML, XML and JSON bodies (`422 not-media`); yt-dlp failures never fall back to plain GET (§7.6) |
+| A processing worker leases fetch tasks, or a downloader leases media tasks | Worker kind is fixed at registration, grants are refused across kinds, and the claim enforces the split on its own |
+
+**Residual risks of URL downloads**
+
+- **Landlock `ConnectTCP` restricts by port, not by address.** The child may connect to the proxy's port on *any* address. The port is not secret (it is in yt-dlp's argv, and a compromised yt-dlp can read its own command line), so a compromised yt-dlp can have an attacker-controlled host listen on that same port, connect to it directly and exfiltrate over it, **bypassing the proxy and its SSRF filter**: this reaches public hosts, and also private ones that happen to listen on that port. What stays blocked: DNS and every other UDP, `listen`/`accept`, TCP Fast Open, Unix sockets, and every other TCP port. The proxy's port is random and high, so an unrelated internal service is unlikely to listen on it, but that is luck, not a control. **The control is an egress firewall on the downloader's network namespace** that lets out only TCP to ports 80 and 443 and the server's port (and DNS to the resolver, which the proxy needs): the proxy's port is an ephemeral one (Linux's default range is 32768–60999) and the worker never uses 80, 443 or the server's port for it, so the direct path is then closed, while the proxy and the plain GET, held to the same 80/443 by the dialer, keep working. The proxy and the child run as the same uid inside the container, so an `owner` match cannot tell them apart; filter by port. With Docker, for a downloader on its own bridge network (subnet `172.30.0.0/24` here, server on 8080):
+
+  ```sh
+  iptables -I DOCKER-USER -s 172.30.0.0/24 -j DROP
+  iptables -I DOCKER-USER -s 172.30.0.0/24 -p udp --dport 53 -j ACCEPT
+  iptables -I DOCKER-USER -s 172.30.0.0/24 -p tcp -m multiport --dports 53,80,443,8080 -j ACCEPT
+  iptables -I DOCKER-USER -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  ```
+
+  If the network has IPv6 enabled (`enable_ipv6`), do the same with `ip6tables` for its IPv6 subnet (`fd30::/64` here), or the downloader's IPv6 traffic bypasses the IPv4 rules:
+
+  ```sh
+  ip6tables -I DOCKER-USER -s fd30::/64 -j DROP
+  ip6tables -I DOCKER-USER -s fd30::/64 -p udp --dport 53 -j ACCEPT
+  ip6tables -I DOCKER-USER -s fd30::/64 -p tcp -m multiport --dports 53,80,443,8080 -j ACCEPT
+  ip6tables -I DOCKER-USER -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  ```
+
+  (`-I` prepends, so the rules end up in the reverse of this order: established traffic, then the allowed ports, then the drop.) This relies on the port allowlist of the proxy and the plain GET: without it a fetch could legitimately need any port. The rest of the downloader's own confinement still applies: a dedicated network segment, no secrets on the host, an unprivileged uid, a current yt-dlp.
+- **The cookies file is an exfiltration target and a confused deputy.** `--yt-dlp-cookies` is copied into each lease's directory, where the child reads it; a compromised yt-dlp can send it out over the path above. And anyone with `submit_url` on a queue the downloader serves fetches with that account's session: private videos, age-gated or members-only content it can see. Use a throwaway account, and grant `submit_url` accordingly.
+- **Below Landlock ABI 4** the child gets no sockets at all, so it fails closed, and the downloader **refuses every fetch lease as pre-work** without running yt-dlp (warning at startup); its probe reports a level below `full`. With the default `--fetch-min-sandbox full` such a downloader is simply not offered fetch tasks. Lowering the floor does not make it fetch on Linux: it is then offered fetch tasks, refuses each as pre-work (requeued, no attempt used), and after repeated refusals the circuit breaker auto-pauses it (§4.2). **Lowering `--fetch-min-sandbox` is an informed acceptance** that only matters where no seccomp or Landlock is applied to the child at all (a non-Linux downloader, level `none`): there the child is unconfined network-wise, so a compromised yt-dlp can ignore `--proxy` and connect anywhere.
+- **`--allow-private-egress`** removes the SSRF filter: anyone with `submit_url` can then make that downloader fetch from the networks it can reach, and read the result back as a transcript of whatever they can coax into audio. Use it only on a downloader isolated for that purpose.
+- **A URL is visible to everyone who can see the job**, like `source` and `prompt` (§5.2); it can carry secrets a client should not put there.
+- A fetched file is untrusted media like any upload and is processed under the same sandboxed prepare path; the content check is a guard against feeding web pages in, not a malware scanner.
 
 ---
 
@@ -1139,3 +1293,4 @@ Logging and metrics go in from phase 1, because instrumenting as each piece is w
 | 3 | UI: login, worker approval, queues and weights, jobs, users/clients, audit, share dashboard | Worker approved and job run without touching the CLI |
 | 4 | `deploy/` compose stack with VictoriaMetrics/VictoriaLogs/vmalert and alert rules; nightly integration test | Alerts fire in a staged failure (killed worker, full disk) |
 | 5 | First production client integration (§9): validate on a sample, then submit the full backlog at `low` | Sample transcripts are complete and correctly labelled |
+| 6 | URL downloads: `fetch` task kind, downloader workers (§7.6), sandbox network profile, egress filter and proxy, fetch pacing and policies (§8.6), `submit_url`, downloader image and yt-dlp bump workflow | Local test server URL → transcript through a downloader; SSRF filter, rebinding and redirect tests pass; policy and pacing tests pass |

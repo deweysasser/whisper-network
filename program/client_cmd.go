@@ -36,7 +36,8 @@ func stdout(w io.Writer) io.Writer {
 	return w
 }
 
-// SubmitCmd uploads a media file as a new job.
+// SubmitCmd submits a media file, or a URL for a downloader worker to fetch,
+// as a new job.
 type SubmitCmd struct {
 	ClientFlags    `embed:""`
 	Queue          string `default:"public" help:"Queue to submit to"`
@@ -45,16 +46,29 @@ type SubmitCmd struct {
 	Weight         string `enum:",low,medium,high" default:"" help:"Weight class within the queue: low, medium or high"`
 	Prompt         string `help:"Initial prompt (names, vocabulary); at most 800 characters"`
 	Label          string `help:"Free-form label"`
-	Source         string `help:"Where the media came from (recorded, never fetched)"`
+	Source         string `help:"Where the media came from (recorded, never fetched; defaults to the URL with --url)"`
+	URL            string `name:"url" help:"Media URL for a downloader worker to fetch, instead of FILE"`
 	Metadata       string `help:"Opaque JSON object stored with the job"`
 	IdempotencyKey string `help:"Retry-safe key: resubmitting with it returns the original job"`
 	JSON           bool   `name:"json" help:"Print the job document instead of its ID"`
-	File           string `arg:"" type:"existingfile" help:"Media file (any audio or video)"`
+	File           string `arg:"" optional:"" type:"existingfile" help:"Media file (any audio or video)"`
 
 	out io.Writer
 }
 
-// Run submits the file.
+// Validate enforces exactly one of FILE or --url (kong's xor does not cover
+// positional arguments).
+func (c *SubmitCmd) Validate() error {
+	switch {
+	case c.File == "" && c.URL == "":
+		return errors.New("expected one of FILE or --url")
+	case c.File != "" && c.URL != "":
+		return errors.New("FILE and --url are mutually exclusive")
+	}
+	return nil
+}
+
+// Run submits the file, or the URL for a downloader to fetch.
 func (c *SubmitCmd) Run(ctx context.Context) error {
 	params := api.JobParams{Model: c.Model, Language: c.Language, Weight: api.Weight(c.Weight),
 		Prompt: c.Prompt, Label: c.Label, Source: c.Source}
@@ -71,6 +85,13 @@ func (c *SubmitCmd) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if c.URL != "" {
+		job, err := cl.SubmitURL(ctx, c.Queue, api.FetchRequest{JobParams: params, URL: c.URL}, c.IdempotencyKey)
+		if err != nil {
+			return err
+		}
+		return c.print(job)
+	}
 	f, err := os.Open(c.File)
 	if err != nil {
 		return err
@@ -81,11 +102,15 @@ func (c *SubmitCmd) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	return c.print(job)
+}
+
+func (c *SubmitCmd) print(job *api.Job) error {
 	out := stdout(c.out)
 	if c.JSON {
 		return printJSON(out, job)
 	}
-	_, err = fmt.Fprintln(out, job.ID)
+	_, err := fmt.Fprintln(out, job.ID)
 	return err
 }
 
@@ -93,7 +118,7 @@ func (c *SubmitCmd) Run(ctx context.Context) error {
 type StatusCmd struct {
 	ClientFlags `embed:""`
 	Queue       string `default:"public" help:"Queue to list when no job ID is given"`
-	State       string `enum:",preparing,queued,running,done,failed" default:"" help:"Only list jobs in this state"`
+	State       string `enum:",preparing,fetching,queued,running,done,failed" default:"" help:"Only list jobs in this state"`
 	Sort        string `enum:"created,newest,state" default:"created" help:"List order: created (oldest first), newest, or state (running, waiting, failed, done)"`
 	Limit       int    `default:"50" help:"Maximum jobs to list"`
 	JobID       string `arg:"" optional:"" help:"Job ID: print its status document"`
@@ -283,7 +308,7 @@ func (c *RetryCmd) Run(ctx context.Context) error {
 type DeleteCmd struct {
 	ClientFlags `embed:""`
 	Queue       string    `default:"public" help:"Queue of the jobs to delete (without a job ID)"`
-	State       string    `enum:",preparing,queued,running,done,failed" default:"" help:"Delete the jobs in this state (required without a job ID)"`
+	State       string    `enum:",preparing,fetching,queued,running,done,failed" default:"" help:"Delete the jobs in this state (required without a job ID)"`
 	Since       time.Time `help:"Only jobs updated after this time (RFC 3339)"`
 	DryRun      bool      `help:"List what would be deleted, change nothing"`
 	JSON        bool      `name:"json" help:"Print the server's response document"`

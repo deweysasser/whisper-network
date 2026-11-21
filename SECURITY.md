@@ -38,7 +38,9 @@ untrusted inputs and partially trusted machines can do.
 | Job ID enumeration | Authorization decides access; jobs a caller cannot see return 404. |
 | Credential theft from the database | Tokens are stored as sha256 hashes (they are 256-bit random); passwords use argon2id. |
 | Default credentials | The first-run admin password is random, shown once, and must be changed at first login. |
-| Secrets in logs | Tokens, passwords, cookies, prompts, transcript text and job metadata are never logged; a test enforces it. |
+| Secrets in logs | Tokens, passwords, cookies, prompts, transcript text and job metadata are never logged; a test enforces it. A URL job's URL is not logged, audited or used as a metric label (its site stands for it), except that a failed fetch's reason and stderr tail are kept in full and may quote it. |
+| URL jobs reach internal services (SSRF) | The server never contacts a submitted URL. Downloaders fetch through an in-process egress proxy that refuses private, loopback, link-local, multicast and IPv4-embedding IPv6 ranges after DNS resolution, on every redirect hop, and allows only ports 80 and 443 (DESIGN.md §7.6, §13). Submitting needs the separate `submit_url` grant, and a downloader holds the separate `fetch` grant. |
+| Malicious site exploits yt-dlp | yt-dlp runs under `sandbox-exec` with no filesystem access beyond its work directory and tools, and may open TCP connections only to the proxy's port (Landlock ABI 4); seccomp refuses other socket families, `listen`, `accept` and TCP Fast Open. A downloader never runs ffmpeg or whisper-cli, and the server checks the fetched result before any worker processes it. |
 | Privilege escalation through client creation | A client can only hand out grants it holds. |
 | Disk exhaustion | Per-queue upload caps, a free-space check on `/readyz` and on upload. |
 | Model file tampering | Each model is pinned by sha256, verified by the server before caching and by the worker before use. |
@@ -64,6 +66,13 @@ untrusted inputs and partially trusted machines can do.
   isolation between them.
 - Plain HTTP exposes tokens. The server warns when it serves HTTP on a
   non-loopback address.
+- Landlock limits yt-dlp by port, not address: a compromised yt-dlp could
+  connect directly to an attacker's host on the proxy's port, bypassing the
+  egress filter. An egress firewall on the downloader (only TCP 80, 443 and
+  the server's port, plus DNS) closes this; see README and DESIGN.md §13.
+- A `--yt-dlp-cookies` file is readable by yt-dlp inside the sandbox, and
+  anyone with `submit_url` fetches with that account's session. Use a
+  throwaway account.
 
 ## Hardening checklist for operators
 
@@ -78,6 +87,11 @@ untrusted inputs and partially trusted machines can do.
 - [ ] **Approve workers deliberately.** Check the description, hostname and
       sandbox level before approving, and approve only for the queues that
       worker should hear. Reject workers you do not recognise.
+- [ ] **Downloaders.** Grant `submit_url` only to clients you trust to make
+      your network fetch URLs. Run downloaders on their own machine or
+      container behind an egress firewall (above), keep
+      `--fetch-min-sandbox=full` (default), and leave `--allow-private-egress`
+      off outside tests.
 - [ ] **Prepare sandbox policy.** Keep `--prepare-min-sandbox=full` (default)
       unless you trust every worker; lowering it sends untrusted media to
       workers with weaker sandboxes. Workers that should not run ffmpeg can set

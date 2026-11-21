@@ -11,6 +11,9 @@ const (
 	seccompOffNR      = 0
 	seccompOffArch    = 4
 	seccompOffArg0Low = 16
+	seccompOffArg1Low = 24
+	seccompOffArg2Low = 32
+	seccompOffArg3Low = 40
 
 	// x32 syscalls on amd64 carry this bit in nr and use different
 	// numbers; the filter refuses them all.
@@ -35,6 +38,7 @@ const (
 	bpfJEQ   = unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K
 	bpfJGE   = unix.BPF_JMP | unix.BPF_JGE | unix.BPF_K
 	bpfJSET  = unix.BPF_JMP | unix.BPF_JSET | unix.BPF_K
+	bpfAND   = unix.BPF_ALU | unix.BPF_AND | unix.BPF_K
 	bpfRet   = unix.BPF_RET | unix.BPF_K
 )
 
@@ -77,14 +81,56 @@ func buildSeccomp(r seccompRules) ([]unix.SockFilter, error) {
 			bpfStmt(bpfRet, seccompDeny(unix.EPERM)),
 			bpfStmt(bpfRet, unix.SECCOMP_RET_ALLOW))
 	}
-	// denyArg0Bits refuses syscall nr when its first argument has any bit
-	// of mask set, and allows it otherwise.
-	denyArg0Bits := func(nr uintptr, mask uint32, errno unix.Errno) {
+	// denyArgBits refuses syscall nr when the low word of the argument at
+	// offset off has any bit of mask set, and allows it otherwise.
+	denyArgBits := func(nr uintptr, off uint32, mask uint32, errno unix.Errno) {
 		prog = append(prog,
 			bpfJump(bpfJEQ, uint32(nr), 0, 4),
-			bpfStmt(bpfLoadW, seccompOffArg0Low),
+			bpfStmt(bpfLoadW, off),
 			bpfJump(bpfJSET, mask, 0, 1),
 			bpfStmt(bpfRet, seccompDeny(errno)),
+			bpfStmt(bpfRet, unix.SECCOMP_RET_ALLOW))
+	}
+	// allowTCPSocket lets socket(2) through only for
+	// (AF_INET|AF_INET6, SOCK_STREAM [|SOCK_NONBLOCK|SOCK_CLOEXEC],
+	// 0|IPPROTO_TCP) and refuses every other socket with EACCES. The
+	// kernel reads all three arguments as int, so the low words decide.
+	allowTCPSocket := func() {
+		const typeFlags = unix.SOCK_NONBLOCK | unix.SOCK_CLOEXEC
+		prog = append(prog,
+			bpfJump(bpfJEQ, unix.SYS_SOCKET, 0, 11),
+			bpfStmt(bpfLoadW, seccompOffArg0Low),
+			bpfJump(bpfJEQ, unix.AF_INET, 1, 0),
+			bpfJump(bpfJEQ, unix.AF_INET6, 0, 6), // → deny
+			bpfStmt(bpfLoadW, seccompOffArg1Low),
+			bpfStmt(bpfAND, ^uint32(typeFlags)),
+			bpfJump(bpfJEQ, unix.SOCK_STREAM, 0, 3), // → deny
+			bpfStmt(bpfLoadW, seccompOffArg2Low),
+			bpfJump(bpfJEQ, 0, 2, 0),                // → allow
+			bpfJump(bpfJEQ, unix.IPPROTO_TCP, 1, 0), // → allow
+			bpfStmt(bpfRet, seccompDeny(unix.EACCES)),
+			bpfStmt(bpfRet, unix.SECCOMP_RET_ALLOW))
+	}
+	// allowUnixStreamPair lets socketpair(2) through only for (AF_UNIX,
+	// SOCK_STREAM [|SOCK_NONBLOCK|SOCK_CLOEXEC], 0) and refuses every
+	// other pair with EACCES. Such a pair is connected to itself from
+	// birth: connect(2) on it fails with EISCONN and a Unix stream socket
+	// refuses a destination address on sendto(2)/sendmsg(2), so it
+	// reaches nothing but its other end. Runtimes need it for their
+	// in-process wakeups (deno's tokio signal driver, Python asyncio).
+	// Datagram pairs stay refused: they can sendto(2) any pathname socket.
+	allowUnixStreamPair := func() {
+		const typeFlags = unix.SOCK_NONBLOCK | unix.SOCK_CLOEXEC
+		prog = append(prog,
+			bpfJump(bpfJEQ, unix.SYS_SOCKETPAIR, 0, 9),
+			bpfStmt(bpfLoadW, seccompOffArg0Low),
+			bpfJump(bpfJEQ, unix.AF_UNIX, 0, 5), // → deny
+			bpfStmt(bpfLoadW, seccompOffArg1Low),
+			bpfStmt(bpfAND, ^uint32(typeFlags)),
+			bpfJump(bpfJEQ, unix.SOCK_STREAM, 0, 2), // → deny
+			bpfStmt(bpfLoadW, seccompOffArg2Low),
+			bpfJump(bpfJEQ, 0, 1, 0), // → allow
+			bpfStmt(bpfRet, seccompDeny(unix.EACCES)),
 			bpfStmt(bpfRet, unix.SECCOMP_RET_ALLOW))
 	}
 
@@ -101,16 +147,37 @@ func buildSeccomp(r seccompRules) ([]unix.SockFilter, error) {
 	// to clone(2), whose flags the filter can read. The Go runtime uses
 	// clone(2) directly. Threads and fork never set CLONE_NEW* flags.
 	deny(unix.SYS_CLONE3, unix.ENOSYS)
-	denyArg0Bits(unix.SYS_CLONE, cloneNewMask, unix.EPERM)
-	denyArg0Bits(unix.SYS_UNSHARE, unshareNewMask, unix.EPERM)
+	denyArgBits(unix.SYS_CLONE, seccompOffArg0Low, cloneNewMask, unix.EPERM)
+	denyArgBits(unix.SYS_UNSHARE, seccompOffArg0Low, unshareNewMask, unix.EPERM)
 	deny(unix.SYS_SETNS, unix.EPERM)
 	if r.denyNet {
 		// socketpair too: an AF_UNIX datagram socket from socketpair can
 		// still sendto(2) a pathname address (/dev/log, the journald
 		// socket), which Landlock below ABI 9 does not check. The child's
 		// inherited descriptors are /dev/null and pipes, not sockets, so
-		// with neither call there is no socket to send from.
-		deny(unix.SYS_SOCKET, unix.EACCES)
+		// with neither call there is no socket to send from. inetStream
+		// allows stream pairs only (allowUnixStreamPair), before this
+		// catch-all.
+		if r.inetStream {
+			allowTCPSocket()
+			allowUnixStreamPair()
+			// Outbound only: listen(2) on an unbound socket autobinds
+			// an ephemeral port without Landlock's bind check. A
+			// connect autobinds without bind(2), which is refused so
+			// stream pairs cannot claim abstract names (Landlock's
+			// abstract scoping covers connect, not bind).
+			deny(unix.SYS_BIND, unix.EACCES)
+			deny(unix.SYS_LISTEN, unix.EACCES)
+			deny(unix.SYS_ACCEPT, unix.EACCES)
+			deny(unix.SYS_ACCEPT4, unix.EACCES)
+			// TCP Fast Open connects from sendto/sendmsg. The flags are
+			// an int (sendto, sendmmsg) or unsigned (sendmsg): low word.
+			denyArgBits(unix.SYS_SENDTO, seccompOffArg3Low, unix.MSG_FASTOPEN, unix.EACCES)
+			denyArgBits(unix.SYS_SENDMSG, seccompOffArg2Low, unix.MSG_FASTOPEN, unix.EACCES)
+			denyArgBits(unix.SYS_SENDMMSG, seccompOffArg3Low, unix.MSG_FASTOPEN, unix.EACCES)
+		} else {
+			deny(unix.SYS_SOCKET, unix.EACCES)
+		}
 		deny(unix.SYS_SOCKETPAIR, unix.EACCES)
 	}
 	if pid := r.signalPid; pid > 0 {

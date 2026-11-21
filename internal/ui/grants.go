@@ -36,6 +36,7 @@ var (
 	userQueueRoles = []roleInfo{
 		{Role: api.RoleQueueAdmin, Label: "Queue admin", Help: "Approve workers for the queue; see the status of and delete all its jobs"},
 		{Role: api.RoleSubmit, Label: "Submit", Help: "Create jobs; see, read and delete its own"},
+		{Role: api.RoleSubmitURL, Label: "Submit URL", Help: "Submit a URL for a downloader to fetch; see, read and delete its own jobs"},
 		{Role: api.RoleViewAll, Label: "View all", Help: "See the status of every job"},
 		{Role: api.RoleReadAll, Label: "Read transcripts", Help: "See every job and read its transcript, prompt and metadata", Restricted: true},
 		{Role: api.RoleDeleteAll, Label: "Delete all", Help: "Delete any job"},

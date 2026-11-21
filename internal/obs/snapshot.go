@@ -31,6 +31,17 @@ type Snapshot struct {
 	RetryableFailedJobs int
 	// FleetSlots is the fleet's capacity (whisper_fleet_slots).
 	FleetSlots []FleetSlots
+	// FetchCooldowns counts the fetch cooldowns in force by site label
+	// (whisper_fetch_cooldowns), and FetchBlocked the pending fetch tasks
+	// pacing holds back from every downloader (whisper_fetch_blocked_tasks).
+	// Site labels are policy site keys or "other", never URLs.
+	FetchCooldowns, FetchBlocked []SiteCount
+}
+
+// SiteCount is a count for one fetch site label.
+type SiteCount struct {
+	Site string
+	N    int
 }
 
 // FleetSlots is the number of worker slots in one state ("in_use",
@@ -121,6 +132,9 @@ func (m *Metrics) writeSnapshot(w io.Writer) {
 	if v := m.version.Load(); v != nil {
 		metrics.WriteGaugeFloat64(w, series("whisper_server_info", "version", *v), 1)
 	}
+	if n := m.invalidPolicies.Load(); n != nil {
+		metrics.WriteGaugeFloat64(w, "whisper_fetch_invalid_policies", float64(*n))
+	}
 	s := m.snap.Load()
 	if s == nil {
 		return
@@ -175,6 +189,17 @@ func (m *Metrics) writeSnapshot(w io.Writer) {
 	})
 	for _, c := range slots {
 		g("whisper_fleet_slots", float64(c.N), "kind", c.Kind, "state", c.State)
+	}
+
+	for _, c := range []struct {
+		name string
+		in   []SiteCount
+	}{{"whisper_fetch_cooldowns", s.FetchCooldowns}, {"whisper_fetch_blocked_tasks", s.FetchBlocked}} {
+		sc := append([]SiteCount(nil), c.in...)
+		sort.Slice(sc, func(i, j int) bool { return sc[i].Site < sc[j].Site })
+		for _, x := range sc {
+			g(c.name, float64(x.N), "site", x.Site)
+		}
 	}
 
 	m.writeWorkers(w, s.WorkerInfo)

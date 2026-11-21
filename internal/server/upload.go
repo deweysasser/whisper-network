@@ -231,14 +231,12 @@ func (s *Server) validateParams(p *api.JobParams) error {
 	return nil
 }
 
-// uploadLimit is the media size cap on q: the queue's override if it has
-// one, but never above the server's --max-upload-bytes, which bounds what a
-// queue administrator can make the server accept (and the disk reserve).
+// uploadLimit is the media size cap on q (store.ByteCap): the queue's
+// override if it has one, but never above the server's --max-upload-bytes,
+// which bounds what a queue administrator can make the server accept (and
+// the disk reserve).
 func (s *Server) uploadLimit(q *store.Queue) int64 {
-	if q.MaxUploadBytes > 0 {
-		return min(q.MaxUploadBytes, s.cfg.MaxUploadBytes)
-	}
-	return s.cfg.MaxUploadBytes
+	return store.ByteCap(q.MaxUploadBytes, s.cfg.MaxUploadBytes)
 }
 
 // receiveOriginal streams the media part to blobs/{job}/original, hashing
@@ -247,11 +245,29 @@ func (s *Server) uploadLimit(q *store.Queue) int64 {
 // on res and stop with 507 if free space falls below MinFreeBytes, and a
 // body slower than MinTransferRate stops with 408.
 func (s *Server) receiveOriginal(jobID string, src io.Reader, limit int64, res *reservation) (store.Media, error) {
-	out, err := s.blobs.Create(jobID, blobs.Original)
+	out, m, _, err := s.receiveMedia(jobID, src, limit, res)
 	if err != nil {
 		return store.Media{}, err
 	}
-	defer out.Abort()
+	if err := out.Commit(); err != nil {
+		return store.Media{}, err
+	}
+	return m, nil
+}
+
+// receiveMedia is receiveOriginal without the commit: on success the
+// caller owns the pending original (and must Commit or Abort it), and gets
+// the leading bytes the type was sniffed from as well. On error nothing is
+// left behind.
+func (s *Server) receiveMedia(jobID string, src io.Reader, limit int64, res *reservation) (*blobs.Pending, store.Media, []byte, error) {
+	out, err := s.blobs.Create(jobID, blobs.Original)
+	if err != nil {
+		return nil, store.Media{}, nil, err
+	}
+	fail := func(err error) (*blobs.Pending, store.Media, []byte, error) {
+		out.Abort()
+		return nil, store.Media{}, nil, err
+	}
 	h := sha256.New()
 	head := &headBuffer{max: sniffLen}
 	disk := &guardedWriter{w: out, res: res}
@@ -259,21 +275,18 @@ func (s *Server) receiveOriginal(jobID string, src io.Reader, limit int64, res *
 	var mbe *http.MaxBytesError
 	switch {
 	case errors.Is(err, errDiskLow):
-		return store.Media{}, storageFull("free space fell below the minimum during the upload")
+		return fail(storageFull("free space fell below the minimum during the upload"))
 	case errors.Is(err, errTooSlow):
-		return store.Media{}, tooSlow()
+		return fail(tooSlow())
 	case errors.As(err, &mbe) || n > limit:
-		return store.Media{}, newProblem(http.StatusRequestEntityTooLarge, api.ProblemTooLarge,
-			"media exceeds the "+itoa64(limit)+" byte limit")
+		return fail(newProblem(http.StatusRequestEntityTooLarge, api.ProblemTooLarge,
+			"media exceeds the "+itoa64(limit)+" byte limit"))
 	case err != nil:
-		return store.Media{}, badRequest("reading media: " + err.Error())
+		return fail(badRequest("reading media: " + err.Error()))
 	case n == 0:
-		return store.Media{}, badRequest("media part is empty")
+		return fail(badRequest("media part is empty"))
 	}
-	if err := out.Commit(); err != nil {
-		return store.Media{}, err
-	}
-	return store.Media{Bytes: n, SHA256: hex.EncodeToString(h.Sum(nil)), Type: media.Sniff(head.b)}, nil
+	return out, store.Media{Bytes: n, SHA256: hex.EncodeToString(h.Sum(nil)), Type: media.Sniff(head.b)}, head.b, nil
 }
 
 // headBuffer keeps the first max bytes written to it.

@@ -37,4 +37,4 @@ func (c *SandboxExecCmd) Run() error {
 
 // sandboxFailureStatus is the exit status when the sandbox could not be set up
 // or the command could not be started.
-const sandboxFailureStatus = 126
+const sandboxFailureStatus = sandbox.SetupFailureStatus

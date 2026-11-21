@@ -183,3 +183,19 @@ func TestCanApproveWorker(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateGrantFetchRoles(t *testing.T) {
+	for _, role := range []api.Role{api.RoleFetch, api.RoleSubmitURL} {
+		assert.NoError(t, ValidateGrant(api.Grant{Role: role, Scope: "queue:A"}))
+		assert.Error(t, ValidateGrant(api.Grant{Role: role, Scope: "*"}))
+		assert.Error(t, ValidateGrant(api.Grant{Role: role, Scope: "queue:"}))
+	}
+}
+
+func TestQueueAdminMayGrantFetchRoles(t *testing.T) {
+	qa := user(g(api.RoleQueueAdmin, "queue:A"))
+	for _, role := range []api.Role{api.RoleFetch, api.RoleSubmitURL} {
+		assert.NoError(t, CanGrantTo(qa, []api.Grant{g(role, "queue:A")}))
+		assert.Error(t, CanGrantTo(qa, []api.Grant{g(role, "queue:B")}))
+	}
+}

@@ -292,3 +292,19 @@ func (w *Worker) WaitClaimed(leaseID any) {
 		return m["message"] == "lease claimed" && m[obs.FieldLeaseID] == leaseID
 	})
 }
+
+// StartDownloader runs a real downloader worker with the fake yt-dlp, which
+// may reach loopback (AllowPrivateEgress) so tests can serve media from
+// local HTTP servers. group is its egress group. Approve it with
+// Env.Approve like any worker (the grant is fetch).
+func (e *Env) StartDownloader(desc, group string, mods ...func(*worker.Config)) *Worker {
+	e.T.Helper()
+	all := append([]func(*worker.Config){func(c *worker.Config) {
+		c.Downloader = true
+		c.YtDlp = e.Fakes.YtDlp
+		c.EgressGroup = group
+		c.AllowPrivateEgress = true
+		c.Slots = 0
+	}}, mods...)
+	return e.StartWorker(desc, all...)
+}

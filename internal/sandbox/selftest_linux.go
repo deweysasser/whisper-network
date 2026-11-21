@@ -21,6 +21,50 @@ func runNetChecks(tg selfTestTargets, out map[string]string) {
 	out[CheckAbstractConnect] = outcome(dialUnix("@" + tg.abstract))
 	out[CheckUnixDgramSendto] = outcome(sendUnixDgram(tg.dgramPath))
 	out[CheckSignalParent] = outcome(unix.Kill(os.Getppid(), 0))
+	if tg.allowedTCP != "" {
+		out[CheckTCPListen] = outcome(listenTCP())
+		out[CheckTCPFastOpen] = outcome(fastOpenTo(tg.tcp))
+		out[CheckAbstractBind] = outcome(bindAbstract(tg.abstract + "-bind"))
+		out[CheckTCPConnectAllowed] = outcome(dialInet(unix.SOCK_STREAM, 0, tg.allowedTCP))
+	}
+}
+
+// listenTCP calls listen(2) on a fresh, unbound TCP socket, which binds it
+// to an ephemeral port.
+func listenTCP() error {
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+	return unix.Listen(fd, 1)
+}
+
+// bindAbstract binds one end of a fresh AF_UNIX stream socketpair to the
+// abstract name.
+func bindAbstract(name string) error {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fds[0])
+	defer unix.Close(fds[1])
+	return unix.Bind(fds[0], &unix.SockaddrUnix{Name: "@" + name})
+}
+
+// fastOpenTo sends one byte with MSG_FASTOPEN to addr from a fresh TCP
+// socket: a connect without connect(2).
+func fastOpenTo(addr string) error {
+	ap, err := netip.ParseAddrPort(addr)
+	if err != nil {
+		return err
+	}
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+	return unix.Sendto(fd, []byte("p"), unix.MSG_FASTOPEN, &unix.SockaddrInet4{Port: int(ap.Port()), Addr: ap.Addr().As4()})
 }
 
 // dialInet connects (stream) or sends one datagram (dgram) to addr.
@@ -72,7 +116,8 @@ func outcome(err error) string {
 	case errors.Is(err, unix.EACCES), errors.Is(err, unix.EPERM):
 		return OutcomeBlocked
 	case errors.Is(err, unix.EPROTONOSUPPORT), errors.Is(err, unix.EAFNOSUPPORT),
-		errors.Is(err, unix.ENOPROTOOPT), errors.Is(err, unix.ESOCKTNOSUPPORT):
+		errors.Is(err, unix.ENOPROTOOPT), errors.Is(err, unix.ESOCKTNOSUPPORT),
+		errors.Is(err, unix.EOPNOTSUPP): // e.g. MSG_FASTOPEN with TCP Fast Open disabled
 		return OutcomeUnsupported
 	}
 	return "error: " + err.Error()

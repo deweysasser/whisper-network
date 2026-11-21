@@ -135,7 +135,7 @@ func (u *UI) handleQueue(w http.ResponseWriter, r *http.Request, rc *reqCtx) err
 		CanEditMax:    rc.can(auth.ActPatchQueueMaxUpload, res),
 		CanEditWeight: rc.can(auth.ActSetQueueWeight, res),
 		Visibility:    auth.VisibilityOn(rc.P.Principal, q.Name),
-		States:        []api.JobState{api.JobPreparing, api.JobQueued, api.JobRunning, api.JobDone, api.JobFailed},
+		States:        []api.JobState{api.JobFetching, api.JobPreparing, api.JobQueued, api.JobRunning, api.JobDone, api.JobFailed},
 		Sorts:         sortChoices,
 		Back:          "/ui/queues/" + url.PathEscape(q.Name),
 		CSRF:          rc.CSRF,
@@ -158,7 +158,7 @@ func (u *UI) handleQueue(w http.ResponseWriter, r *http.Request, rc *reqCtx) err
 		if v.Grants, err = u.queueGrants(ctx, rc, q); err != nil {
 			return err
 		}
-		for _, role := range []api.Role{api.RoleQueueAdmin, api.RoleSubmit, api.RoleViewAll, api.RoleReadAll, api.RoleDeleteAll} {
+		for _, role := range []api.Role{api.RoleQueueAdmin, api.RoleSubmit, api.RoleSubmitURL, api.RoleViewAll, api.RoleReadAll, api.RoleDeleteAll} {
 			if auth.CanGrantTo(rc.P.Principal, []api.Grant{{Role: role, Scope: auth.QueueScope(q.Name)}}) == nil {
 				v.GrantRoles = append(v.GrantRoles, role)
 			}
@@ -327,7 +327,7 @@ func (u *UI) queueJobs(w http.ResponseWriter, r *http.Request, rc *reqCtx, q *st
 
 func validJobState(s api.JobState) bool {
 	switch s {
-	case api.JobPreparing, api.JobQueued, api.JobRunning, api.JobDone, api.JobFailed:
+	case api.JobFetching, api.JobPreparing, api.JobQueued, api.JobRunning, api.JobDone, api.JobFailed:
 		return true
 	}
 	return false
@@ -347,7 +347,7 @@ func (u *UI) queueGrants(ctx context.Context, rc *reqCtx, q *store.Queue) ([]gra
 	var out []grantRow
 	var ids labelIDs
 	scope := auth.QueueScope(q.Name)
-	for _, role := range []api.Role{api.RoleQueueAdmin, api.RoleSubmit, api.RoleViewAll, api.RoleReadAll, api.RoleDeleteAll, api.RoleProcess} {
+	for _, role := range []api.Role{api.RoleQueueAdmin, api.RoleSubmit, api.RoleSubmitURL, api.RoleViewAll, api.RoleReadAll, api.RoleDeleteAll, api.RoleProcess, api.RoleFetch} {
 		ps, err := st.PrincipalsWithRole(ctx, role, store.QueueScope(q.ID))
 		if err != nil {
 			return nil, err

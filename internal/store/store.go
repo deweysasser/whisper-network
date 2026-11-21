@@ -97,6 +97,17 @@ type Config struct {
 	// PrepareMinSandbox is the minimum worker sandbox level for prepare
 	// tasks. Defaults to full.
 	PrepareMinSandbox api.SandboxLevel
+	// FetchMinSandbox is the minimum worker sandbox level for a downloader
+	// to count as eligible for a queue's fetch jobs, and to be offered
+	// fetch tasks. Defaults to full.
+	FetchMinSandbox api.SandboxLevel
+	// FetchCost is the fixed scheduling cost of a fetch task. Defaults to
+	// PrepareCost.
+	FetchCost float64
+	// FetchMaxBytes is the server's upload cap (--max-upload-bytes): a
+	// fetch lease's byte cap is the queue's max_upload_bytes, never above
+	// this. Zero means no server cap (the queue's alone, or none).
+	FetchMaxBytes int64
 	// ReadConns caps the read pool. Defaults to max(4, GOMAXPROCS).
 	ReadConns int
 }
@@ -133,6 +144,12 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	}
 	if cfg.PrepareMinSandbox == "" {
 		cfg.PrepareMinSandbox = api.SandboxFull
+	}
+	if cfg.FetchCost <= 0 {
+		cfg.FetchCost = cfg.PrepareCost
+	}
+	if cfg.FetchMinSandbox == "" {
+		cfg.FetchMinSandbox = api.SandboxFull
 	}
 	if cfg.ReadConns <= 0 {
 		cfg.ReadConns = max(4, runtime.GOMAXPROCS(0))

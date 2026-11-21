@@ -1,0 +1,91 @@
+{{define "content"}}
+<h1>Fetch</h1>
+{{with .Data.Error}}<p class="notice error" role="alert">{{.}}</p>{{end}}
+{{if .Data.AnyInvalid}}<p class="notice warn" role="alert">Some policies below are invalid. An invalid policy blocks fetching from the sites it governs until you repair it (edit and save) or delete it.</p>{{end}}
+
+<section class="card">
+  <h2>Policies</h2>
+  <p class="muted">Pacing for downloads, per site and egress. The most specific policy applies: <code>site@egress</code>, then <code>site</code>, then <code>*@egress</code>, then <code>*</code>.</p>
+  <div class="scroll">
+  <table class="data fetch-policies">
+    <thead><tr>{{template "th" (col "fetch.key")}}{{template "th" (col "fetch.rules")}}{{template "th" (col "fetch.concurrency" "n")}}{{template "th" (col "fetch.backoff")}}{{template "th" (col "fetch.updated")}}{{template "th" (col "fetch.actions")}}</tr></thead>
+    <tbody>
+    {{range .Data.Policies}}
+    <tr{{if .Invalid}} class="invalid"{{end}}>
+      <td><code>{{.Key}}</code>{{if .Invalid}} <span class="badge state-rejected" title="Blocks the sites it governs until repaired or deleted">invalid</span>{{end}}
+        {{with .Invalid}}<div class="small invalid-reason">{{.}}</div>{{end}}</td>
+      <td>{{if .RulesNone}}<span class="muted">none</span>{{else}}{{.Rules}}{{end}}</td>
+      <td class="n">{{.Concurrency}}</td>
+      <td>{{.BackoffInitial}} → {{.BackoffCap}}</td>
+      <td>{{.UpdatedBy}} <span class="muted small">{{when .UpdatedAt}}</span></td>
+      <td class="row-actions">
+        <a class="button small" href="{{.EditHref}}">Edit</a>
+        {{if .CanDelete}}<form method="post" action="{{.DeleteAction}}" class="inline"
+          hx-post="{{.DeleteAction}}" hx-confirm="Delete the policy {{.Key}}?">
+          {{template "csrf" $.CSRF}}
+          <button type="submit" class="danger small">Delete</button>
+        </form>{{end}}
+      </td>
+    </tr>
+    {{end}}
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section class="card" id="policy-form">
+  <h2>{{if .Data.Editing}}Edit policy {{.Data.Editing}}{{else}}Add or replace a policy{{end}}</h2>
+  <form method="post" action="/ui/fetch/policies" class="stack">
+    {{template "csrf" .CSRF}}
+    <label>Key <input name="key" value="{{.Data.Policy.Key}}" placeholder="youtube.com or youtube.com@label:home or *" required></label>
+    <label>Rules <input name="rules" value="{{.Data.Policy.Rules}}" placeholder="1/3m 20/1h (space-separated; empty for none)"></label>
+    <label>Concurrency <input name="concurrency" type="number" min="1" value="{{or .Data.Policy.Concurrency "1"}}" required></label>
+    <label>Backoff, first <input name="backoff_initial" value="{{or .Data.Policy.BackoffInitial "5m"}}" required></label>
+    <label>Backoff, cap <input name="backoff_cap" value="{{or .Data.Policy.BackoffCap "6h"}}" required></label>
+    <div><button type="submit">Save policy</button></div>
+  </form>
+</section>
+
+<section class="card">
+  <h2>Cooldowns in force</h2>
+  <div class="scroll">
+  <table class="data fetch-cooldowns">
+    <thead><tr>{{template "th" (col "cool.egress")}}{{template "th" (col "cool.site")}}{{template "th" (col "cool.until")}}{{template "th" (col "cool.kind")}}{{template "th" (col "cool.reason")}}{{template "th" (col "cool.actions")}}</tr></thead>
+    <tbody>
+    {{range .Data.Cooldowns}}
+    <tr>
+      <td><code>{{.EgressKey}}</code></td>
+      <td><code>{{.Site}}</code></td>
+      <td title="{{when .Until}}">{{dur .Left}} left</td>
+      <td>{{if .Manual}}manual{{else}}automatic, level {{.Level}}{{end}}</td>
+      <td>{{.Reason}}{{with .SetBy}} <span class="muted small">({{.}})</span>{{end}}</td>
+      <td class="row-actions">
+        <form method="post" action="/ui/fetch/cooldowns/clear" class="inline">
+          {{template "csrf" $.CSRF}}
+          <input type="hidden" name="egress_key" value="{{.EgressKey}}">
+          <input type="hidden" name="site" value="{{.Site}}">
+          <button type="submit" class="small">Clear</button>
+        </form>
+      </td>
+    </tr>
+    {{else}}
+    <tr><td colspan="6" class="muted">No cooldowns.</td></tr>
+    {{end}}
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section class="card">
+  <h2>Set a cooldown</h2>
+  <form method="post" action="/ui/fetch/cooldowns" class="stack">
+    {{template "csrf" .CSRF}}
+    <label>Egress key <input name="egress_key" list="egress-keys" value="{{.Data.Cooldown.EgressKey}}" placeholder="label:home" required></label>
+    <datalist id="egress-keys">{{range .Data.Egress}}<option value="{{.}}">{{end}}</datalist>
+    <label>Site <input name="site" value="{{.Data.Cooldown.Site}}" placeholder="youtube.com" required></label>
+    <label>Duration <input name="duration" value="{{or .Data.Cooldown.Duration "1h"}}" required placeholder="1h (at most 168h)"></label>
+    <label>Reason <input name="reason" value="{{.Data.Cooldown.Reason}}"></label>
+    <div><button type="submit">Set cooldown</button></div>
+  </form>
+</section>
+{{end}}

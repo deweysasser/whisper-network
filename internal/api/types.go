@@ -12,6 +12,7 @@ import (
 type JobState string
 
 const (
+	JobFetching  JobState = "fetching"
 	JobPreparing JobState = "preparing"
 	JobQueued    JobState = "queued"
 	JobRunning   JobState = "running"
@@ -33,6 +34,7 @@ const (
 type TaskKind string
 
 const (
+	KindFetch      TaskKind = "fetch"
 	KindPrepare    TaskKind = "prepare"
 	KindTranscribe TaskKind = "transcribe"
 )
@@ -109,6 +111,10 @@ const (
 	RoleReadAll     Role = "read_all"
 	RoleDeleteAll   Role = "delete_all"
 	RoleProcess     Role = "process"
+	// RoleFetch lets a downloader worker fetch URLs for jobs on a queue.
+	RoleFetch Role = "fetch"
+	// RoleSubmitURL lets a client or user submit a URL to fetch on a queue.
+	RoleSubmitURL Role = "submit_url"
 )
 
 // Grant is a role bound to a scope. Scope is "*", "queue:<name>" or
@@ -121,6 +127,13 @@ type Grant struct {
 // ---------------------------------------------------------------------------
 // Client API (§6.1)
 
+// FetchRequest is the body of POST /queue/{q}/fetch: job parameters plus the
+// URL a downloader worker is to fetch.
+type FetchRequest struct {
+	JobParams
+	URL string `json:"url"`
+}
+
 // JobParams is the "params" multipart part of POST /queue/{q}.
 type JobParams struct {
 	Model    string          `json:"model"`
@@ -128,7 +141,7 @@ type JobParams struct {
 	Weight   Weight          `json:"weight,omitempty"`   // default medium
 	Prompt   string          `json:"prompt,omitempty"`   // <= MaxPromptLen chars
 	Label    string          `json:"label,omitempty"`
-	Source   string          `json:"source,omitempty"`   // recorded, never fetched
+	Source   string          `json:"source,omitempty"`   // recorded, never fetched (the fetch URL is FetchRequest.URL)
 	Metadata json.RawMessage `json:"metadata,omitempty"` // opaque, <= MaxMetadataBytes
 }
 
@@ -338,6 +351,16 @@ type Gap struct {
 // ---------------------------------------------------------------------------
 // Worker API (§6.2)
 
+// WorkerKind is fixed at registration: what kind of tasks a worker may run.
+type WorkerKind string
+
+const (
+	// WorkerProcessing runs prepare and transcribe tasks (the default).
+	WorkerProcessing WorkerKind = "processing"
+	// WorkerDownloader runs fetch tasks only.
+	WorkerDownloader WorkerKind = "downloader"
+)
+
 // WorkerFacts is what a worker reports about itself at registration and on
 // PATCH /worker/{id}.
 type WorkerFacts struct {
@@ -355,6 +378,11 @@ type WorkerFacts struct {
 	Slots         int          `json:"slots"`
 	Models        []string     `json:"models"`
 	Version       string       `json:"version,omitempty"` // whisper-network version
+	// Kind is empty for a processing worker.
+	Kind         WorkerKind `json:"kind,omitempty"`
+	YtDlpVersion string     `json:"yt_dlp_version,omitempty"`
+	EgressGroup  string     `json:"egress_group,omitempty"`
+	EgressIP     string     `json:"egress_ip,omitempty"`
 }
 
 // RegisterResponse is returned by POST /worker. Token is shown once.
@@ -369,7 +397,7 @@ type Worker struct {
 	ID         string      `json:"id"`
 	State      WorkerState `json:"state"`
 	Facts      WorkerFacts `json:"facts"`
-	Queues     []string    `json:"queues"` // queues this worker may process
+	Queues     []string    `json:"queues"` // queues this worker may process (a downloader: fetch for)
 	LastSeenAt *time.Time  `json:"last_seen_at,omitempty"`
 	// Hints from the server.
 	HeartbeatIntervalS int `json:"heartbeat_interval_s"`
@@ -400,9 +428,14 @@ type Lease struct {
 	InputBytes  int64    `json:"input_bytes,omitempty"`  // prepare: original size
 	InputSHA256 string   `json:"input_sha256,omitempty"` // prepare: original hash
 	// MaxOutputBytes (prepare) is the largest canonical FLAC the server
-	// will accept, as in Worker.MaxPrepareOutputBytes.
-	MaxOutputBytes int64  `json:"max_output_bytes,omitempty"`
-	AudioSamples   int64  `json:"audio_samples,omitempty"`
+	// will accept, as in Worker.MaxPrepareOutputBytes. For a fetch lease it
+	// is the byte cap on the download.
+	MaxOutputBytes int64 `json:"max_output_bytes,omitempty"`
+	AudioSamples   int64 `json:"audio_samples,omitempty"`
+	// URL and Site (fetch) are the URL to download and its policy site key;
+	// MaxOutputBytes is the byte cap for the download.
+	URL            string `json:"url,omitempty"`
+	Site           string `json:"site,omitempty"`
 	Model          string `json:"model,omitempty"`
 	ModelSHA256    string `json:"model_sha256,omitempty"`
 	VADModel       string `json:"vad_model,omitempty"`
@@ -492,10 +525,20 @@ type TranscribeResult struct {
 	Segments      []Segment `json:"segments"`
 }
 
-// Prepare result headers (PUT /lease/{id}/result with Content-Type audio/flac).
+// Result headers: prepare (PUT /lease/{id}/result with Content-Type
+// audio/flac) and fetch.
 const (
 	HeaderComputeMS     = "X-Compute-Ms"
 	HeaderFFmpegVersion = "X-Ffmpeg-Version"
+	// HeaderFetchMethod on a fetch result says how the media was fetched:
+	// FetchMethodYtDlp or FetchMethodHTTP (optional; for logs only).
+	HeaderFetchMethod = "X-Fetch-Method"
+)
+
+// Values of HeaderFetchMethod.
+const (
+	FetchMethodYtDlp = "yt-dlp"
+	FetchMethodHTTP  = "http"
 )
 
 // FailureReport is the body of POST /lease/{id}/failure.
@@ -528,11 +571,14 @@ const (
 	// It counts as an attempt but not toward the worker's failure streak,
 	// and the task's next lease carries NoContext.
 	StageLoop FailureStage = "loop"
+	// StageRateLimited is a fetch the origin refused for rate (HTTP 429 or
+	// similar). The server starts a cooldown for the site and egress.
+	StageRateLimited FailureStage = "rate_limited"
 )
 
 // Valid reports whether s is a known stage.
 func (s FailureStage) Valid() bool {
-	return s == StagePreWork || s == StageInput || s == StageChild
+	return s == StagePreWork || s == StageInput || s == StageChild || s == StageRateLimited
 }
 
 const MaxStderrTail = 4 << 10
@@ -568,6 +614,8 @@ const (
 	ProblemNotRetryable   = "not-retryable"
 	ProblemStorageFull    = "storage-full"
 	ProblemRateLimited    = "rate-limited"
+	ProblemNoDownloader   = "no-downloader"
+	ProblemNotMedia       = "not-media"
 	ProblemInternal       = "internal"
 )
 

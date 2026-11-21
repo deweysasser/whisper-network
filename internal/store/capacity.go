@@ -68,7 +68,7 @@ func FleetCapacity(ws []Worker, now time.Time, seenWithin time.Duration, prepare
 			}
 		}
 		c.All.add(slots, busy, deferred)
-		if slices.Contains(w.Facts.Kinds, api.KindTranscribe) {
+		if w.Kind != api.WorkerDownloader && slices.Contains(w.Facts.Kinds, api.KindTranscribe) {
 			c.Transcribe.add(slots, busy, deferred)
 		}
 		if CanPrepare(w.Facts, prepareMin) {
@@ -79,7 +79,8 @@ func FleetCapacity(ws []Worker, now time.Time, seenWithin time.Duration, prepare
 }
 
 // CanPrepare reports whether a worker with facts f may be offered prepare
-// tasks when they need sandbox level prepareMin (as Claim decides).
+// tasks when they need sandbox level prepareMin (as Claim decides: never a
+// downloader).
 func CanPrepare(f api.WorkerFacts, prepareMin api.SandboxLevel) bool {
-	return slices.Contains(f.Kinds, api.KindPrepare) && f.SandboxLevel.Rank() >= prepareMin.Rank()
+	return f.Kind != api.WorkerDownloader && slices.Contains(f.Kinds, api.KindPrepare) && f.SandboxLevel.Rank() >= prepareMin.Rank()
 }
