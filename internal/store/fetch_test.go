@@ -211,6 +211,30 @@ func TestAcceptFetchIdempotent(t *testing.T) {
 	assert.ErrorIs(t, f.s.AcceptFetch(f.ctx, pl.ID, w, FetchCompletion{Original: Media{SHA256: "z"}}), ErrInvalid)
 }
 
+func TestAcceptFetchGuards(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	d := f.downloader(api.SandboxFull, "e1", f.pubID)
+	j := f.urlJob(f.pubID, "example.com")
+	l := f.claimFetch(d)
+	require.NotNil(t, l)
+	// The job leaves fetching under the lease (as no store path does today:
+	// the guard is what keeps a stray completion from re-entering prepare).
+	_, err := f.s.w.ExecContext(f.ctx, `UPDATE jobs SET state = 'preparing' WHERE id = ?`, j.ID)
+	require.NoError(t, err)
+	err = f.s.AcceptFetch(f.ctx, l.ID, d, FetchCompletion{Original: Media{SHA256: "x"}})
+	assert.ErrorIs(t, err, ErrConflict)
+	st, _ := f.task(j.ID, FetchSeq)
+	assert.Equal(t, "leased", st, "rolled back")
+
+	f.urlJob(f.pubID, "example.com")
+	l2 := f.claimFetch(d)
+	require.NotNil(t, l2)
+	f.clk.Advance(ttl + time.Second)
+	err = f.s.AcceptFetch(f.ctx, l2.ID, d, FetchCompletion{Original: Media{SHA256: "y"}})
+	assert.ErrorIs(t, err, ErrLeaseGone)
+}
+
 func TestAcceptFetchResetsCooldownLevel(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
@@ -375,9 +399,115 @@ func TestFetchPacingPerEgressGroup(t *testing.T) {
 	for range 3 {
 		f.urlJob(f.pubID, "youtube.com")
 	}
+	l := f.claimFetch(a)
+	require.NotNil(t, l)
+	f.acceptFetch(l, "a1") // ended: only the 1/3m rule can block a2
+	assert.Nil(t, f.claimFetch(a2), "same group: 1/3m")
+	require.NotNil(t, f.claimFetch(b), "another group")
+	f.clk.Advance(3 * time.Minute)
+	require.NotNil(t, f.claimFetch(a2))
+}
+
+func TestFetchPacingAcrossQueues(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	other := f.queue("other", 0)
+	d := f.downloader(api.SandboxFull, "e1", f.pubID, other)
+	f.urlJob(f.pubID, "youtube.com")
+	f.urlJob(other, "youtube.com")
+	l := f.claimFetch(d)
+	require.NotNil(t, l)
+	f.acceptFetch(l, "a")
+	assert.Nil(t, f.claimFetch(d), "the group's 1/3m spans queues")
+	f.clk.Advance(3 * time.Minute)
+	l = f.claimFetch(d)
+	require.NotNil(t, l)
+	assert.Equal(t, other, l.QueueID)
+}
+
+func TestFetchRotationIgnoresGroupThatCannotClaim(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	a := f.downloader(api.SandboxFull, "A", f.pubID)
+	b := f.downloader(api.SandboxFull, "B", f.pubID)
+	j1 := f.urlJob(f.pubID, "example.com")
+	f.urlJob(f.pubID, "example.com")
+	lb := f.claimFetch(b)
+	require.NotNil(t, lb)
+	require.Equal(t, j1.ID, lb.JobID)
+	f.clk.Advance(time.Second)
 	require.NotNil(t, f.claimFetch(a))
-	assert.Nil(t, f.claimFetch(a2), "same group")
-	require.NotNil(t, f.claimFetch(b))
+	// B fails job1 retryably: it is pending again, but never for b.
+	_, err := f.s.Fail(f.ctx, lb.ID, b, "net", true)
+	require.NoError(t, err)
+	f.clk.Advance(3 * time.Minute)
+	assert.Nil(t, f.claimFetch(b, "A", "B"), "b failed the only pending task")
+	l := f.claimFetch(a, "A", "B")
+	require.NotNil(t, l, "B cannot take job1, so it must not hold A back")
+	assert.Equal(t, j1.ID, l.JobID)
+}
+
+func TestFetchRotationIgnoresGroupBelowSandboxFloor(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	a := f.downloader(api.SandboxFull, "A", f.pubID)
+	f.downloader(api.SandboxFSOnly, "B", f.pubID)
+	f.urlJob(f.pubID, "example.com")
+	f.urlJob(f.pubID, "example.com")
+	l := f.claimFetch(a)
+	require.NotNil(t, l)
+	f.acceptFetch(l, "x")
+	require.NotNil(t, f.claimFetch(a, "A", "B"), "B (never fetched) is below the fetch sandbox floor")
+}
+
+func TestFetchInvalidPolicyFailsClosed(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	d := f.downloader(api.SandboxFull, "e1", f.pubID)
+	_, err := f.s.w.ExecContext(f.ctx, `UPDATE fetch_policies SET rules = 'not json' WHERE key = 'youtube.com'`)
+	require.NoError(t, err)
+	f.urlJob(f.pubID, "youtube.com")
+	f.urlJob(f.pubID, "example.com")
+	l := f.claimFetch(d)
+	require.NotNil(t, l)
+	assert.Equal(t, "example.com", l.Site, "other sites still use '*'")
+	f.acceptFetch(l, "x")
+	f.clk.Advance(time.Hour)
+	assert.Nil(t, f.claimFetch(d), "youtube.com is blocked, not '*'")
+	bad, err := f.s.InvalidFetchPolicies(f.ctx)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"youtube.com"}, bad)
+	_, ok, err := f.s.NextFetchEligible(f.ctx, f.clk.Now())
+	require.NoError(t, err)
+	assert.False(t, ok, "blocked with no time it clears")
+}
+
+func TestFetchInvalidEgressPolicyFailsClosed(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	d1 := f.downloader(api.SandboxFull, "e1", f.pubID)
+	d2 := f.downloader(api.SandboxFull, "e2", f.pubID)
+	_, err := f.s.w.ExecContext(f.ctx, `INSERT INTO fetch_policies (key, site, egress_key, rules, concurrency,
+		backoff_initial_s, backoff_cap_s, updated_by, updated_at) VALUES
+		('example.com@e1', 'example.com', 'e1', '["0/1s"]', 1, 60, 60, 'x', 0)`)
+	require.NoError(t, err)
+	f.urlJob(f.pubID, "example.com")
+	assert.Nil(t, f.claimFetch(d1), "(example.com, e1) blocked")
+	require.NotNil(t, f.claimFetch(d2), "e2 is unaffected")
+}
+
+func TestFetchInvalidDefaultPolicyBlocksAll(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	d := f.downloader(api.SandboxFull, "e1", f.pubID)
+	_, err := f.s.w.ExecContext(f.ctx, `UPDATE fetch_policies SET concurrency = 0 WHERE key = '*'`)
+	require.NoError(t, err)
+	f.urlJob(f.pubID, "youtube.com")
+	f.urlJob(f.pubID, "example.com")
+	assert.Nil(t, f.claimFetch(d))
+	bad, err := f.s.InvalidFetchPolicies(f.ctx)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"*"}, bad)
 }
 
 func TestFetchConcurrencyLimit(t *testing.T) {
@@ -427,7 +557,7 @@ func TestFetchRotationPrefersLeastRecentGroup(t *testing.T) {
 	f.downloader(api.SandboxFull, "C", f.pubID)
 	f.downloader(api.SandboxFull, "D") // no fetch grant
 	assert.Nil(t, f.claimFetch(b, "A", "B", "C"), "C never fetched")
-	require.NotNil(t, f.claimFetch(b, "A", "B", "D"), "D cannot serve the queue")
+	require.NotNil(t, f.claimFetch(b, "A", "B", "D"), "D (no fetch grant) cannot serve the queue")
 
 	// A waiting group that is itself blocked does not hold others back.
 	f.clk.Advance(3 * time.Minute)
@@ -513,13 +643,19 @@ func TestFetchPoliciesFailClosed(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
 	d := f.downloader(api.SandboxFull, "e1", f.pubID)
-	// An unparsable row is skipped, not a panic: example.com falls back to '*'.
+	// An invalid row blocks its site (no panic on a 0/1s rule).
 	_, err := f.s.w.ExecContext(f.ctx, `INSERT INTO fetch_policies (key, site, egress_key, rules, concurrency,
 		backoff_initial_s, backoff_cap_s, updated_by, updated_at) VALUES
 		('example.com', 'example.com', NULL, '["0/1s"]', 1, 60, 60, 'x', 0),
 		('bad.com', 'bad.com', NULL, 'not json', 1, 60, 60, 'x', 0)`)
 	require.NoError(t, err)
 	f.urlJob(f.pubID, "example.com")
+	f.urlJob(f.pubID, "bad.com")
+	assert.Nil(t, f.claimFetch(d))
+	bad, err := f.s.InvalidFetchPolicies(f.ctx)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"bad.com", "example.com"}, bad)
+	f.urlJob(f.pubID, "fine.com")
 	require.NotNil(t, f.claimFetch(d))
 
 	_, err = f.s.w.ExecContext(f.ctx, `DELETE FROM fetch_policies WHERE key = '*'`)
@@ -543,6 +679,7 @@ func TestNextFetchEligible(t *testing.T) {
 	assert.False(t, ok, "nothing pending")
 
 	d := f.downloader(api.SandboxFull, "e1", f.pubID)
+	f.downloader(api.SandboxFull, "e2", f.pubID)
 	t0 := f.clk.Now()
 	f.urlJob(f.pubID, "youtube.com")
 	f.urlJob(f.pubID, "youtube.com")

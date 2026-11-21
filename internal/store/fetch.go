@@ -19,10 +19,25 @@ import (
 // everywhere else, and so that a fetch task sorts before it.
 const FetchSeq = -1
 
-// fetchGrantSQL is a condition (over j = jobs, with the worker principal as
-// its one argument) that the worker holds fetch on the job's queue.
-const fetchGrantSQL = `EXISTS (SELECT 1 FROM grants g WHERE g.principal = ? AND g.role = 'fetch'
+// fetchGrantFor is a condition (over j = jobs) that the worker whose
+// principal is the SQL expression principal ("?" for an argument) holds
+// fetch on the job's queue.
+func fetchGrantFor(principal string) string {
+	return `EXISTS (SELECT 1 FROM grants g WHERE g.principal = ` + principal + ` AND g.role = 'fetch'
 	AND (g.scope = '*' OR g.scope = 'queue:' || j.queue_id))`
+}
+
+// fetchGrantSQL is fetchGrantFor with the principal as its one argument.
+var fetchGrantSQL = fetchGrantFor("?")
+
+// fetchBranchSQL is the fetch branch of the claim predicate (over t = tasks,
+// j = jobs) for the downloader whose principal is the SQL expression
+// principal: a fetch task on a queue it holds fetch on. Claim adds the
+// pacing and failed-here exclusions; rotation (pacer.canServe) uses the
+// same branch for other groups' downloaders.
+func fetchBranchSQL(principal string) string {
+	return "t.kind = 'fetch' AND " + fetchGrantFor(principal)
+}
 
 // QueueHasDownloader reports whether the queue has an eligible downloader:
 // a downloader worker that is active or paused, whose sandbox level ranks at
@@ -268,9 +283,9 @@ const fetchStartsKeep = 24 * time.Hour
 
 // recordFetchStart records a fetch claim, in the claim's transaction: the
 // start for (egress, site) and the lease's egress key. It also prunes
-// starts older than the longest rule window of any policy (at least
+// starts older than the longest rule window of any policy in fp (at least
 // fetchStartsKeep).
-func (t *Tx) recordFetchStart(ctx context.Context, l *Lease, egress string, now time.Time) error {
+func (t *Tx) recordFetchStart(ctx context.Context, fp *fetchPolicies, l *Lease, egress string, now time.Time) error {
 	ms := toMS(now)
 	if _, err := t.tx.ExecContext(ctx, `INSERT INTO fetch_starts (egress_key, site, started_at) VALUES (?,?,?)`,
 		egress, l.Site, ms); err != nil {
@@ -280,11 +295,7 @@ func (t *Tx) recordFetchStart(ctx context.Context, l *Lease, egress string, now 
 		return fmt.Errorf("record fetch start: %w", err)
 	}
 	l.EgressKey = egress
-	ps, err := loadFetchPolicies(ctx, t.tx)
-	if err != nil {
-		return err
-	}
-	keep := max(fetchpolicy.LongestWindow(ps), fetchStartsKeep)
+	keep := max(fetchpolicy.LongestWindow(fp.ps), fetchStartsKeep)
 	if _, err := t.tx.ExecContext(ctx, `DELETE FROM fetch_starts WHERE started_at < ?`,
 		toMS(now.Add(-keep))); err != nil {
 		return fmt.Errorf("prune fetch starts: %w", err)
@@ -292,18 +303,30 @@ func (t *Tx) recordFetchStart(ctx context.Context, l *Lease, egress string, now 
 	return nil
 }
 
-// loadFetchPolicies reads every fetch policy. A row that does not parse or
-// validate is skipped (the admin API never writes one; a hand edit might),
-// so a bad row cannot break claims: its site falls back to the next most
-// specific policy.
-func loadFetchPolicies(ctx context.Context, q querier) ([]fetchpolicy.Policy, error) {
+// fetchPolicies is one snapshot of the fetch policy table.
+//
+// A row that does not parse or validate (the admin API never writes one; a
+// hand edit might) fails closed: it stays in ps as a placeholder with its
+// site and egress key and zero concurrency, ahead of the valid rows so that
+// it wins Resolve's ties, and so blocks whatever it would have governed --
+// the site, or (site, egress) for a site@egress row. It never falls back to
+// a less specific policy. An invalid '*' row blocks every site.
+type fetchPolicies struct {
+	ps []fetchpolicy.Policy
+	// invalid are the keys of the invalid rows, in key order.
+	invalid        []string
+	defaultInvalid bool
+}
+
+func loadFetchPolicies(ctx context.Context, q querier) (*fetchPolicies, error) {
 	rows, err := q.QueryContext(ctx, `SELECT key, site, COALESCE(egress_key, ''), rules, concurrency,
 		backoff_initial_s, backoff_cap_s FROM fetch_policies ORDER BY key`)
 	if err != nil {
 		return nil, fmt.Errorf("fetch policies: %w", err)
 	}
 	defer rows.Close()
-	var out []fetchpolicy.Policy
+	out := &fetchPolicies{}
+	var valid, bad []fetchpolicy.Policy
 	for rows.Next() {
 		var p fetchpolicy.Policy
 		var rules string
@@ -312,12 +335,41 @@ func loadFetchPolicies(ctx context.Context, q querier) ([]fetchpolicy.Policy, er
 			return nil, fmt.Errorf("fetch policies: %w", err)
 		}
 		p.BackoffInitial, p.BackoffCap = time.Duration(initial)*time.Second, time.Duration(cap)*time.Second
-		if parseFetchRules(&p, rules) != nil || p.Validate() != nil {
+		if parseFetchRules(&p, rules) == nil && p.Validate() == nil {
+			valid = append(valid, p)
 			continue
 		}
-		out = append(out, p)
+		out.invalid = append(out.invalid, p.Key)
+		if p.Key == "*" || p.Site == "*" && p.EgressKey == "" {
+			out.defaultInvalid = true
+		}
+		bad = append(bad, fetchpolicy.Policy{Key: p.Key, Site: p.Site, EgressKey: p.EgressKey})
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("fetch policies: %w", err)
+	}
+	out.ps = append(bad, valid...)
+	return out, nil
+}
+
+// resolve is the policy for (site, egress); zero Concurrency means blocked
+// (no policy, or an invalid one).
+func (fp *fetchPolicies) resolve(site, egress string) fetchpolicy.Policy {
+	if fp.defaultInvalid {
+		return fetchpolicy.Policy{}
+	}
+	return fetchpolicy.Resolve(fp.ps, site, egress)
+}
+
+// InvalidFetchPolicies returns the keys of fetch policy rows that do not
+// parse or validate, in key order. Each blocks what it governs (see
+// fetchPolicies); the server should log or meter them.
+func (s *Store) InvalidFetchPolicies(ctx context.Context) ([]string, error) {
+	fp, err := loadFetchPolicies(ctx, s.r)
+	if err != nil {
+		return nil, err
+	}
+	return fp.invalid, nil
 }
 
 func parseFetchRules(p *fetchpolicy.Policy, js string) error {
@@ -338,24 +390,17 @@ func parseFetchRules(p *fetchpolicy.Policy, js string) error {
 // pacer evaluates fetch pacing for (egress key, site) pairs against one
 // snapshot of the policies.
 type pacer struct {
-	q   querier
-	ps  []fetchpolicy.Policy
-	now time.Time
-}
-
-func newPacer(ctx context.Context, q querier, now time.Time) (*pacer, error) {
-	ps, err := loadFetchPolicies(ctx, q)
-	if err != nil {
-		return nil, err
-	}
-	return &pacer{q: q, ps: ps, now: now}, nil
+	q          querier
+	fp         *fetchPolicies
+	minSandbox api.SandboxLevel
+	now        time.Time
 }
 
 // decide is fetchpolicy.Decide for (egress, site) with its stored state. It
-// fails closed: when no policy applies (no valid '*' row) the site is
-// blocked with no time at which it clears.
+// fails closed: when no valid policy applies the site is blocked with no
+// time at which it clears.
 func (p *pacer) decide(ctx context.Context, egress, site string) (ok bool, next time.Time, err error) {
-	pol := fetchpolicy.Resolve(p.ps, site, egress)
+	pol := p.fp.resolve(site, egress)
 	if pol.Concurrency < 1 {
 		return false, time.Time{}, nil
 	}
@@ -412,21 +457,27 @@ func (p *pacer) lastStart(ctx context.Context, egress, site string) (int64, erro
 	return at.Int64, nil
 }
 
-// canServe reports whether an active downloader of egress holds fetch on
-// a queue with a pending fetch task for site. A waiting group that cannot
-// take the site's tasks must not hold others back from them.
+// canServe reports whether some downloader of egress could claim a pending
+// fetch task of site now, by the claim's own per-worker rules: an active
+// downloader at or above the fetch sandbox floor, the claim's fetch branch
+// (fetchBranchSQL: kind and grant) and the failed-here exclusion. A waiting
+// group that cannot claim the site's tasks must not hold others back from
+// them, or the site could stall.
 func (p *pacer) canServe(ctx context.Context, egress, site string) (bool, error) {
-	var ok bool
-	err := p.q.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM workers w
+	levels, err := queryStrings(ctx, p.q, `SELECT DISTINCT w.sandbox_level FROM workers w
 		WHERE w.kind = 'downloader' AND w.state = 'active' AND w.egress_key = ?
 		AND EXISTS (SELECT 1 FROM tasks t JOIN jobs j ON j.id = t.job_id
-			WHERE t.kind = 'fetch' AND t.state = 'pending' AND COALESCE(j.fetch_site, '') = ?
-			AND EXISTS (SELECT 1 FROM grants g WHERE g.principal = 'worker:' || w.id AND g.role = 'fetch'
-				AND (g.scope = '*' OR g.scope = 'queue:' || j.queue_id))))`, egress, site).Scan(&ok)
+			WHERE t.state = 'pending' AND COALESCE(j.fetch_site, '') = ?
+			AND `+fetchBranchSQL("'worker:' || w.id")+` AND NOT `+failedHereFor("w.id")+`)`, egress, site)
 	if err != nil {
 		return false, fmt.Errorf("fetch rotation: %w", err)
 	}
-	return ok, nil
+	for _, l := range levels {
+		if api.SandboxLevel(l).Rank() >= p.minSandbox.Rank() {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // pendingFetchSites lists the distinct sites of pending fetch tasks.
@@ -456,28 +507,27 @@ func queryStrings(ctx context.Context, q querier, query string, args ...any) ([]
 // from egressKey may not take now. A site is blocked when
 //
 //   - pacing says no: fetchpolicy.Decide for (egressKey, site), with the
-//     policy fetchpolicy.Resolve picks (none at all blocks: fail closed),
-//     the starts recorded in fetch_starts, the in-flight count (unended
-//     leases from egressKey on jobs of the site) and the cooldown; or
+//     policy fetchpolicy.Resolve picks from fp (no valid policy blocks:
+//     fail closed, see fetchPolicies), the starts recorded in
+//     fetch_starts, the in-flight count (unended leases from egressKey on
+//     jobs of the site) and the cooldown; or
 //   - rotation prefers another group: some other key K in waiting (egress
 //     keys with a fetch claim waiting now) is itself allowed by pacing,
-//     has an active downloader able to take the site's pending tasks, and
+//     has a downloader that could claim one of the site's pending tasks
+//     now (pacer.canServe: the claim's own worker rules), and
 //     last started a fetch of the site strictly earlier than egressKey did
 //     (never counts as earliest). Equal last starts do not block, so two
 //     groups that never fetched the site do not hold each other back.
 //
 // It runs inside the claim's transaction, so the decision and the start the
 // claim then records are atomic with respect to other claims.
-func (t *Tx) blockedFetchSites(ctx context.Context, egressKey string, waiting []string,
+func (t *Tx) blockedFetchSites(ctx context.Context, fp *fetchPolicies, egressKey string, waiting []string,
 	now time.Time) ([]string, error) {
 	sites, err := pendingFetchSites(ctx, t.tx)
 	if err != nil || len(sites) == 0 {
 		return nil, err
 	}
-	p, err := newPacer(ctx, t.tx, now)
-	if err != nil {
-		return nil, err
-	}
+	p := &pacer{q: t.tx, fp: fp, minSandbox: t.s.cfg.FetchMinSandbox, now: now}
 	var others []string
 	for _, k := range waiting {
 		if k != egressKey && !slices.Contains(others, k) {
@@ -551,10 +601,11 @@ func (s *Store) NextFetchEligible(ctx context.Context, now time.Time) (time.Time
 	if err != nil || len(keys) == 0 {
 		return time.Time{}, false, err
 	}
-	p, err := newPacer(ctx, s.r, now)
+	fp, err := loadFetchPolicies(ctx, s.r)
 	if err != nil {
 		return time.Time{}, false, err
 	}
+	p := &pacer{q: s.r, fp: fp, minSandbox: s.cfg.FetchMinSandbox, now: now}
 	var best time.Time
 	for _, k := range keys {
 		for _, site := range sites {

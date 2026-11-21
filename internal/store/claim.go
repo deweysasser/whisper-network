@@ -112,17 +112,18 @@ func (l *Lease) API(heartbeatInterval time.Duration) api.Lease {
 const processGrantSQL = `EXISTS (SELECT 1 FROM grants g WHERE g.principal = ? AND g.role = 'process'
 	AND (g.scope = '*' OR g.scope = 'queue:' || j.queue_id))`
 
-// failedHereSQL is a condition (over t = tasks and j = jobs, with the worker
-// id as its one argument) that the worker has a failed (other than before
-// work started) or expired lease on the task since the job was last retried.
-// The
-// t.attempts check skips the lookup for tasks that never failed anywhere: a
-// task's attempts count the distinct workers its failed and expired leases
-// ran on (plus one while it is leased), so it is 0 for a pending task with
-// none.
-const failedHereSQL = `(t.attempts > 0 AND EXISTS (SELECT 1 FROM leases x WHERE x.job_id = t.job_id AND x.seq = t.seq
-	AND x.worker_id = ? AND x.outcome IN ('failed','expired') AND x.stage IS NOT 'pre-work'
+// failedHereFor is a condition (over t = tasks and j = jobs) that the
+// worker whose id is the SQL expression worker ("?" for an argument) has a
+// failed (other than before work started) or expired lease on the task
+// since the job was last retried. The t.attempts check skips the lookup for
+// tasks that never failed anywhere: a task's attempts count the distinct
+// workers its failed and expired leases ran on (plus one while it is
+// leased), so it is 0 for a pending task with none.
+func failedHereFor(worker string) string {
+	return `(t.attempts > 0 AND EXISTS (SELECT 1 FROM leases x WHERE x.job_id = t.job_id AND x.seq = t.seq
+	AND x.worker_id = ` + worker + ` AND x.outcome IN ('failed','expired') AND x.stage IS NOT 'pre-work'
 	AND x.retry = j.retries))`
+}
 
 // claimant is what Claim reads about the claiming worker in its
 // transaction.
@@ -174,7 +175,7 @@ func (s *Store) eligibilitySQL(workerID string, c claimant, el Eligibility) (whe
 		}
 	}
 	if c.kind == api.WorkerDownloader && c.fetch {
-		cond := "(t.kind = 'fetch' AND " + fetchGrantSQL
+		cond := "(" + fetchBranchSQL("?")
 		args = append(args, principal)
 		if len(c.blocked) > 0 {
 			cond += " AND COALESCE(j.fetch_site, '') NOT IN (" + placeholders(len(c.blocked)) + ")"
@@ -187,7 +188,7 @@ func (s *Store) eligibilitySQL(workerID string, c claimant, el Eligibility) (whe
 	if len(kinds) == 0 {
 		return "", nil, false
 	}
-	where = "t.state = 'pending' AND (" + strings.Join(kinds, " OR ") + ") AND NOT " + failedHereSQL
+	where = "t.state = 'pending' AND (" + strings.Join(kinds, " OR ") + ") AND NOT " + failedHereFor("?")
 	args = append(args, workerID)
 	return where, args, true
 }
@@ -220,9 +221,13 @@ func (s *Store) Claim(ctx context.Context, workerID string, el Eligibility, ttl 
 		now := s.now()
 		c.fetch = c.kind == api.WorkerDownloader && slices.Contains(el.Kinds, api.KindFetch) &&
 			el.SandboxLevel.Rank() >= s.cfg.FetchMinSandbox.Rank()
+		var fp *fetchPolicies
 		if c.fetch {
 			var err error
-			if c.blocked, err = (&Tx{s: s, tx: tx}).blockedFetchSites(ctx, egress, el.WaitingGroups, now); err != nil {
+			if fp, err = loadFetchPolicies(ctx, tx); err != nil {
+				return err
+			}
+			if c.blocked, err = (&Tx{s: s, tx: tx}).blockedFetchSites(ctx, fp, egress, el.WaitingGroups, now); err != nil {
 				return err
 			}
 		}
@@ -237,7 +242,7 @@ func (s *Store) Claim(ctx context.Context, workerID string, el Eligibility, ttl 
 		if lease.Kind == api.KindFetch {
 			// In the claim's transaction, so a concurrent claim sees this
 			// start and cannot take the same slot.
-			return (&Tx{s: s, tx: tx}).recordFetchStart(ctx, lease, egress, now)
+			return (&Tx{s: s, tx: tx}).recordFetchStart(ctx, fp, lease, egress, now)
 		}
 		return nil
 	})
