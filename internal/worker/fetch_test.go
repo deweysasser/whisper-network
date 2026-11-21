@@ -4,19 +4,24 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/deweysasser/whisper-network/internal/api"
 	"github.com/deweysasser/whisper-network/internal/egress"
+	"github.com/deweysasser/whisper-network/internal/sandbox"
+	"github.com/deweysasser/whisper-network/internal/testscale"
 	"github.com/deweysasser/whisper-network/internal/worker/workertest"
 )
 
@@ -292,4 +297,122 @@ func TestEgressProbeRejectsNonGlobalIP(t *testing.T) {
 		assert.Equal(t, body, ip)
 		srv.Close()
 	}
+}
+
+func TestFetchSandboxSetupFailurePreWork(t *testing.T) {
+	var probes atomic.Int32
+	probe := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		probes.Add(1)
+		_, _ = w.Write([]byte("203.0.113.7"))
+	}))
+	defer probe.Close()
+	h := fetchHarness(t, workertest.YtDlpOK, fakeMedia)
+	// sandbox-exec fails as it does when Landlock or seccomp cannot be set up.
+	self := filepath.Join(t.TempDir(), "self")
+	require.NoError(t, os.WriteFile(self, []byte("#!/bin/sh\necho 'sandbox-exec: landlock: setup failed' >&2\nexit 126\n"), 0o755))
+	h.cfg.Self = self
+	h.cfg.AllowPrivateEgress = true
+	h.cfg.EgressProbe = probe.URL
+	h.cfg.EgressProbeInterval = 1 << 40
+	task := startFetch(t, h, workertest.Task{})
+	f := h.failure(task)
+	assert.Equal(t, api.StagePreWork, f.Stage)
+	time.Sleep(testscale.D(200 * time.Millisecond))
+	assert.Equal(t, int32(1), probes.Load(), "a sandbox failure says nothing about the network")
+}
+
+func TestYtDlpRunError(t *testing.T) {
+	exit := func(code int) error {
+		err := exec.Command("/bin/sh", "-c", fmt.Sprintf("exit %d", code)).Run()
+		require.Error(t, err)
+		return err
+	}
+	var te *taskError
+	assert.NoError(t, ytdlpRunError(nil))
+	assert.NoError(t, ytdlpRunError(exit(1)), "an exit status is the classifier's")
+	require.ErrorAs(t, ytdlpRunError(exit(sandbox.SetupFailureStatus)), &te)
+	assert.Equal(t, api.StagePreWork, te.stage)
+	require.ErrorAs(t, ytdlpRunError(fmt.Errorf("%w: starting yt-dlp: %w", errChildStart, os.ErrNotExist)), &te)
+	assert.Equal(t, api.StagePreWork, te.stage)
+	require.ErrorAs(t, ytdlpRunError(exec.ErrWaitDelay), &te)
+	assert.Equal(t, api.StageInput, te.stage)
+	assert.True(t, te.retryable)
+}
+
+func TestFetchExitZeroWithBytesIsOK(t *testing.T) {
+	h := fetchHarness(t, workertest.YtDlpOKFiltered, fakeMedia)
+	task := startFetch(t, h, workertest.Task{})
+	h.eventually(h.taskState(task, api.TaskDone), "a completed upload must stand")
+	h.waitEvent("task.done")
+	assert.NotContains(t, string(h.logs.Bytes()), `"event":"task.failed"`)
+}
+
+func TestFetchStalledUploadEndsAtTimeout(t *testing.T) {
+	const limit = 2 * time.Second
+	t.Run("yt-dlp", func(t *testing.T) {
+		h := fetchHarness(t, workertest.YtDlpEndless, fakeMedia)
+		h.cfg.Limits.FetchTimeout = limit
+		h.srv.StallResults(t)
+		start := time.Now()
+		task := startFetch(t, h, workertest.Task{})
+		f := h.failure(task)
+		assert.True(t, f.Retryable)
+		assert.Less(t, time.Since(start), limit+testscale.D(2500*time.Millisecond))
+	})
+	t.Run("GET", func(t *testing.T) {
+		media := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "audio/flac")
+			_, _ = w.Write(fakeMedia)
+			buf := make([]byte, 64<<10)
+			for r.Context().Err() == nil {
+				if _, err := w.Write(buf); err != nil {
+					return
+				}
+			}
+		}))
+		defer media.Close()
+		h := fetchHarness(t, workertest.YtDlpUnsupported, nil)
+		h.cfg.AllowPrivateEgress = true
+		h.cfg.Limits.FetchTimeout = limit
+		h.srv.StallResults(t)
+		start := time.Now()
+		task := startFetch(t, h, workertest.Task{URL: media.URL + "/a.flac"})
+		f := h.failure(task)
+		assert.True(t, f.Retryable)
+		assert.Less(t, time.Since(start), limit+testscale.D(2500*time.Millisecond))
+	})
+}
+
+func TestFetchResultFailsMidStream(t *testing.T) {
+	t.Run("503", func(t *testing.T) {
+		h := fetchHarness(t, workertest.YtDlpTrickle, fakeMedia)
+		h.srv.FailResultsEarly(1, http.StatusServiceUnavailable)
+		task := startFetch(t, h, workertest.Task{})
+		f := h.failure(task) // the endless producer was stopped, or this never comes
+		assert.True(t, f.Retryable)
+		assert.Equal(t, api.StageInput, f.Stage)
+		assert.Nil(t, h.srv.Task(task).Fetched)
+	})
+	t.Run("410", func(t *testing.T) {
+		h := fetchHarness(t, workertest.YtDlpTrickle, fakeMedia)
+		h.srv.FailResultsEarly(1, http.StatusGone)
+		task := startFetch(t, h, workertest.Task{})
+		h.eventually(func() bool {
+			return bytes.Contains(h.logs.Bytes(), []byte("lease ended by the server; task abandoned"))
+		}, "the fetch never ended after the 410")
+		assert.Empty(t, h.srv.Task(task).Failures, "a gone lease is not reported")
+	})
+}
+
+func TestFetchHeartbeat410KillsFetch(t *testing.T) {
+	h := fetchHarness(t, workertest.YtDlpTrickle, fakeMedia)
+	task := startFetch(t, h, workertest.Task{})
+	l := h.liveLease(task)
+	time.Sleep(testscale.D(300 * time.Millisecond)) // let the trickle reach the server
+	h.srv.CancelLease(l.ID)
+	h.eventually(func() bool {
+		return bytes.Contains(h.logs.Bytes(), []byte("server ended the lease; killing the task"))
+	}, "heartbeat 410 did not kill the fetch")
+	h.eventually(func() bool { return h.srv.Task(task).AbortedResults == 1 }, "the PUT was not aborted")
+	assert.Nil(t, h.srv.Task(task).Fetched)
 }

@@ -48,6 +48,10 @@ type Server struct {
 	inputCutAt     int
 	resultFailures int // remaining result PUTs to fail
 	resultStatus   int
+	earlyFailures  int // remaining result PUTs to fail before reading the body
+	earlyStatus    int
+	stallResults   bool
+	unstall        chan struct{}
 	modelDelay     time.Duration
 	ackDelay       time.Duration // between accepting a result and answering
 	modelGets      map[string]int
@@ -228,6 +232,25 @@ func (s *Server) FailResults(n, status int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.resultFailures, s.resultStatus = n, status
+}
+
+// FailResultsEarly makes the next n result uploads fail with status at
+// once, without reading the body: the answer arrives mid-stream.
+func (s *Server) FailResultsEarly(n, status int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.earlyFailures, s.earlyStatus = n, status
+}
+
+// StallResults makes every result upload stop reading its body until the
+// client goes away or the test ends.
+func (s *Server) StallResults(t testing.TB) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stallResults = true
+	s.unstall = make(chan struct{})
+	ch := s.unstall
+	t.Cleanup(func() { close(ch) }) // before the server's Close
 }
 
 // SlowResultAcks makes the server accept each result (ending the lease as
@@ -638,6 +661,26 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request, l *Lease, _ *
 }
 
 func (s *Server) result(w http.ResponseWriter, r *http.Request, l *Lease, t *Task, _ *Worker) {
+	s.mu.Lock()
+	early, status, stall, unstall := s.earlyFailures > 0, s.earlyStatus, s.stallResults, s.unstall
+	if early {
+		s.earlyFailures--
+	}
+	s.mu.Unlock()
+	if early {
+		s.mu.Lock()
+		s.resultPuts++
+		s.mu.Unlock()
+		problem(w, status, api.ProblemInternal, "")
+		return
+	}
+	if stall {
+		select {
+		case <-r.Context().Done():
+		case <-unstall:
+		}
+		return
+	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		// The upload broke off: keep nothing, as the real server does.

@@ -268,6 +268,9 @@ const (
 	YtDlpPrivate         = "private"           // a private video
 	YtDlpCrashAfterBytes = "crash-after-bytes" // print the body, pause, then fail
 	YtDlpHTML            = "html"              // print an HTML page and exit 0
+	YtDlpOKFiltered      = "ok-filtered"       // print the body, then the live filter's skip notice, and exit 0
+	YtDlpEndless         = "endless"           // print the body, then zeros as fast as possible, forever
+	YtDlpTrickle         = "trickle"           // print the body, then 1 KiB every 20 ms, forever
 )
 
 // CookiesHeader is the first line yt-dlp expects of a cookies file; the
@@ -352,6 +355,27 @@ func fakeYtDlp(args []string) int {
 		time.Sleep(500 * time.Millisecond)
 		fmt.Fprint(os.Stderr, "ERROR: unable to download video data: [Errno 104] Connection reset by peer\n")
 		return 1
+	case YtDlpOKFiltered:
+		_, _ = os.Stdout.Write(body)
+		fmt.Fprint(os.Stderr, "[download] Some Title does not pass filter (!is_live), skipping ..\n")
+		return 0
+	case YtDlpEndless, YtDlpTrickle:
+		if _, err := os.Stdout.Write(body); err != nil {
+			return 1
+		}
+		chunk := make([]byte, 64<<10)
+		if mode == YtDlpTrickle {
+			chunk = chunk[:1024]
+		}
+		for {
+			if _, err := os.Stdout.Write(chunk); err != nil {
+				fmt.Fprintf(os.Stderr, "ERROR: [Errno 32] Broken pipe\n")
+				return 1
+			}
+			if mode == YtDlpTrickle {
+				time.Sleep(20 * time.Millisecond)
+			}
+		}
 	case YtDlpHTML:
 		_, _ = os.Stdout.WriteString("<!DOCTYPE html>\n<html><head><title>Sign in</title></head><body>" +
 			strings.Repeat("<p>please sign in</p>", 100) + "</body></html>\n")

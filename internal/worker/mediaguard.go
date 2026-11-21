@@ -141,8 +141,8 @@ func (c *capReader) Read(p []byte) (int, error) {
 	if c.left < 0 {
 		return 0, errTooLarge
 	}
-	if int64(len(p)) > c.left+1 {
-		p = p[:c.left+1]
+	if c.left < int64(len(p)) {
+		p = p[:c.left+1] // one byte more than allowed reveals an overrun
 	}
 	n, err := c.r.Read(p)
 	if int64(n) > c.left {

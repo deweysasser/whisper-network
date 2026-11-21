@@ -33,6 +33,9 @@ var ytdlpEnv = []string{"PYTHONDONTWRITEBYTECODE=1", "PYTHONNOUSERSITE=1"}
 // nothing, so a plain GET may try.
 var errYtDlpUnsupported = errors.New("yt-dlp: unsupported URL")
 
+// errFetchTimeout ends a fetch, upload included, that ran past FetchTimeout.
+var errFetchTimeout = errors.New("fetch exceeded its time limit")
+
 // errUploadEnded is what a fetch's producer sees once the PUT has ended.
 var errUploadEnded = errors.New("result upload ended")
 
@@ -112,37 +115,45 @@ func (w *Worker) fetchYtDlp(ctx context.Context, l *api.Lease, dir, cookies stri
 	if !lim.NoAddressSpaceLimit {
 		spec.AddressSpace = uint64(lim.FetchAddressSpace)
 	}
-	childCtx, kill := context.WithCancel(ctx)
+	// FetchTimeout bounds the whole fetch, upload included: a server that
+	// stops reading must not hold the slot past it.
+	fetchCtx, cancelFetch := context.WithTimeoutCause(ctx, lim.FetchTimeout, errFetchTimeout)
+	defer cancelFetch()
+	childCtx, kill := context.WithCancel(fetchCtx)
 	defer kill()
-	up := w.newFetchUpload(ctx, l, api.FetchMethodYtDlp, run, kill)
+	up := w.newFetchUpload(fetchCtx, l, api.FetchMethodYtDlp, run, kill)
 	res, err := w.runChild(childCtx, childRun{
 		argv: YtDlpArgs(w.tools.ytdlp, l.URL, w.proxy.Port(), cookies), spec: spec, dir: dir,
 		timeout: lim.FetchTimeout, stdout: up, env: ytdlpEnv,
 	})
 	n, uerr := up.finish(err)
-	if uerr != nil {
-		return n, w.uploadFailure(ctx, uerr)
-	}
-	var ee *exec.ExitError
 	switch {
+	case isContentRefusal(uerr):
+		return n, w.uploadFailure(ctx, l, uerr)
 	case ctx.Err() != nil:
 		return n, context.Cause(ctx)
-	case errors.Is(err, errChildTimeout):
+	case errors.Is(context.Cause(fetchCtx), errFetchTimeout), errors.Is(err, errChildTimeout):
 		w.requestEgressProbe()
 		return n, fetchTransient("yt-dlp timed out")
-	case err != nil && !errors.As(err, &ee):
-		return n, preWork("starting yt-dlp", err)
+	case uerr != nil:
+		return n, w.uploadFailure(ctx, l, uerr)
+	case err == nil && n > 0:
+		// Exited 0 and the server took the whole stream: done, whatever
+		// the stderr says.
+		return n, nil
 	}
+	if rerr := ytdlpRunError(err); rerr != nil {
+		return n, rerr
+	}
+	var ee *exec.ExitError
+	errors.As(err, &ee)
 	// Only the class is logged: the stderr quotes the URL, the video's id
 	// and its title, even with the URL itself redacted.
 	outcome := classifyYtDlp(errOrNil(ee), redactURL(res.stderr, l.URL))
-	log.Info().Str("yt_dlp_outcome", outcome.String()).Msg("yt-dlp finished")
+	log.Info().Str(obs.FieldYtDlpOutcome, outcome.String()).Msg("yt-dlp finished")
 	switch outcome {
 	case ytdlpOK:
-		if n == 0 {
-			return 0, fetchTransient("yt-dlp produced no output")
-		}
-		return n, nil
+		return 0, fetchTransient("yt-dlp produced no output")
 	case ytdlpUnsupported:
 		if n == 0 {
 			return 0, errYtDlpUnsupported
@@ -157,6 +168,28 @@ func (w *Worker) fetchYtDlp(ctx context.Context, l *api.Lease, dir, cookies stri
 	return n, fetchTransient("yt-dlp failed")
 }
 
+// ytdlpRunError classifies how a yt-dlp child ended before its stderr is
+// looked at. A child that never started, or whose sandbox could not be set
+// up (sandbox-exec's exit 126), is the worker's own problem: pre-work, and
+// nothing to do with the network. Any other error that is not an exit
+// status (exec.ErrWaitDelay when a grandchild held stdout open, say) is a
+// transient failure mid-run. nil and ordinary exit statuses are left to
+// classifyYtDlp.
+func ytdlpRunError(err error) error {
+	var ee *exec.ExitError
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, errChildStart):
+		return preWork("starting yt-dlp", err)
+	case errors.As(err, &ee) && ee.ExitCode() == sandbox.SetupFailureStatus:
+		return preWork("setting up the yt-dlp sandbox", nil)
+	case errors.As(err, &ee):
+		return nil
+	}
+	return fetchTransient("yt-dlp failed")
+}
+
 // errOrNil returns ee as an error, or nil when it is nil (avoiding a
 // non-nil interface holding a nil pointer).
 func errOrNil(ee *exec.ExitError) error {
@@ -169,7 +202,7 @@ func errOrNil(ee *exec.ExitError) error {
 // fetchGET fetches the lease's URL with a plain GET through the egress
 // filter (each redirect hop is checked too), within FetchTimeout.
 func (w *Worker) fetchGET(ctx context.Context, l *api.Lease, run *leaseRun) (int64, error) {
-	getCtx, cancel := context.WithCancel(ctx)
+	getCtx, cancel := context.WithTimeoutCause(ctx, w.cfg.Limits.FetchTimeout, errFetchTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(getCtx, http.MethodGet, l.URL, nil)
 	if err != nil {
@@ -198,12 +231,19 @@ func (w *Worker) fetchGET(ctx context.Context, l *api.Lease, run *leaseRun) (int
 	if l.MaxOutputBytes > 0 && resp.ContentLength > l.MaxOutputBytes {
 		return 0, fetchTooLarge(l.MaxOutputBytes)
 	}
-	up := w.newFetchUpload(ctx, l, api.FetchMethodHTTP, run, cancel)
+	up := w.newFetchUpload(getCtx, l, api.FetchMethodHTTP, run, cancel)
 	_, cerr := io.Copy(up, resp.Body)
 	n, uerr := up.finish(cerr)
 	switch {
+	case isContentRefusal(uerr):
+		return n, w.uploadFailure(ctx, l, uerr)
+	case ctx.Err() != nil:
+		return n, context.Cause(ctx)
+	case errors.Is(context.Cause(getCtx), errFetchTimeout):
+		w.requestEgressProbe()
+		return n, fetchTransient("GET timed out")
 	case uerr != nil:
-		return n, w.uploadFailure(ctx, uerr)
+		return n, w.uploadFailure(ctx, l, uerr)
 	case cerr != nil:
 		return n, w.getFailure(ctx, cerr)
 	case n == 0:
@@ -227,15 +267,20 @@ func (w *Worker) getFailure(ctx context.Context, err error) error {
 	return fetchTransient("GET failed (" + class + ")")
 }
 
+// isContentRefusal reports the media guard's or the byte cap's verdict.
+func isContentRefusal(err error) bool {
+	return errors.As(err, new(errNotMedia)) || errors.Is(err, errTooLarge)
+}
+
 // uploadFailure classifies a failed result stream: the media guard or byte
 // cap tripped, the task was cancelled, or the PUT itself failed.
-func (w *Worker) uploadFailure(ctx context.Context, err error) error {
+func (w *Worker) uploadFailure(ctx context.Context, l *api.Lease, err error) error {
 	var nm errNotMedia
 	switch {
 	case errors.As(err, &nm):
 		return fetchNotMedia(nm)
 	case errors.Is(err, errTooLarge):
-		return &taskError{reason: "too large: the media exceeds the server's size limit", stage: api.StageInput}
+		return fetchTooLarge(l.MaxOutputBytes)
 	case ctx.Err() != nil:
 		return context.Cause(ctx)
 	}
@@ -288,10 +333,28 @@ type fetchUpload struct {
 	pw                     *io.PipeWriter
 	body                   *errRecorder
 	done                   chan error
+	// stopAbort unregisters the abort on the parent context's end.
+	stopAbort func() bool
 }
 
+// newFetchUpload returns the upload for a producer bounded by ctx. When ctx
+// ends (the fetch's time limit, the lease lost) the PUT is aborted and the
+// pipe closed, so neither a producer blocked writing to a server that stopped
+// reading nor the PUT outlives it.
 func (w *Worker) newFetchUpload(ctx context.Context, l *api.Lease, method string, run *leaseRun, stop func()) *fetchUpload {
-	return &fetchUpload{w: w, l: l, method: method, run: run, parent: ctx, stop: stop}
+	u := &fetchUpload{w: w, l: l, method: method, run: run, parent: ctx, stop: stop}
+	u.stopAbort = context.AfterFunc(ctx, func() { u.abort(context.Cause(ctx)) })
+	return u
+}
+
+// abort ends a started upload uncleanly with cause.
+func (u *fetchUpload) abort(cause error) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.started {
+		u.cancel()
+		u.pr.CloseWithError(cause)
+	}
 }
 
 func (u *fetchUpload) Write(p []byte) (int, error) {
@@ -338,6 +401,7 @@ func (u *fetchUpload) startLocked() {
 // is the caller's to classify, unless the PUT had failed first (and so
 // ended the producer). With no byte written, no PUT was made.
 func (u *fetchUpload) finish(prodErr error) (int64, error) {
+	defer u.stopAbort()
 	u.mu.Lock()
 	started, n := u.started, u.n
 	u.finishing = true

@@ -68,7 +68,11 @@ var errFinished = errors.New("task finished")
 
 // leaseRun is the state a lease's task shares with its heartbeat.
 type leaseRun struct {
-	// uploading is set once the result upload starts. From then on the
+	// uploading is set once the server may have the whole result: when a
+	// prepare or transcribe upload starts, and when a fetch's stream has
+	// ended cleanly (its producer finished), not while it is still
+	// streaming, since the server cannot accept a body it has not fully
+	// received and a 410 then must kill the fetch. From then on the
 	// upload's own response decides the outcome: a heartbeat's 410 may only
 	// mean the server already accepted the result (the lease ended as
 	// done) before the worker heard back, so it must not cancel the upload.

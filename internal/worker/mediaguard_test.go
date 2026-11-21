@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"math"
 	"strings"
 	"testing"
 	"testing/iotest"
@@ -64,4 +65,7 @@ func TestCapReader(t *testing.T) {
 	got, err = io.ReadAll(newCapReader(strings.NewReader("123456"), 0))
 	require.NoError(t, err)
 	assert.Equal(t, "123456", string(got), "0 means no worker-side cap")
+	got, err = io.ReadAll(newCapReader(strings.NewReader("123456"), math.MaxInt64))
+	require.NoError(t, err, "no overflow at the largest cap")
+	assert.Equal(t, "123456", string(got))
 }

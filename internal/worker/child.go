@@ -37,6 +37,9 @@ type childResult struct {
 // errChildTimeout reports a child killed for exceeding its wall-clock limit.
 var errChildTimeout = errors.New("child exceeded its time limit")
 
+// errChildStart marks a child that could not be started at all.
+var errChildStart = errors.New("child did not start")
+
 // children tracks running child PIDs for the RSS gauge.
 type children struct {
 	mu   sync.Mutex
@@ -91,7 +94,7 @@ func (w *Worker) runChild(ctx context.Context, r childRun) (childResult, error) 
 
 	start := time.Now()
 	if err := cmd.Start(); err != nil {
-		return childResult{}, fmt.Errorf("starting %s: %w", filepath.Base(r.argv[0]), err)
+		return childResult{}, fmt.Errorf("%w: starting %s: %w", errChildStart, filepath.Base(r.argv[0]), err)
 	}
 	w.children.add(cmd.Process.Pid)
 	err := sandbox.Wait(cmd)

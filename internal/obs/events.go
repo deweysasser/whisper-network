@@ -91,7 +91,10 @@ const (
 	FieldSite        = "site"
 	FieldEgressKey   = "egress_key"
 	FieldFetchMethod = "fetch_method"
-	FieldUntil       = "until"
+	// FieldYtDlpOutcome is how a yt-dlp run was classified (ok,
+	// unsupported, rate_limited, permanent, transient).
+	FieldYtDlpOutcome = "yt_dlp_outcome"
+	FieldUntil        = "until"
 	// FieldCooldownLevel is a fetch cooldown's backoff level ("level" is
 	// the log level's key) and FieldManual whether an admin set it.
 	FieldCooldownLevel = "cooldown_level"

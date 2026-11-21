@@ -8,6 +8,11 @@ import (
 // SubcommandName is the hidden CLI subcommand that applies a Spec and execs.
 const SubcommandName = "sandbox-exec"
 
+// SetupFailureStatus is sandbox-exec's exit status when it could not apply
+// the restrictions or start the command (the shell's "found but could not
+// execute").
+const SetupFailureStatus = 126
+
 // Command builds the *exec.Cmd that runs argv under sandbox-exec. self is the
 // path of the worker binary (normally os.Executable()). The context's
 // cancellation kills the process, which is how wall-clock timeouts work.
