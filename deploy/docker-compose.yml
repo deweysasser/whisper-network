@@ -10,7 +10,7 @@
 #
 # Image selection: WN_IMAGE (default ghcr.io/deweysasser/whisper-network) and
 # WN_TAG (default latest). The worker uses <image>:<tag>; the server uses
-# <image>:<tag>-server.
+# <image>:<tag>-server; the downloader uses <image>:<tag>-downloader.
 
 name: whisper-network
 
@@ -49,6 +49,24 @@ services:
     # Transcription must not compete with real work on the host.
     cpu_shares: 128
     mem_limit: 6g
+    labels: *shipped
+    restart: unless-stopped
+
+  # Fetches URL jobs (yt-dlp, or a plain GET) for the server. It talks to the
+  # internet through a filtering proxy under a Landlock sandbox; it refuses
+  # private addresses unless --allow-private-egress is given. Like any
+  # worker it must be approved in the server UI, and URL jobs also need the
+  # submit_url grant on the queue and a fetch grant for this worker.
+  # Remove this service if you do not want URL jobs.
+  downloader:
+    image: ${WN_IMAGE:-ghcr.io/deweysasser/whisper-network}:${WN_TAG:-latest}-downloader
+    command: ["worker", "--downloader", "--server", "http://server:8080", "--description", "compose-downloader"]
+    depends_on:
+      - server
+    volumes:
+      - downloader-state:/var/lib/whisper-network
+    cpu_shares: 128
+    mem_limit: 1g
     labels: *shipped
     restart: unless-stopped
 
@@ -111,5 +129,6 @@ services:
 volumes:
   server-data:
   worker-state:
+  downloader-state:
   vm-data:
   vl-data:

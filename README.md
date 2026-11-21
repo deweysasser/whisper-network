@@ -26,13 +26,14 @@ Design points:
   classes within a queue.
 - Workers are untrusted until a human approves them for specific queues.
 - ffmpeg runs only inside a sandboxed worker child process, never on the server.
+- Clients can submit a media URL instead of an upload. The server never fetches it; separate, sandboxed downloader workers do (see "URL jobs").
 - State is one SQLite file plus a blob directory: one volume to back up.
 - Logs are JSONL for VictoriaLogs; metrics are Prometheus text, scrapeable or
   pushable.
 
 Non-goals: high availability (one server, one SQLite file), diarization,
-translation, engines other than whisper.cpp, fetching media from URLs, push
-notifications. The full specification is [DESIGN.md](DESIGN.md).
+translation, engines other than whisper.cpp, downloading video (URL jobs fetch
+audio only), push notifications. The full specification is [DESIGN.md](DESIGN.md).
 
 ## How it works
 
@@ -149,6 +150,22 @@ trust, the damage a misbehaving worker can do is contained:
   [Concepts](#concepts)).
 - Who processes a job is shown only to operators (`admin`, the queue's
   `queue_admin`, or `worker_admin` over that worker), not to submitters.
+
+### URL jobs: only downloaders fetch
+
+The server never connects to a URL a client names. A client with the
+`submit_url` grant posts a URL, and a **downloader** worker (`worker
+--downloader`, its own image) fetches it with yt-dlp (or a plain GET for direct
+links) and streams the audio back as the job's media. Downloaders are a separate
+kind of worker, fixed at registration: they hold the `fetch` grant, never
+process media, and processing workers never fetch. Every connection a
+downloader makes goes through an address filter that refuses loopback, private,
+CGNAT, link-local and similar addresses (unless `--allow-private-egress`), and
+yt-dlp runs in a sandbox that may only connect to that filter's proxy port.
+Residual risk: Landlock limits TCP connects by port, not address, so a
+compromised yt-dlp could reach a host listening on the proxy's own port,
+bypassing the filter; see DESIGN.md section 13. A URL is job content and is
+never logged; logs and metrics carry only the site (`youtube.com`).
 
 ### Media is handled in a sandbox
 
@@ -279,11 +296,38 @@ queue's jobs (`--state` filters). `fetch --json` returns segments with
 absolute times. A failed job is retried from the server's copy of the media
 with `whisper-network retry "$id"`; nothing needs uploading again.
 
+### 5. Optional: URL jobs with a downloader
+
+Run a downloader from the `-downloader` image (the worker image plus yt-dlp and
+deno, without whisper or ffmpeg):
+
+```sh
+docker run -d --name wn-downloader -v wn-downloader:/var/lib/whisper-network \
+  ghcr.io/deweysasser/whisper-network:latest-downloader \
+  worker --downloader --server http://<server>:8080 --description "my downloader"
+```
+
+Approve it like a worker, but grant it `fetch` instead of `process`, and give
+clients `submit_url` on the queue (the UI's queue page offers both). Then:
+
+```sh
+id=$(whisper-network submit --url 'https://example.com/talk.mp3' --model small.en)
+```
+
+or `POST /queue/{q}/fetch` with the job params plus `url`. With no eligible
+downloader for the queue the server answers `409 no-downloader`. Fetch limits
+are per site and per egress address, set by an admin on the **Fetch** page
+(`/ui/fetch`) or `/admin/fetch-policies`: the defaults allow YouTube one fetch
+per 3 minutes and back off for 12 hours after a rate limit. Downloaders behind
+one public address should share `--egress-group NAME` (or set `--egress-probe`)
+so they are paced together. Needs a kernel with Landlock ABI 4 (Linux 6.7+) for
+the default `--fetch-min-sandbox full`.
+
 ### Compose example
 
-[deploy/](deploy/) contains a compose file with the server, one worker,
-VictoriaMetrics, VictoriaLogs, a log shipper and vmalert. It is an example, not
-a hardened deployment.
+[deploy/](deploy/) contains a compose file with the server, one worker, a
+downloader, VictoriaMetrics, VictoriaLogs, a log shipper and vmalert. It is an
+example, not a hardened deployment.
 
 ## Quick start with binaries
 
@@ -394,14 +438,16 @@ transcribe tasks go to any level because their input is server-generated WAV.
 | Role | Scope | Allows |
 |---|---|---|
 | `admin` | `*` | Everything |
-| `queue_admin` | `queue:X` | Approve workers for X; grant `submit`, `view_all`, `delete_all`, `process` on X; list jobs and read their full status; delete any job. Not transcripts |
+| `queue_admin` | `queue:X` | Approve workers for X; grant `submit`, `submit_url`, `view_all`, `delete_all`, `process`, `fetch` on X; list jobs and read their full status; delete any job. Not transcripts |
 | `worker_admin` | `*` or `worker:<id>` | Approve, pause, resume, reject and delete (once rejected) workers |
 | `client_admin` | `*` | Create and revoke API clients |
 | `submit` | `queue:X` | Create jobs; see, read and delete its own |
+| `submit_url` | `queue:X` | Create URL jobs (a downloader fetches the media); the same own-job rights as `submit` |
 | `view_all` | `queue:X` | List every job and read its full status, including prompt, metadata and submitter (not the transcript or result) |
 | `read_all` | `queue:X` | Read every job's transcript and result; implies `view_all`. Granted by admin only |
 | `delete_all` | `queue:X` | Delete any job |
-| `process` | `queue:X` | Workers: lease tasks from X |
+| `process` | `queue:X` | Processing workers: lease prepare and transcribe tasks from X |
+| `fetch` | `queue:X` | Downloader workers: lease fetch tasks from X |
 
 Upgrading from a release without `read_all` gives every existing `view_all` and
 `queue_admin` grant a matching `read_all` grant, so access is unchanged until
@@ -424,6 +470,7 @@ Client tokens (`wnc_...`) and worker tokens (`wnw_...`) go in
 |---|---|---|
 | `POST /queue/{q}` | Create a job (multipart: `params` JSON, `media`); honours `Idempotency-Key` | client |
 | `GET /queue/{q}` | List visible jobs (`state`, `since`, `limit`, `cursor`; `sort=state`, or `sort=created&order=asc\|desc`) | client |
+| `POST /queue/{q}/fetch` | Create a URL job (JSON: job params plus `url`); honours `Idempotency-Key`; `409 no-downloader` without an eligible downloader | client (`submit_url`) |
 | `POST /queue/{q}/bulk` | Retry or delete many jobs: `{"action":"retry"\|"delete", "job_ids":[...]}` or `"filter":{"state","since","cursor"}`, optional `"dry_run"`; at most 500 per request; per-job outcomes | client (authorized per job) |
 | `PATCH /queue/{q}` | Change weight, description, upload cap | admin / queue_admin |
 | `GET /job/{id}` | Job status | client |
@@ -438,7 +485,7 @@ Client tokens (`wnc_...`) and worker tokens (`wnw_...`) go in
 | `GET /lease/{id}/input` | Task input | worker |
 | `POST /lease/{id}/heartbeat`, `PUT /lease/{id}/result`, `POST /lease/{id}/failure`, `DELETE /lease/{id}` | Lease lifecycle | worker |
 | `GET /models/{name}` | Pinned model file | worker |
-| `/admin/...` | Workers, queues, users, clients, grants, audit | user or client with admin roles |
+| `/admin/...` | Workers, queues, users, clients, grants, audit; `fetch-policies` and `fetch-cooldowns` (per-site fetch limits, admin only) | user or client with admin roles |
 | `GET /admin/version` | The server's own version, `{"version":"v0.5.0"}`, to compare with workers' `facts.version` in `GET /admin/workers` | admin, worker_admin, queue_admin |
 | `GET /healthz`, `GET /readyz` | Liveness, readiness | none |
 | `/ui/` | Web UI | user |
@@ -483,6 +530,7 @@ for the authoritative list.
 | `--class-weights` | `low=1,medium=2,high=4` | `WHISPER_CLASS_WEIGHTS` | Job weight-class shares |
 | `--model-factors` | `small.en=1,large-v3-turbo=3` | `WHISPER_MODEL_FACTORS` | Scheduling cost factor per model |
 | `--prepare-min-sandbox` | `full` | `WHISPER_PREPARE_MIN_SANDBOX` | `full`, `fs-only` or `none`: least sandbox level for prepare tasks |
+| `--fetch-min-sandbox` | `full` | `WHISPER_FETCH_MIN_SANDBOX` | `full`, `fs-only` or `none`: least sandbox level for a downloader to get fetch tasks. `full` means filesystem restricted and TCP connect limited to its egress proxy (Landlock ABI 4+) |
 | `--max-upload-bytes` | `2GiB` | `WHISPER_MAX_UPLOAD_BYTES` | Default upload cap (a queue may set a lower one). Raise it for large media, e.g. `13GiB` for 12 GB videos; a file is prepared only on a worker with room for it, and fails after `--retry-wait-limit` if no worker has |
 | `--min-free-bytes` | `1GiB` | `WHISPER_MIN_FREE_BYTES` | Refuse uploads below this much free disk |
 | `--audio-retention` | `24h` | `WHISPER_AUDIO_RETENTION` | Keep canonical audio this long after a job is done |
@@ -515,6 +563,13 @@ for the authoritative list.
 | `--max-host-load` | `70` | `WHISPER_MAX_HOST_LOAD` | Stop claiming new tasks while the host's CPU use by other processes (percent, 1-minute average, excluding this worker and its children) is above this; running tasks continue. `0` disables. Linux only |
 | `--max-host-load-resume` | `60` | `WHISPER_MAX_HOST_LOAD_RESUME` | Resume claiming once that load falls below this (at most `--max-host-load`) |
 | `--kinds` | `prepare,transcribe` | `WHISPER_KINDS` | Task kinds to accept |
+| `--downloader` | off | `WHISPER_DOWNLOADER` | Run as a downloader: fetch URL jobs with yt-dlp instead of processing media. Fixed at registration; needs yt-dlp (2022.11 or later), not ffmpeg or whisper-cli; 2 slots by default |
+| `--yt-dlp` | `yt-dlp` | `WHISPER_YT_DLP` | yt-dlp binary (downloader) |
+| `--yt-dlp-cookies` | | `WHISPER_YT_DLP_COOKIES` | Cookies file passed to yt-dlp, copied per fetch (downloader) |
+| `--egress-group` | | `WHISPER_EGRESS_GROUP` | Name shared by downloaders that leave through the same address, so the server rate-limits them together (downloader) |
+| `--egress-probe` | | `WHISPER_EGRESS_PROBE` | URL returning this downloader's public IP as text, e.g. `https://api.ipify.org` (downloader; optional) |
+| `--allow-private-egress` | off | `WHISPER_ALLOW_PRIVATE_EGRESS` | Let the downloader reach loopback, private and link-local addresses; disables the SSRF filter (downloader) |
+| `--fetch-timeout` | `2h` | `WHISPER_FETCH_TIMEOUT` | Time limit of one fetch (downloader) |
 | `--whisper-cli` | `whisper-cli` | `WHISPER_WHISPER_CLI` | whisper-cli binary |
 | `--ffmpeg` | `ffmpeg` | `WHISPER_FFMPEG` | ffmpeg binary |
 | `--engine-version` | probed | `WHISPER_ENGINE_VERSION` | Override the reported engine version |
@@ -535,7 +590,7 @@ All of them take `--server` (`WHISPER_SERVER`) and `--token` (`WHISPER_TOKEN`).
 
 | Command | Flags |
 |---|---|
-| `submit <file>` | `--queue` (`public`), `--model` (`small.en`), `--language` (server default `en`; `auto` allowed), `--weight` (`low`, `medium`, `high`), `--prompt` (at most 800 characters), `--label`, `--source` (recorded, never fetched), `--metadata` (JSON object), `--idempotency-key`, `--json` (print the job document instead of its ID) |
+| `submit <file>` or `submit --url <url>` | `--url` (a media URL for a downloader to fetch instead of a file; needs `submit_url`), `--queue` (`public`), `--model` (`small.en`), `--language` (server default `en`; `auto` allowed), `--weight` (`low`, `medium`, `high`), `--prompt` (at most 800 characters), `--label`, `--source` (recorded, never fetched; defaults to the URL with `--url`), `--metadata` (JSON object), `--idempotency-key`, `--json` (print the job document instead of its ID) |
 | `status [<job-id>]` | `--queue` (`public`), `--state`, `--sort` (`created`, `newest`, `state`), `--limit` (`50`). With a job ID, prints that job; otherwise lists the queue |
 | `fetch <job-id>` | `-o/--output` (file instead of stdout), `--json` (`result.json` instead of text), `--partial` (a job that is not done: what exists so far, gaps marked) |
 | `retry [<job-id>]` | With a job ID, retries that failed job. Otherwise retries the queue's failed jobs: `--queue` (`public`), `--since` (failed after, RFC 3339), `--dry-run` (list, change nothing), `--json` |
@@ -616,6 +671,9 @@ Key series: `whisper_jobs`, `whisper_tasks`, `whisper_queue_backlog_cost`,
 `whisper_worker_info` (labels include `version`, `engine_version`),
 `whisper_server_info{version}`,
 `whisper_worker_slots_busy`, `whisper_task_realtime_factor`,
+`whisper_fetch_total{site,outcome}`, `whisper_fetch_bytes_total{site}`,
+`whisper_fetch_cooldowns`, `whisper_fetch_blocked_tasks`,
+`whisper_fetch_invalid_policies`,
 `whisper_data_free_bytes`, `whisper_storage_bytes` (`kind="failed"`: media held
 for failed jobs), `whisper_failed_jobs_retryable`.
 

@@ -3,6 +3,8 @@
 # Targets:
 #   worker (default)  whisper-network + whisper-cli + ffmpeg. Can also run `server`.
 #   server            whisper-network only, on distroless (no media tools at all).
+#   downloader        whisper-network + yt-dlp + deno, for `worker --downloader`
+#                     (no whisper-cli, no ffmpeg).
 
 # Base images are pinned by digest for reproducible builds; dependabot's docker
 # ecosystem updates the tag and digest together.
@@ -15,6 +17,16 @@ ARG WHISPER_RELEASE=1.9.5
 ARG WHISPER_VERSION=v${WHISPER_RELEASE}
 # Commit that WHISPER_VERSION must resolve to (guards against a moved tag).
 ARG WHISPER_COMMIT=d1be6fde11ac6e0407606b4e42fe72d34add8037
+
+# yt-dlp (standalone release binary) and deno (the JS runtime yt-dlp uses for
+# some extractors), both verified against pinned checksums. The weekly
+# ytdlp-bump workflow updates the YTDLP_* values.
+ARG YTDLP_VERSION=2026.10.26
+ARG YTDLP_SHA256_AMD64=767ba9dce7052aa196f8b12652f433d76de128ba168966fa84b6394d5e6c6795
+ARG YTDLP_SHA256_ARM64=e87e9533e89fe5889abaa21f5114dfe7756d6aa6219b83551add04d48b18e483
+ARG DENO_VERSION=2.9.8
+ARG DENO_SHA256_AMD64=e890975bc2549807bbcc0b584ffafda72cc7c93349dd99c80483dd784f6c4609
+ARG DENO_SHA256_ARM64=d49596c20b9788cf8f5d8ddf644103d4bde56ed239753f0bdb92ba9361d51905
 
 FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS debian
 # The Go toolchain runs on the build host's platform and cross-compiles, so
@@ -100,3 +112,47 @@ USER 10001
 VOLUME ["/var/lib/whisper-network"]
 ENTRYPOINT ["/usr/local/bin/whisper-network"]
 CMD ["worker", "--help"]
+
+# ---------------------------------------------------------------------------
+# Downloader tools: fetched and checksum-verified here so the final image
+# needs neither curl nor unzip.
+FROM debian AS downloader-tools
+ARG TARGETARCH
+ARG YTDLP_VERSION
+ARG YTDLP_SHA256_AMD64
+ARG YTDLP_SHA256_ARM64
+ARG DENO_VERSION
+ARG DENO_SHA256_AMD64
+ARG DENO_SHA256_ARM64
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl unzip ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /dl
+RUN set -eu; \
+    case "${TARGETARCH}" in \
+      amd64) ytdlp_file=yt-dlp_linux;         ytdlp_sha="${YTDLP_SHA256_AMD64}"; deno_arch=x86_64;  deno_sha="${DENO_SHA256_AMD64}" ;; \
+      arm64) ytdlp_file=yt-dlp_linux_aarch64; ytdlp_sha="${YTDLP_SHA256_ARM64}"; deno_arch=aarch64; deno_sha="${DENO_SHA256_ARM64}" ;; \
+      *) echo "unsupported architecture ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o yt-dlp "https://github.com/yt-dlp/yt-dlp/releases/download/${YTDLP_VERSION}/${ytdlp_file}"; \
+    echo "${ytdlp_sha}  yt-dlp" | sha256sum -c -; \
+    curl -fsSL -o deno.zip "https://github.com/denoland/deno/releases/download/v${DENO_VERSION}/deno-${deno_arch}-unknown-linux-gnu.zip"; \
+    echo "${deno_sha}  deno.zip" | sha256sum -c -; \
+    unzip -q deno.zip deno; \
+    chmod 0755 yt-dlp deno
+
+# ---------------------------------------------------------------------------
+# Downloader worker: fetches URL jobs through a filtering proxy under a
+# Landlock sandbox. No whisper or ffmpeg: it never processes media.
+FROM debian AS downloader
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd --system --uid 10001 --home-dir /var/lib/whisper-network --create-home whisper
+COPY --from=downloader-tools /dl/yt-dlp /dl/deno /usr/local/bin/
+RUN yt-dlp --version && deno --version
+COPY --from=builder /out/whisper-network /usr/local/bin/whisper-network
+USER 10001
+VOLUME ["/var/lib/whisper-network"]
+ENTRYPOINT ["/usr/local/bin/whisper-network"]
+CMD ["worker", "--downloader", "--help"]
