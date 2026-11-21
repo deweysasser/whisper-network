@@ -137,7 +137,8 @@ func (s *Store) checkLive(l leaseRow, now time.Time) error {
 func (s *Store) endLease(ctx context.Context, tx *sql.Tx, l leaseRow, outcome api.LeaseOutcome,
 	retryable bool, reason string, stage api.FailureStage, now time.Time) (*LeaseEnd, error) {
 	if outcome != api.OutcomeFailed || !stage.Valid() && stage != api.StageLoop ||
-		stage == api.StagePreWork && !s.preWorkRefund() {
+		stage == api.StagePreWork && !s.preWorkRefund() ||
+		stage == api.StageRateLimited && l.Kind != api.KindFetch {
 		stage = "" // a pre-work failure then counts as an ordinary one
 	}
 	// A loop is the model's failure, not the worker's: it counts as an
@@ -153,10 +154,15 @@ func (s *Store) endLease(ctx context.Context, tx *sql.Tx, l leaseRow, outcome ap
 		return nil, err
 	}
 	preWork := stage == api.StagePreWork
+	// A rate-limited fetch is the site's refusal, not the worker's or the
+	// input's: like pre-work it requeues with no attempt and no exclusion,
+	// but it is not a failure of the worker at all (no streak), and it sets
+	// a cooldown on its egress group x site.
+	rateLimited := stage == api.StageRateLimited
 	if err := countLeaseEnd(ctx, tx, l.WorkerID, outcome); err != nil {
 		return nil, err
 	}
-	pause, err := s.trackFailureStreak(ctx, tx, l, outcome, (retryable || preWork) && !loop, preWork, now)
+	pause, err := s.trackFailureStreak(ctx, tx, l, outcome, (retryable || preWork) && !loop && !rateLimited, preWork, now)
 	if err != nil {
 		return nil, err
 	}
@@ -172,19 +178,29 @@ func (s *Store) endLease(ctx context.Context, tx *sql.Tx, l leaseRow, outcome ap
 		return nil, err
 	}
 
+	if rateLimited {
+		if err := s.startRateLimitCooldown(ctx, tx, l, now); err != nil {
+			return nil, err
+		}
+	}
+
 	switch {
-	case (preWork || retryable && end.Attempt < s.cfg.MaxAttempts) && !failing:
+	case (preWork || rateLimited || retryable && end.Attempt < s.cfg.MaxAttempts) && !failing:
 		if err := reactivate(ctx, tx, l.QueueID, l.Weight); err != nil {
 			return nil, err
 		}
+		// A rate-limited task keeps its pending_since, so FailStranded
+		// measures the wait from when it first became pending.
+		pendingSince := sql.NullInt64{Int64: toMS(now), Valid: !rateLimited}
 		if _, err := tx.ExecContext(ctx, `UPDATE tasks SET state = 'pending', attempts = ?,
-			error = COALESCE(?, error), pending_since = ? WHERE job_id = ? AND seq = ? AND state = 'leased'`,
-			end.Attempt, errText, toMS(now), l.JobID, l.Seq); err != nil {
+			error = COALESCE(?, error), pending_since = COALESCE(?, pending_since)
+			WHERE job_id = ? AND seq = ? AND state = 'leased'`,
+			end.Attempt, errText, pendingSince, l.JobID, l.Seq); err != nil {
 			return nil, fmt.Errorf("requeue task: %w", err)
 		}
 		end.Requeued = true
 		return end, nil
-	case preWork || retryable && end.Attempt < s.cfg.MaxAttempts:
+	case preWork || rateLimited || retryable && end.Attempt < s.cfg.MaxAttempts:
 		// The task could run again, but its job is failing.
 		if _, err := tx.ExecContext(ctx, `UPDATE tasks SET state = ?, attempts = ?, error = COALESCE(?, error)
 			WHERE job_id = ? AND seq = ? AND state = 'leased'`,
@@ -235,7 +251,7 @@ func failedAttempts(kind api.TaskKind, seq int, workers []string) string {
 // countedFailureSQL is a condition (over leases, unqualified) that a lease
 // counts as a failed attempt: it failed, other than before work started, or
 // expired, since the job was last retried (leases.retry, DESIGN.md §4.2).
-const countedFailureSQL = `outcome IN ('failed','expired') AND stage IS NOT 'pre-work'
+const countedFailureSQL = `outcome IN ('failed','expired') AND stage IS NOT 'pre-work' AND stage IS NOT 'rate_limited'
 	AND retry = (SELECT retries FROM jobs WHERE jobs.id = leases.job_id)`
 
 // failedOn returns the distinct workers that failed a task (not counting

@@ -30,6 +30,12 @@ type StrandedTask struct {
 // that took it since then failed it, and no other eligible worker has taken
 // it (DESIGN.md §8.2). Each such task fails for good and makes its job
 // failing, with a reason naming the workers that failed it. The reaper calls it; limit must be positive.
+//
+// It also fails a pending fetch task that has been pending for limit (since
+// the task first became pending: a rate-limited requeue does not restart
+// the wait) and has a rate_limited lease in the job's current retry: every
+// downloader that tried the site was refused. Its job error is
+// "rate limited by <site> on every downloader for <limit>".
 func (s *Store) FailStranded(ctx context.Context, limit time.Duration) ([]StrandedTask, error) {
 	if limit <= 0 {
 		return nil, fmt.Errorf("%w: retry wait limit must be positive", ErrInvalid)
@@ -45,27 +51,36 @@ func (s *Store) FailStranded(ctx context.Context, limit time.Duration) ([]Strand
 		// outcome, so it has waited since then. The first subquery is
 		// served by leases_task_failures and rules out most tasks before
 		// the second, which looks at leases ended since the cutoff.
-		rows, err := tx.QueryContext(ctx, `SELECT t.job_id, t.seq, t.kind, COALESCE(t.error, '') FROM tasks t
-			WHERE t.state = 'pending' AND t.attempts > 0
+		//
+		// The rate-limited branch needs no attempts: such a lease is
+		// refunded, and the task keeps its pending_since.
+		const rateLimitedSQL = `(t.kind = 'fetch' AND t.pending_since <= ?
+			AND EXISTS (SELECT 1 FROM leases r WHERE r.job_id = t.job_id AND r.seq = t.seq
+				AND r.stage = 'rate_limited' AND r.retry = j.retries))`
+		rows, err := tx.QueryContext(ctx, `SELECT t.job_id, t.seq, t.kind, COALESCE(t.error, ''),
+			COALESCE(j.fetch_site, ''), `+rateLimitedSQL+` FROM tasks t JOIN jobs j ON j.id = t.job_id
+			WHERE t.state = 'pending' AND (`+rateLimitedSQL+` OR t.attempts > 0
 			AND (SELECT MAX(x.ended_at) FROM leases x WHERE x.job_id = t.job_id AND x.seq = t.seq
-				AND x.outcome IN ('failed','expired') AND x.stage IS NOT 'pre-work'
-				AND x.retry = (SELECT retries FROM jobs WHERE id = t.job_id)) <= ?
+				AND x.outcome IN ('failed','expired') AND x.stage IS NOT 'pre-work' AND x.stage IS NOT 'rate_limited'
+				AND x.retry = j.retries) <= ?
 			AND NOT EXISTS (SELECT 1 FROM leases y WHERE y.job_id = t.job_id AND y.seq = t.seq
-				AND (y.ended_at IS NULL OR y.ended_at > ?))
-			ORDER BY t.job_id, t.seq`, cutoff, cutoff)
+				AND (y.ended_at IS NULL OR y.ended_at > ?)))
+			ORDER BY t.job_id, t.seq`, cutoff, cutoff, cutoff, cutoff)
 		if err != nil {
 			return fmt.Errorf("stranded tasks: %w", err)
 		}
-		var errs []string
+		var errs, sites []string
+		var rl []bool
 		for rows.Next() {
 			var st StrandedTask
-			var e string
-			if err := rows.Scan(&st.JobID, &st.Seq, &st.Kind, &e); err != nil {
+			var e, site string
+			var isRL bool
+			if err := rows.Scan(&st.JobID, &st.Seq, &st.Kind, &e, &site, &isRL); err != nil {
 				rows.Close()
 				return fmt.Errorf("stranded tasks: %w", err)
 			}
 			out = append(out, st)
-			errs = append(errs, e)
+			errs, sites, rl = append(errs, e), append(sites, site), append(rl, isRL)
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
@@ -80,10 +95,14 @@ func (s *Store) FailStranded(ctx context.Context, limit time.Duration) ([]Strand
 			if st.Workers, err = failedOn(ctx, tx, st.JobID, st.Seq); err != nil {
 				return err
 			}
-			st.Reason = failedAttempts(st.Kind, st.Seq, st.Workers) + "; no other eligible worker took it within " +
-				shortDuration(limit)
-			if errs[i] != "" {
-				st.Reason += ": " + errs[i]
+			if rl[i] {
+				st.Reason = "rate limited by " + sites[i] + " on every downloader for " + shortDuration(limit)
+			} else {
+				st.Reason = failedAttempts(st.Kind, st.Seq, st.Workers) + "; no other eligible worker took it within " +
+					shortDuration(limit)
+				if errs[i] != "" {
+					st.Reason += ": " + errs[i]
+				}
 			}
 			if _, err := tx.ExecContext(ctx, `UPDATE tasks SET state = 'failed' WHERE job_id = ? AND seq = ?`,
 				st.JobID, st.Seq); err != nil {

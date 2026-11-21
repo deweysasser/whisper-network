@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/deweysasser/whisper-network/internal/api"
@@ -619,4 +620,189 @@ func (s *Store) NextFetchEligible(ctx context.Context, now time.Time) (time.Time
 		}
 	}
 	return best, !best.IsZero(), nil
+}
+
+// fallbackBackoff is the cooldown backoff when neither the governing policy
+// nor the '*' policy is usable (see rateLimitBackoff).
+var fallbackBackoff = fetchpolicy.Policy{BackoffInitial: 12 * time.Hour, BackoffCap: 24 * time.Hour}
+
+// rateLimitBackoff is the policy whose backoff applies to (site, egress): the
+// one the claim resolves. When that is blocked (an invalid row, or no
+// policy) the '*' policy's values are used if valid, else fallbackBackoff,
+// so a rate limit always cools the pair down.
+func (fp *fetchPolicies) rateLimitBackoff(site, egress string) fetchpolicy.Policy {
+	if p := fp.resolve(site, egress); p.Concurrency >= 1 {
+		return p
+	}
+	for _, p := range fp.ps {
+		if p.Key == "*" && p.Concurrency >= 1 {
+			return p
+		}
+	}
+	return fallbackBackoff
+}
+
+// startRateLimitCooldown, in the transaction that ended l with stage
+// rate_limited, cools down l's (egress key, site): until = now +
+// Backoff(policy, level) with the row's level before it is incremented.
+//
+// An existing manual row whose until is later than that is left unchanged
+// (a rate limit never shortens a manual cooldown). Otherwise the row becomes
+// automatic with the new until and level+1, replacing a shorter manual one.
+func (s *Store) startRateLimitCooldown(ctx context.Context, tx *sql.Tx, l leaseRow, now time.Time) error {
+	var egress, site string
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(l.egress_key, ''), COALESCE(j.fetch_site, '')
+		FROM leases l LEFT JOIN jobs j ON j.id = l.job_id WHERE l.id = ?`, l.ID).Scan(&egress, &site); err != nil {
+		return fmt.Errorf("rate limit cooldown: %w", err)
+	}
+	fp, err := loadFetchPolicies(ctx, tx)
+	if err != nil {
+		return err
+	}
+	var until int64
+	var level int
+	var manual bool
+	err = tx.QueryRowContext(ctx, `SELECT until, level, manual FROM fetch_cooldowns WHERE egress_key = ? AND site = ?`,
+		egress, site).Scan(&until, &level, &manual)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("rate limit cooldown: %w", err)
+	}
+	next := toMS(now.Add(fetchpolicy.Backoff(fp.rateLimitBackoff(site, egress), level)))
+	if manual && until > next {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO fetch_cooldowns (egress_key, site, until, level, manual, set_by, reason)
+		VALUES (?, ?, ?, ?, 0, ?, 'rate limited')
+		ON CONFLICT (egress_key, site) DO UPDATE SET until = excluded.until, level = excluded.level, manual = 0,
+		set_by = excluded.set_by, reason = excluded.reason`,
+		egress, site, next, level+1, SystemActor); err != nil {
+		return fmt.Errorf("rate limit cooldown: %w", err)
+	}
+	return nil
+}
+
+// FetchPolicies returns the valid fetch policies in key order. Rows that do
+// not parse or validate are omitted (see InvalidFetchPolicies).
+func (s *Store) FetchPolicies(ctx context.Context) ([]fetchpolicy.Policy, error) {
+	fp, err := loadFetchPolicies(ctx, s.r)
+	if err != nil {
+		return nil, err
+	}
+	var out []fetchpolicy.Policy
+	for _, p := range fp.ps {
+		if p.Concurrency >= 1 {
+			out = append(out, p)
+		}
+	}
+	slices.SortFunc(out, func(a, b fetchpolicy.Policy) int { return strings.Compare(a.Key, b.Key) })
+	return out, nil
+}
+
+// PutFetchPolicy inserts or replaces a fetch policy, recording by as the
+// editor. It is ErrInvalid unless the policy validates, every rule parses
+// and Key is the Site or Site@EgressKey. created reports an insert.
+func (t *Tx) PutFetchPolicy(ctx context.Context, p fetchpolicy.Policy, by string) (created bool, err error) {
+	if err := p.Validate(); err != nil {
+		return false, fmt.Errorf("%w: %v", ErrInvalid, err)
+	}
+	want := p.Site
+	if p.EgressKey != "" {
+		want += "@" + p.EgressKey
+	}
+	if p.Key != want {
+		return false, fmt.Errorf("%w: policy key %q must be %q", ErrInvalid, p.Key, want)
+	}
+	rules := make([]string, 0, len(p.Rules))
+	for _, r := range p.Rules {
+		if _, err := fetchpolicy.ParseRule(r.String()); err != nil {
+			return false, fmt.Errorf("%w: rule %s: %v", ErrInvalid, r, err)
+		}
+		rules = append(rules, r.String())
+	}
+	js, err := json.Marshal(rules)
+	if err != nil {
+		return false, fmt.Errorf("put fetch policy: %w", err)
+	}
+	var n int
+	if err := t.tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM fetch_policies WHERE key = ?`, p.Key).Scan(&n); err != nil {
+		return false, fmt.Errorf("put fetch policy: %w", err)
+	}
+	var egress sql.NullString
+	if p.EgressKey != "" {
+		egress = sql.NullString{String: p.EgressKey, Valid: true}
+	}
+	if _, err := t.tx.ExecContext(ctx, `INSERT INTO fetch_policies (key, site, egress_key, rules, concurrency,
+		backoff_initial_s, backoff_cap_s, updated_by, updated_at) VALUES (?,?,?,?,?,?,?,?,?)
+		ON CONFLICT (key) DO UPDATE SET site = excluded.site, egress_key = excluded.egress_key,
+		rules = excluded.rules, concurrency = excluded.concurrency, backoff_initial_s = excluded.backoff_initial_s,
+		backoff_cap_s = excluded.backoff_cap_s, updated_by = excluded.updated_by, updated_at = excluded.updated_at`,
+		p.Key, p.Site, egress, string(js), p.Concurrency, int64(p.BackoffInitial/time.Second),
+		int64(p.BackoffCap/time.Second), by, toMS(t.s.now())); err != nil {
+		return false, fmt.Errorf("put fetch policy: %w", err)
+	}
+	return n == 0, nil
+}
+
+// DeleteFetchPolicy removes a fetch policy. The '*' default cannot be
+// deleted (ErrConflict); an unknown key is ErrNotFound.
+func (t *Tx) DeleteFetchPolicy(ctx context.Context, key string) error {
+	if key == "*" {
+		return fmt.Errorf("%w: the default fetch policy cannot be deleted", ErrConflict)
+	}
+	res, err := t.tx.ExecContext(ctx, `DELETE FROM fetch_policies WHERE key = ?`, key)
+	if err != nil {
+		return fmt.Errorf("delete fetch policy: %w", err)
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return fmt.Errorf("delete fetch policy: %w", err)
+	} else if n == 0 {
+		return fmt.Errorf("fetch policy %q: %w", key, ErrNotFound)
+	}
+	return nil
+}
+
+// FetchCooldowns returns the cooldowns in force at now (until after now),
+// earliest first.
+func (s *Store) FetchCooldowns(ctx context.Context, now time.Time) ([]api.FetchCooldown, error) {
+	rows, err := s.r.QueryContext(ctx, `SELECT egress_key, site, until, level, manual, set_by, reason
+		FROM fetch_cooldowns WHERE until > ? ORDER BY until, egress_key, site`, toMS(now))
+	if err != nil {
+		return nil, fmt.Errorf("fetch cooldowns: %w", err)
+	}
+	defer rows.Close()
+	var out []api.FetchCooldown
+	for rows.Next() {
+		var c api.FetchCooldown
+		var until int64
+		if err := rows.Scan(&c.EgressKey, &c.Site, &until, &c.Level, &c.Manual, &c.SetBy, &c.Reason); err != nil {
+			return nil, fmt.Errorf("fetch cooldowns: %w", err)
+		}
+		c.Until = fromMS(until)
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// SetCooldown manually cools (egressKey, site) down until until, replacing
+// any existing row. An existing row's level is kept (so the automatic
+// backoff resumes where it was); a new row starts at 0.
+func (t *Tx) SetCooldown(ctx context.Context, egressKey, site string, until time.Time, by, reason string) error {
+	if _, err := t.tx.ExecContext(ctx, `INSERT INTO fetch_cooldowns (egress_key, site, until, level, manual, set_by, reason)
+		VALUES (?, ?, ?, 0, 1, ?, ?)
+		ON CONFLICT (egress_key, site) DO UPDATE SET until = excluded.until, manual = 1,
+		set_by = excluded.set_by, reason = excluded.reason`,
+		egressKey, site, toMS(until), by, reason); err != nil {
+		return fmt.Errorf("set cooldown: %w", err)
+	}
+	return nil
+}
+
+// ClearCooldown deletes the cooldown row of (egressKey, site), if any, which
+// also resets its level.
+func (t *Tx) ClearCooldown(ctx context.Context, egressKey, site string) error {
+	if _, err := t.tx.ExecContext(ctx, `DELETE FROM fetch_cooldowns WHERE egress_key = ? AND site = ?`,
+		egressKey, site); err != nil {
+		return fmt.Errorf("clear cooldown: %w", err)
+	}
+	return nil
 }

@@ -122,7 +122,7 @@ const processGrantSQL = `EXISTS (SELECT 1 FROM grants g WHERE g.principal = ? AN
 func failedHereFor(worker string) string {
 	return `(t.attempts > 0 AND EXISTS (SELECT 1 FROM leases x WHERE x.job_id = t.job_id AND x.seq = t.seq
 	AND x.worker_id = ` + worker + ` AND x.outcome IN ('failed','expired') AND x.stage IS NOT 'pre-work'
-	AND x.retry = j.retries))`
+	AND x.stage IS NOT 'rate_limited' AND x.retry = j.retries))`
 }
 
 // claimant is what Claim reads about the claiming worker in its
