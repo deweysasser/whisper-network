@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/rs/zerolog"
 
 	"github.com/deweysasser/whisper-network/internal/api"
 	"github.com/deweysasser/whisper-network/internal/auth"
+	"github.com/deweysasser/whisper-network/internal/fetchpolicy"
 	"github.com/deweysasser/whisper-network/internal/obs"
 	"github.com/deweysasser/whisper-network/internal/store"
 )
@@ -42,6 +44,9 @@ type Ops struct {
 	// JobFinished, if set, is called after the commit for each job a change
 	// failed (the server logs job.failed and records its metrics).
 	JobFinished func(ctx context.Context, jobID string)
+	// PacingChanged, if set, is called after fetch policies or cooldowns
+	// change (the server recomputes its pacing wake-up and wakes claims).
+	PacingChanged func()
 	// PasswordSlot, if set, bounds concurrent password hashing (the server
 	// sets it to Server.PasswordSlot). Every hash Ops computes holds a slot
 	// for exactly the duration of the hash.
@@ -813,4 +818,95 @@ func (o *Ops) RenameQueue(ctx context.Context, a Actor, q *store.Queue, name str
 		}
 		return rec("queue.rename", "queue:"+name, map[string]any{"from": q.Name})
 	})
+}
+
+func (o *Ops) pacingChanged() {
+	if o.PacingChanged != nil {
+		o.PacingChanged()
+	}
+}
+
+// fetchPolicyAudit is the audit detail of a fetch policy change. It names
+// sites and egress keys, never URLs.
+func fetchPolicyAudit(p fetchpolicy.Policy) map[string]any {
+	rules := make([]string, len(p.Rules))
+	for i, r := range p.Rules {
+		rules[i] = r.String()
+	}
+	d := map[string]any{"key": p.Key, "site": p.Site, "rules": rules, "concurrency": p.Concurrency,
+		"backoff_initial": p.BackoffInitial.String(), "backoff_cap": p.BackoffCap.String()}
+	if p.EgressKey != "" {
+		d["egress"] = p.EgressKey
+	}
+	return d
+}
+
+// PutFetchPolicy creates or replaces a fetch policy (audited as
+// fetch_policy.put). An invalid policy is a 400.
+func (o *Ops) PutFetchPolicy(ctx context.Context, a Actor, p fetchpolicy.Policy) (created bool, err error) {
+	err = o.change(ctx, a, func(tx *store.Tx, rec recorder) error {
+		var err error
+		if created, err = tx.PutFetchPolicy(ctx, p, a.Name); err != nil {
+			return err
+		}
+		return rec("fetch_policy.put", "fetch_policy:"+p.Key, fetchPolicyAudit(p))
+	})
+	if err != nil {
+		return false, err
+	}
+	o.pacingChanged()
+	return created, nil
+}
+
+// DeleteFetchPolicy deletes a fetch policy (audited as fetch_policy.delete).
+// The '*' default is a 409, an unknown key a 404.
+func (o *Ops) DeleteFetchPolicy(ctx context.Context, a Actor, key string) error {
+	err := o.change(ctx, a, func(tx *store.Tx, rec recorder) error {
+		if err := tx.DeleteFetchPolicy(ctx, key); err != nil {
+			return err
+		}
+		return rec("fetch_policy.delete", "fetch_policy:"+key, map[string]any{"key": key})
+	})
+	if err != nil {
+		return err
+	}
+	o.pacingChanged()
+	return nil
+}
+
+func cooldownTarget(egress, site string) string { return "fetch_cooldown:" + egress + "/" + site }
+
+// SetCooldown manually cools (egress, site) down until until (audited as
+// fetch_cooldown.set). An empty key or site, or an until not in the future,
+// is a 400.
+func (o *Ops) SetCooldown(ctx context.Context, a Actor, egress, site string, until time.Time, reason string) error {
+	err := o.change(ctx, a, func(tx *store.Tx, rec recorder) error {
+		if err := tx.SetCooldown(ctx, egress, site, until, a.Name, reason); err != nil {
+			return err
+		}
+		return rec("fetch_cooldown.set", cooldownTarget(egress, site),
+			map[string]any{"egress": egress, "site": site, "until": until.UTC(), "reason": reason})
+	})
+	if err != nil {
+		return err
+	}
+	o.pacingChanged()
+	return nil
+}
+
+// ClearCooldown ends the cooldown of (egress, site) (audited as
+// fetch_cooldown.clear); clearing one that is not set is not an error.
+func (o *Ops) ClearCooldown(ctx context.Context, a Actor, egress, site string) error {
+	err := o.change(ctx, a, func(tx *store.Tx, rec recorder) error {
+		if err := tx.ClearCooldown(ctx, egress, site); err != nil {
+			return err
+		}
+		return rec("fetch_cooldown.clear", cooldownTarget(egress, site),
+			map[string]any{"egress": egress, "site": site})
+	})
+	if err != nil {
+		return err
+	}
+	o.pacingChanged()
+	return nil
 }

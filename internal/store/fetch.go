@@ -883,3 +883,39 @@ func (t *Tx) ClearCooldown(ctx context.Context, egressKey, site string) error {
 	}
 	return nil
 }
+
+// FetchPolicyMeta is who last edited a fetch policy, and when.
+type FetchPolicyMeta struct {
+	UpdatedBy string
+	UpdatedAt time.Time
+}
+
+// FetchPolicyMetas returns the edit metadata of every fetch policy row, by
+// key (including rows FetchPolicies omits as invalid).
+func (s *Store) FetchPolicyMetas(ctx context.Context) (map[string]FetchPolicyMeta, error) {
+	rows, err := s.r.QueryContext(ctx, `SELECT key, updated_by, updated_at FROM fetch_policies`)
+	if err != nil {
+		return nil, fmt.Errorf("fetch policy metas: %w", err)
+	}
+	defer rows.Close()
+	out := map[string]FetchPolicyMeta{}
+	for rows.Next() {
+		var k string
+		var m FetchPolicyMeta
+		var at int64
+		if err := rows.Scan(&k, &m.UpdatedBy, &at); err != nil {
+			return nil, fmt.Errorf("fetch policy metas: %w", err)
+		}
+		m.UpdatedAt = fromMS(at)
+		out[k] = m
+	}
+	return out, rows.Err()
+}
+
+// FailAllOrphanedFetchJobs fails the fetching jobs of every queue without an
+// eligible downloader (at the store's FetchMinSandbox) and returns them with
+// the leases that ended. It is the reaper's backstop for floors raised or
+// downloaders removed behind the store's back.
+func (s *Store) FailAllOrphanedFetchJobs(ctx context.Context) (OrphanFailures, error) {
+	return inTx1(ctx, s, func(tx *Tx) (OrphanFailures, error) { return tx.failAllOrphanedFetchJobs(ctx) })
+}

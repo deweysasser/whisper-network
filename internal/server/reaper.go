@@ -78,6 +78,15 @@ func (s *Server) reapOnce(ctx context.Context) {
 	}
 	counts["jobs_failed"] = len(settled)
 
+	// A queue's last eligible downloader can vanish without a change that
+	// sweeps (a raised --fetch-min-sandbox): fail what no one can fetch.
+	orphans, err := s.st.FailAllOrphanedFetchJobs(ctx)
+	fail("fail orphaned fetch jobs", err)
+	for _, id := range orphans.Jobs {
+		s.jobFinished(ctx, id)
+	}
+	counts["fetch_jobs_orphaned"] = len(orphans.Jobs)
+
 	ids, err := s.st.JobsAwaitingAssembly(ctx)
 	fail("jobs awaiting assembly", err)
 	for _, id := range ids {
