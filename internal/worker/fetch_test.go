@@ -417,7 +417,8 @@ func TestFetchHeartbeat410KillsFetch(t *testing.T) {
 	h := fetchHarness(t, workertest.YtDlpTrickle, fakeMedia)
 	task := startFetch(t, h, workertest.Task{})
 	l := h.liveLease(task)
-	time.Sleep(testscale.D(300 * time.Millisecond)) // let the trickle reach the server
+	// The trickle's PUT has reached the server.
+	h.eventually(func() bool { return h.srv.Task(task).ResultsStarted > 0 }, "the result PUT never started")
 	h.srv.CancelLease(l.ID)
 	h.eventually(func() bool {
 		return bytes.Contains(h.logs.Bytes(), []byte("server ended the lease; killing the task"))

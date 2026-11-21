@@ -109,6 +109,9 @@ type Task struct {
 	// AbortedResults counts result PUTs whose body broke off (a chunked
 	// body that never ended cleanly); nothing of them is kept.
 	AbortedResults int
+	// ResultsStarted counts result PUTs whose handler started (headers
+	// received), whatever became of them.
+	ResultsStarted int
 }
 
 // Lease is the server's record of a lease.
@@ -662,6 +665,7 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request, l *Lease, _ *
 
 func (s *Server) result(w http.ResponseWriter, r *http.Request, l *Lease, t *Task, _ *Worker) {
 	s.mu.Lock()
+	t.ResultsStarted++
 	early, status, stall, unstall := s.earlyFailures > 0, s.earlyStatus, s.stallResults, s.unstall
 	if early {
 		s.earlyFailures--
