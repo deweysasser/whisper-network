@@ -1,13 +1,17 @@
 package server
 
 import (
+	"database/sql"
 	"net/http"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/deweysasser/whisper-network/internal/api"
+	"github.com/deweysasser/whisper-network/internal/obs"
+	"github.com/deweysasser/whisper-network/internal/store"
 )
 
 // newClient creates an API client and returns its id and token.
@@ -249,4 +253,83 @@ func TestApproveDownloaderGrantsFetch(t *testing.T) {
 	assert.Equal(t, []api.Grant{{Role: api.RoleFetch, Scope: "queue:public"}}, h.wireGrants("worker:"+id))
 	pid, _ := h.activeWorker(api.WorkerFacts{}, "public")
 	assert.Equal(t, []api.Grant{{Role: api.RoleProcess, Scope: "queue:public"}}, h.wireGrants("worker:"+pid))
+}
+
+// fetchingJob inserts a fetching job with a pending fetch task on the public
+// queue through a second connection (nothing creates one over the API yet).
+func (h *harness) fetchingJob(id string) {
+	h.t.Helper()
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(h.dir, "wn.db")+"?_pragma=busy_timeout(5000)")
+	require.NoError(h.t, err)
+	defer db.Close()
+	_, err = db.ExecContext(h.ctx, `INSERT INTO jobs (id, queue_id, client_id, state, model, language, created_at, updated_at,
+		fetch_url, fetch_site) VALUES (?, (SELECT id FROM queues WHERE name = 'public'), 'c', 'fetching', 'm', 'en', 1, 1,
+		'https://x/y', 'x')`, id)
+	require.NoError(h.t, err)
+	_, err = db.ExecContext(h.ctx, `INSERT INTO tasks (job_id, seq, kind, cost, state) VALUES (?, -1, 'fetch', 1, 'pending')`, id)
+	require.NoError(h.t, err)
+}
+
+func (h *harness) auditDetails(action string) []string {
+	h.t.Helper()
+	es, err := h.st.QueryAudit(h.ctx, store.AuditFilter{Limit: 1000})
+	require.NoError(h.t, err)
+	var out []string
+	for _, e := range es {
+		if e.Action == action {
+			out = append(out, e.Detail)
+		}
+	}
+	return out
+}
+
+func (h *harness) assertJobFailedReported(job string) {
+	h.t.Helper()
+	assert.Equal(h.t, api.JobFailed, h.job(job).State)
+	jf := h.logs.events(h.t, obs.EventJobFailed)
+	require.Len(h.t, jf, 1)
+	assert.Equal(h.t, job, jf[0][obs.FieldJobID])
+	mb := &syncBuffer{}
+	h.metrics.WritePrometheus(mb)
+	assert.Contains(h.t, string(mb.Bytes()), `whisper_jobs_finished_total{queue="public",outcome="failed"} 1`)
+}
+
+var dlFacts = api.WorkerFacts{Kind: api.WorkerDownloader, Kinds: []api.TaskKind{}}
+
+func TestRevokeLastFetchReportsFailedJob(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	dl, _ := h.activeWorker(dlFacts, "public")
+	h.fetchingJob("jf")
+	require.NoError(t, h.srv.Ops().Revoke(h.ctx, CLIActor(), "worker:"+dl, api.Grant{Role: api.RoleFetch, Scope: "queue:public"}))
+	h.assertJobFailedReported("jf")
+	d := h.auditDetails("grant.remove")
+	require.Len(t, d, 1)
+	assert.Contains(t, d[0], `"failed_jobs":["jf"]`)
+	assert.NotContains(t, d[0], "cancelled_leases", "the revoked worker held no lease")
+}
+
+func TestRejectLastDownloaderReportsFailedJob(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	dl, _ := h.activeWorker(dlFacts, "public")
+	h.fetchingJob("jf")
+	require.NoError(t, h.srv.Ops().SetWorkerState(h.ctx, CLIActor(), dl, api.WorkerRejected))
+	h.assertJobFailedReported("jf")
+	d := h.auditDetails("worker.reject")
+	require.Len(t, d, 1)
+	assert.Contains(t, d[0], `"failed_jobs":["jf"]`)
+	assert.Contains(t, d[0], `"cancelled_leases":0`)
+}
+
+func TestFactsBelowFloorReportsFailedJob(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	f := dlFacts
+	f.SandboxLevel = api.SandboxFull
+	dl, _ := h.activeWorker(f, "public")
+	h.fetchingJob("jf")
+	f.SandboxLevel = api.SandboxFSOnly
+	require.NoError(t, h.srv.Ops().UpdateWorkerFacts(h.ctx, Actor{Name: "worker:" + dl, Grant: "worker:" + dl}, dl, f))
+	h.assertJobFailedReported("jf")
 }

@@ -39,6 +39,9 @@ type Ops struct {
 	// Notify, if set, wakes waiting claims after changes that can make work
 	// claimable.
 	Notify func()
+	// JobFinished, if set, is called after the commit for each job a change
+	// failed (the server logs job.failed and records its metrics).
+	JobFinished func(ctx context.Context, jobID string)
 	// PasswordSlot, if set, bounds concurrent password hashing (the server
 	// sets it to Server.PasswordSlot). Every hash Ops computes holds a slot
 	// for exactly the duration of the hash.
@@ -93,6 +96,16 @@ func SystemActor() Actor { return Actor{Name: store.SystemActor, Grant: store.Sy
 
 // userActor is the actor for a user acting on their own account.
 func userActor(u *store.User) Actor { return Actor{Name: "user:" + u.Username, Grant: u.Principal()} }
+
+// jobsFinished reports jobs a committed change failed.
+func (o *Ops) jobsFinished(ctx context.Context, ids []string) {
+	if o.JobFinished == nil {
+		return
+	}
+	for _, id := range ids {
+		o.JobFinished(ctx, id)
+	}
+}
 
 func (o *Ops) notify() {
 	if o.Notify != nil {
@@ -350,9 +363,15 @@ func (o *Ops) UpdateGrants(ctx context.Context, a Actor, principal string, add, 
 		}
 		removes[i] = storeGrant{wire: g, scope: scope}
 	}
-	var cancelled []string
+	type revoked struct {
+		role      api.Role
+		cancelled int
+	}
+	var cancelled []revoked
+	var anyCancelled bool
+	var failedJobs []string
 	err = o.change(ctx, a, func(tx *store.Tx, rec recorder) error {
-		cancelled = cancelled[:0]
+		cancelled, anyCancelled, failedJobs = cancelled[:0], false, failedJobs[:0]
 		for _, g := range adds {
 			if err := tx.AddGrant(ctx, sp, g.wire.Role, g.scope, a.Grant); err != nil {
 				return err
@@ -362,14 +381,25 @@ func (o *Ops) UpdateGrants(ctx context.Context, a Actor, principal string, add, 
 			}
 		}
 		for _, g := range removes {
-			ended, err := tx.RemoveGrant(ctx, sp, g.wire.Role, g.scope)
+			r, err := tx.RevokeGrant(ctx, sp, g.wire.Role, g.scope)
 			if err != nil {
 				return err
 			}
-			cancelled = append(cancelled, ended...)
+			if len(r.Cancelled) > 0 {
+				cancelled = append(cancelled, revoked{g.wire.Role, len(r.Cancelled)})
+			}
+			anyCancelled = anyCancelled || len(r.Cancelled) > 0 || len(r.Orphaned.Leases) > 0
+			failedJobs = append(failedJobs, r.Orphaned.Jobs...)
 			detail := any(g.wire)
-			if len(ended) > 0 {
-				detail = map[string]any{"role": g.wire.Role, "scope": g.wire.Scope, "cancelled_leases": len(ended)}
+			if len(r.Cancelled) > 0 || len(r.Orphaned.Jobs) > 0 {
+				d := map[string]any{"role": g.wire.Role, "scope": g.wire.Scope}
+				if len(r.Cancelled) > 0 {
+					d["cancelled_leases"] = len(r.Cancelled)
+				}
+				if len(r.Orphaned.Jobs) > 0 {
+					d["failed_jobs"] = r.Orphaned.Jobs
+				}
+				detail = d
 			}
 			if err := rec("grant.remove", principal, detail); err != nil {
 				return err
@@ -380,9 +410,12 @@ func (o *Ops) UpdateGrants(ctx context.Context, a Actor, principal string, add, 
 	if err != nil {
 		return err
 	}
-	if len(cancelled) > 0 {
-		o.Log.Info().Str(obs.FieldPrincipal, principal).Strs("cancelled_leases", cancelled).
-			Msg("leases cancelled: process grant revoked")
+	for _, c := range cancelled {
+		o.Log.Info().Str(obs.FieldPrincipal, principal).Int("cancelled_leases", c.cancelled).
+			Msgf("leases cancelled: %s grant revoked", c.role)
+	}
+	o.jobsFinished(ctx, failedJobs)
+	if anyCancelled {
 		o.notify() // their tasks are pending again
 		return nil
 	}
@@ -461,19 +494,24 @@ func (o *Ops) SetWorkerState(ctx context.Context, a Actor, workerID string, stat
 	default:
 		return badRequest("unsupported worker state " + string(state))
 	}
-	var cancelled []string
+	var ch store.WorkerStateChange
 	err = o.change(ctx, a, func(tx *store.Tx, rec recorder) error {
 		var err error
-		if cancelled, err = tx.SetWorkerState(ctx, workerID, state, a.Name); err != nil {
+		if ch, err = tx.ChangeWorkerState(ctx, workerID, state, a.Name); err != nil {
 			return err
 		}
-		return rec(action, w.Principal(), map[string]any{"from": w.State, "cancelled_leases": len(cancelled)})
+		detail := map[string]any{"from": w.State, "cancelled_leases": len(ch.Cancelled)}
+		if len(ch.Orphaned.Jobs) > 0 {
+			detail["failed_jobs"] = ch.Orphaned.Jobs
+		}
+		return rec(action, w.Principal(), detail)
 	})
 	if err != nil {
 		return err
 	}
 	obs.Info(&o.Log, ev).Str(obs.FieldWorkerID, w.ID).Str(obs.FieldHostname, w.Facts.Hostname).
-		Str(obs.FieldActor, a.Name).Int("cancelled_leases", len(cancelled)).Msg("worker state changed")
+		Str(obs.FieldActor, a.Name).Int("cancelled_leases", len(ch.Cancelled)).Msg("worker state changed")
+	o.jobsFinished(ctx, ch.Orphaned.Jobs)
 	if state != api.WorkerPaused {
 		o.notify()
 	}

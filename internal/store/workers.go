@@ -195,23 +195,28 @@ func (s *Store) ListWorkers(ctx context.Context) ([]Worker, error) {
 }
 
 // UpdateWorkerFacts replaces a worker's reported facts. The worker kind is
-// fixed at registration: facts naming another kind are ErrConflict.
+// fixed at registration: facts naming another kind are ErrConflict. Callers
+// that must report the fetching jobs this can fail use Tx.UpdateWorkerFacts.
 func (s *Store) UpdateWorkerFacts(ctx context.Context, id string, facts api.WorkerFacts) error {
-	return s.InTx(ctx, func(tx *Tx) error { return tx.UpdateWorkerFacts(ctx, id, facts) })
+	return s.InTx(ctx, func(tx *Tx) error { _, err := tx.UpdateWorkerFacts(ctx, id, facts); return err })
 }
 
-// UpdateWorkerFacts is Store.UpdateWorkerFacts inside the transaction.
-func (t *Tx) UpdateWorkerFacts(ctx context.Context, id string, facts api.WorkerFacts) error {
+// UpdateWorkerFacts is Store.UpdateWorkerFacts inside the transaction. A
+// downloader that reports a sandbox level below FetchMinSandbox is no longer
+// eligible, so fetching jobs it was the last eligible downloader for fail;
+// they are returned.
+func (t *Tx) UpdateWorkerFacts(ctx context.Context, id string, facts api.WorkerFacts) (OrphanFailures, error) {
+	var none OrphanFailures
 	kinds, models, err := factsJSON(facts)
 	if err != nil {
-		return err
+		return none, err
 	}
 	var kind api.WorkerKind
 	if err := t.tx.QueryRowContext(ctx, `SELECT kind FROM workers WHERE id = ?`, id).Scan(&kind); err != nil {
-		return notFound(err, "worker "+id)
+		return none, notFound(err, "worker "+id)
 	}
 	if want := cmp.Or(facts.Kind, api.WorkerProcessing); want != kind {
-		return fmt.Errorf("worker %s is a %s, not a %s: %w", id, kind, want, ErrConflict)
+		return none, fmt.Errorf("worker %s is a %s, not a %s: %w", id, kind, want, ErrConflict)
 	}
 	res, err := t.tx.ExecContext(ctx, `UPDATE workers SET hostname=?, description=?, cpu_model=?, cores=?,
 		mem_bytes=?, os=?, arch=?, engine_version=?, ffmpeg_version=?, sandbox_level=?, kinds=?, slots=?,
@@ -219,7 +224,13 @@ func (t *Tx) UpdateWorkerFacts(ctx context.Context, id string, facts api.WorkerF
 		facts.Hostname, facts.Description, facts.CPUModel, facts.Cores, facts.MemBytes, facts.OS, facts.Arch,
 		facts.EngineVersion, facts.FFmpegVersion, string(facts.SandboxLevel), kinds, facts.Slots, models,
 		facts.Version, facts.YtDlpVersion, facts.EgressGroup, facts.EgressIP, id)
-	return mustAffect(res, err, "update worker facts")
+	if err := mustAffect(res, err, "update worker facts"); err != nil {
+		return none, err
+	}
+	if kind == api.WorkerDownloader && facts.SandboxLevel.Rank() < t.s.cfg.FetchMinSandbox.Rank() {
+		return t.failAllOrphanedFetchJobs(ctx)
+	}
+	return none, nil
 }
 
 // SetWorkerEgressKey records the egress key the server derived for a worker.
@@ -265,50 +276,65 @@ func (s *Store) SetWorkerState(ctx context.Context, id string, state api.WorkerS
 	return inTx1(ctx, s, func(tx *Tx) ([]string, error) { return tx.SetWorkerState(ctx, id, state, decidedBy) })
 }
 
-// SetWorkerState is Store.SetWorkerState inside the transaction.
-func (t *Tx) SetWorkerState(ctx context.Context, id string, state api.WorkerState, decidedBy string) (cancelled []string, err error) {
+// SetWorkerState is Store.SetWorkerState inside the transaction. It returns
+// only the worker's own cancelled leases; ChangeWorkerState also reports the
+// fetching jobs failed because rejecting the worker orphaned them.
+func (t *Tx) SetWorkerState(ctx context.Context, id string, state api.WorkerState, decidedBy string) ([]string, error) {
+	c, err := t.ChangeWorkerState(ctx, id, state, decidedBy)
+	return c.Cancelled, err
+}
+
+// WorkerStateChange is the effect of a worker state change.
+type WorkerStateChange struct {
+	// Cancelled are the worker's own leases that rejection ended.
+	Cancelled []string
+	// Orphaned are the fetching jobs failed because no eligible downloader
+	// was left, and the leases (any worker's) ended by failing them.
+	Orphaned OrphanFailures
+}
+
+// ChangeWorkerState is SetWorkerState reporting the whole effect.
+func (t *Tx) ChangeWorkerState(ctx context.Context, id string, state api.WorkerState, decidedBy string) (out WorkerStateChange, err error) {
 	var cur api.WorkerState
 	var kind api.WorkerKind
 	if err := t.tx.QueryRowContext(ctx, `SELECT state, kind FROM workers WHERE id = ?`, id).Scan(&cur, &kind); err != nil {
-		return nil, notFound(err, "worker "+id)
+		return out, notFound(err, "worker "+id)
 	}
 	if !canTransition(cur, state) {
-		return nil, fmt.Errorf("worker %s: %s -> %s: %w", id, cur, state, ErrConflict)
+		return out, fmt.Errorf("worker %s: %s -> %s: %w", id, cur, state, ErrConflict)
 	}
 	if cur == state {
-		return nil, nil
+		return out, nil
 	}
 	now := t.s.now()
 	if _, err := t.tx.ExecContext(ctx, `UPDATE workers SET state = ?, decided_by = ?, decided_at = ?,
 		pause_reason = NULL WHERE id = ?`, string(state), decidedBy, toMS(now), id); err != nil {
-		return nil, fmt.Errorf("set worker state: %w", err)
+		return out, fmt.Errorf("set worker state: %w", err)
 	}
 	if state == api.WorkerActive {
 		if err := clearFailureStreak(ctx, t.tx, id); err != nil {
-			return nil, err
+			return out, err
 		}
 	}
 	if state != api.WorkerRejected {
-		return nil, nil
+		return out, nil
 	}
 	ls, err := liveLeases(ctx, t.tx, `l.worker_id = ?`, id)
 	if err != nil {
-		return nil, err
+		return out, err
 	}
 	for _, l := range ls {
 		if _, err := t.s.endLease(ctx, t.tx, l, api.OutcomeCancelled, true, "worker rejected", "", now); err != nil {
-			return nil, err
+			return out, err
 		}
-		cancelled = append(cancelled, l.ID)
+		out.Cancelled = append(out.Cancelled, l.ID)
 	}
 	if kind == api.WorkerDownloader {
-		_, ended, err := t.failAllOrphanedFetchJobs(ctx)
-		if err != nil {
-			return nil, err
+		if out.Orphaned, err = t.failAllOrphanedFetchJobs(ctx); err != nil {
+			return out, err
 		}
-		cancelled = append(cancelled, ended...)
 	}
-	return cancelled, nil
+	return out, nil
 }
 
 // TouchWorker records that a worker was just seen. Non-nil gauges replace the

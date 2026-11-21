@@ -48,76 +48,81 @@ func queueHasDownloader(ctx context.Context, q querier, queueID int64, minSandbo
 // FailOrphanedFetchJobs fails the fetching jobs of a queue that no eligible
 // downloader (see QueueHasDownloader) can serve, and returns their ids.
 func (t *Tx) FailOrphanedFetchJobs(ctx context.Context, queueID int64, minSandbox api.SandboxLevel) ([]string, error) {
-	jobs, _, err := t.failOrphanedFetchJobs(ctx, queueID, minSandbox)
-	return jobs, err
+	o, err := t.failOrphanedFetchJobs(ctx, queueID, minSandbox)
+	return o.Jobs, err
 }
+
+// OrphanFailures are the fetching jobs failed for want of an eligible
+// downloader, and the leases ended by failing them (which can belong to any
+// worker, e.g. a downloader below the sandbox floor).
+type OrphanFailures struct{ Jobs, Leases []string }
 
 // failOrphanedFetchJobs is FailOrphanedFetchJobs that also returns the ids
 // of the leases it cancelled.
-func (t *Tx) failOrphanedFetchJobs(ctx context.Context, queueID int64, minSandbox api.SandboxLevel) (jobs, leases []string, err error) {
+func (t *Tx) failOrphanedFetchJobs(ctx context.Context, queueID int64, minSandbox api.SandboxLevel) (out OrphanFailures, err error) {
 	ok, err := queueHasDownloader(ctx, t.tx, queueID, minSandbox)
 	if err != nil || ok {
-		return nil, nil, err
+		return out, err
 	}
 	var name string
 	if err := t.tx.QueryRowContext(ctx, `SELECT name FROM queues WHERE id = ?`, queueID).Scan(&name); err != nil {
-		return nil, nil, notFound(err, fmt.Sprintf("queue %d", queueID))
+		return out, notFound(err, fmt.Sprintf("queue %d", queueID))
 	}
 	rows, err := t.tx.QueryContext(ctx, `SELECT id FROM jobs WHERE queue_id = ? AND state = 'fetching' ORDER BY id`, queueID)
 	if err != nil {
-		return nil, nil, fmt.Errorf("orphaned fetch jobs: %w", err)
+		return out, fmt.Errorf("orphaned fetch jobs: %w", err)
 	}
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
 			rows.Close()
-			return nil, nil, fmt.Errorf("orphaned fetch jobs: %w", err)
+			return out, fmt.Errorf("orphaned fetch jobs: %w", err)
 		}
-		jobs = append(jobs, id)
+		out.Jobs = append(out.Jobs, id)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return nil, nil, err
+		return out, err
 	}
 	rows.Close()
 	now := t.s.now()
-	for _, id := range jobs {
+	for _, id := range out.Jobs {
 		ended, err := failJob(ctx, t.tx, id, "no downloader holds fetch on queue "+name, now)
 		if err != nil {
-			return nil, nil, err
+			return out, err
 		}
-		leases = append(leases, ended...)
+		out.Leases = append(out.Leases, ended...)
 	}
-	return jobs, leases, nil
+	return out, nil
 }
 
 // failAllOrphanedFetchJobs applies failOrphanedFetchJobs, at the store's
 // FetchMinSandbox, to every queue with a fetching job.
-func (t *Tx) failAllOrphanedFetchJobs(ctx context.Context) (jobs, leases []string, err error) {
+func (t *Tx) failAllOrphanedFetchJobs(ctx context.Context) (out OrphanFailures, err error) {
 	rows, err := t.tx.QueryContext(ctx, `SELECT DISTINCT queue_id FROM jobs WHERE state = 'fetching' ORDER BY queue_id`)
 	if err != nil {
-		return nil, nil, fmt.Errorf("orphaned fetch jobs: %w", err)
+		return out, fmt.Errorf("orphaned fetch jobs: %w", err)
 	}
 	var qs []int64
 	for rows.Next() {
 		var q int64
 		if err := rows.Scan(&q); err != nil {
 			rows.Close()
-			return nil, nil, fmt.Errorf("orphaned fetch jobs: %w", err)
+			return out, fmt.Errorf("orphaned fetch jobs: %w", err)
 		}
 		qs = append(qs, q)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return nil, nil, err
+		return out, err
 	}
 	rows.Close()
 	for _, q := range qs {
-		j, l, err := t.failOrphanedFetchJobs(ctx, q, t.s.cfg.FetchMinSandbox)
+		o, err := t.failOrphanedFetchJobs(ctx, q, t.s.cfg.FetchMinSandbox)
 		if err != nil {
-			return nil, nil, err
+			return out, err
 		}
-		jobs, leases = append(jobs, j...), append(leases, l...)
+		out.Jobs, out.Leases = append(out.Jobs, o.Jobs...), append(out.Leases, o.Leases...)
 	}
-	return jobs, leases, nil
+	return out, nil
 }
