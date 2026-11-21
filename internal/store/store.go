@@ -97,6 +97,9 @@ type Config struct {
 	// PrepareMinSandbox is the minimum worker sandbox level for prepare
 	// tasks. Defaults to full.
 	PrepareMinSandbox api.SandboxLevel
+	// FetchMinSandbox is the minimum worker sandbox level for a downloader
+	// to count as eligible for a queue's fetch jobs. Defaults to full.
+	FetchMinSandbox api.SandboxLevel
 	// ReadConns caps the read pool. Defaults to max(4, GOMAXPROCS).
 	ReadConns int
 }
@@ -133,6 +136,9 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	}
 	if cfg.PrepareMinSandbox == "" {
 		cfg.PrepareMinSandbox = api.SandboxFull
+	}
+	if cfg.FetchMinSandbox == "" {
+		cfg.FetchMinSandbox = api.SandboxFull
 	}
 	if cfg.ReadConns <= 0 {
 		cfg.ReadConns = max(4, runtime.GOMAXPROCS(0))

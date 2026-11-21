@@ -1,6 +1,7 @@
 package server
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -256,16 +257,32 @@ func (o *Ops) StorePrincipal(ctx context.Context, principal string) (string, aut
 }
 
 // checkGrantFits rejects grants that are well formed but meaningless for
-// the principal kind: process is the only role a worker can use, and only
-// workers can use it.
-func checkGrantFits(kind auth.PrincipalKind, g api.Grant) error {
+// the principal kind: process and fetch are the only roles a worker can
+// use, and only workers can use them. A processing worker takes process, a
+// downloader (wk, ignored for non-workers) takes fetch.
+func checkGrantFits(kind auth.PrincipalKind, wk api.WorkerKind, g api.Grant) error {
 	if err := auth.ValidateGrant(g); err != nil {
 		return badRequest(err.Error())
 	}
-	if (kind == auth.KindWorker) != (g.Role == api.RoleProcess) {
+	fits := g.Role != api.RoleProcess && g.Role != api.RoleFetch
+	if kind == auth.KindWorker {
+		fits = g.Role == workerRole(wk)
+	}
+	if !fits {
+		if kind == auth.KindWorker {
+			return badRequest(fmt.Sprintf("role %s cannot be granted to a %s worker", g.Role, cmp.Or(wk, api.WorkerProcessing)))
+		}
 		return badRequest(fmt.Sprintf("role %s cannot be granted to a %s", g.Role, kind))
 	}
 	return nil
+}
+
+// workerRole is the role a worker of kind holds on the queues it serves.
+func workerRole(k api.WorkerKind) api.Role {
+	if k == api.WorkerDownloader {
+		return api.RoleFetch
+	}
+	return api.RoleProcess
 }
 
 // storeGrant is a grant resolved to its stored scope, with its wire form
@@ -275,11 +292,12 @@ type storeGrant struct {
 	scope string
 }
 
-// resolveGrants checks that each grant fits kind and translates its scope.
-func (o *Ops) resolveGrants(ctx context.Context, kind auth.PrincipalKind, gs []api.Grant) ([]storeGrant, error) {
+// resolveGrants checks that each grant fits kind (and wk, for a worker) and
+// translates its scope.
+func (o *Ops) resolveGrants(ctx context.Context, kind auth.PrincipalKind, wk api.WorkerKind, gs []api.Grant) ([]storeGrant, error) {
 	out := make([]storeGrant, len(gs))
 	for i, g := range gs {
-		if err := checkGrantFits(kind, g); err != nil {
+		if err := checkGrantFits(kind, wk, g); err != nil {
 			return nil, err
 		}
 		scope, err := o.StoreScope(ctx, g.Scope)
@@ -312,7 +330,15 @@ func (o *Ops) UpdateGrants(ctx context.Context, a Actor, principal string, add, 
 	if err != nil {
 		return err
 	}
-	adds, err := o.resolveGrants(ctx, kind, add)
+	var wk api.WorkerKind
+	if id, ok := strings.CutPrefix(sp, "worker:"); ok && kind == auth.KindWorker {
+		w, err := o.Store.WorkerByID(ctx, id)
+		if err != nil {
+			return err
+		}
+		wk = w.Kind
+	}
+	adds, err := o.resolveGrants(ctx, kind, wk, add)
 	if err != nil {
 		return err
 	}
@@ -361,7 +387,7 @@ func (o *Ops) UpdateGrants(ctx context.Context, a Actor, principal string, add, 
 		return nil
 	}
 	for _, g := range add {
-		if g.Role == api.RoleProcess {
+		if g.Role == api.RoleProcess || g.Role == api.RoleFetch {
 			o.notify()
 			break
 		}
@@ -385,16 +411,17 @@ func (o *Ops) ApproveWorker(ctx context.Context, a Actor, workerID string, queue
 			return err
 		}
 	}
+	role := workerRole(w.Kind)
 	err = o.change(ctx, a, func(tx *store.Tx, rec recorder) error {
 		if _, err := tx.SetWorkerState(ctx, workerID, api.WorkerActive, a.Name); err != nil {
 			return err
 		}
 		for _, sc := range scopes {
-			if err := tx.AddGrant(ctx, w.Principal(), api.RoleProcess, sc, a.Grant); err != nil {
+			if err := tx.AddGrant(ctx, w.Principal(), role, sc, a.Grant); err != nil {
 				return err
 			}
 		}
-		return rec("worker.approve", w.Principal(), map[string]any{"queues": nonNilStrings(queues)})
+		return rec("worker.approve", w.Principal(), map[string]any{"queues": nonNilStrings(queues), "role": role})
 	})
 	if err != nil {
 		return err
@@ -533,7 +560,7 @@ func (o *Ops) CreateClient(ctx context.Context, a Actor, name string, grants []a
 	if name = strings.TrimSpace(name); name == "" || len(name) > 200 {
 		return nil, badRequest("client name must be 1-200 characters")
 	}
-	resolved, err := o.resolveGrants(ctx, auth.KindClient, grants)
+	resolved, err := o.resolveGrants(ctx, auth.KindClient, "", grants)
 	if err != nil {
 		return nil, err
 	}
@@ -601,7 +628,7 @@ func (o *Ops) CreateUser(ctx context.Context, a Actor, req api.CreateUserRequest
 	if !store.ValidQueueName(req.Username) { // same conservative grammar as queue names
 		return nil, badRequest("username must match [a-z0-9][a-z0-9-]{0,62}")
 	}
-	grants, err := o.resolveGrants(ctx, auth.KindUser, req.Grants)
+	grants, err := o.resolveGrants(ctx, auth.KindUser, "", req.Grants)
 	if err != nil {
 		return nil, err
 	}

@@ -219,3 +219,34 @@ func TestOnlyAdminGrantsReadAll(t *testing.T) {
 	h.expect("POST", "/client", holder, api.CreateClientRequest{Name: "delegate", Grants: []api.Grant{readPublic}},
 		http.StatusCreated, nil)
 }
+
+func TestGrantFitsWorkerKind(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	proc, _ := h.activeWorker(api.WorkerFacts{}, "public")
+	dl, _ := h.worker(api.WorkerFacts{Kind: api.WorkerDownloader, Kinds: []api.TaskKind{}})
+	ops, a := h.srv.Ops(), CLIActor()
+	fetch := api.Grant{Role: api.RoleFetch, Scope: "queue:public"}
+	process := api.Grant{Role: api.RoleProcess, Scope: "queue:public"}
+
+	var pe *problem
+	err := ops.Grant(h.ctx, a, "worker:"+proc, fetch)
+	require.ErrorAs(t, err, &pe)
+	assert.Equal(t, http.StatusBadRequest, pe.status)
+	err = ops.Grant(h.ctx, a, "worker:"+dl, process)
+	require.ErrorAs(t, err, &pe)
+	assert.Equal(t, http.StatusBadRequest, pe.status)
+	require.NoError(t, ops.Grant(h.ctx, a, "worker:"+dl, fetch))
+	require.NoError(t, ops.Grant(h.ctx, a, "worker:"+proc, process))
+	cid, _ := h.newClient()
+	require.Error(t, ops.Grant(h.ctx, a, "client:"+cid, fetch))
+}
+
+func TestApproveDownloaderGrantsFetch(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	id, _ := h.activeWorker(api.WorkerFacts{Kind: api.WorkerDownloader, Kinds: []api.TaskKind{}}, "public")
+	assert.Equal(t, []api.Grant{{Role: api.RoleFetch, Scope: "queue:public"}}, h.wireGrants("worker:"+id))
+	pid, _ := h.activeWorker(api.WorkerFacts{}, "public")
+	assert.Equal(t, []api.Grant{{Role: api.RoleProcess, Scope: "queue:public"}}, h.wireGrants("worker:"+pid))
+}

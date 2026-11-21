@@ -62,23 +62,34 @@ func (t *Tx) RemoveGrant(ctx context.Context, principal string, role api.Role, s
 		return nil, err
 	}
 	workerID, isWorker := strings.CutPrefix(principal, "worker:")
-	if role != api.RoleProcess || !isWorker {
+	if !isWorker || (role != api.RoleProcess && role != api.RoleFetch) {
 		return nil, nil
 	}
-	ls, err := liveLeases(ctx, t.tx, `l.worker_id = ? AND t.job_id IS NOT NULL AND NOT `+processGrantSQL, workerID, principal)
+	reason, cond := "process grant revoked", `t.kind <> 'fetch' AND NOT `+processGrantSQL
+	if role == api.RoleFetch {
+		reason, cond = "fetch grant revoked", `t.kind = 'fetch' AND NOT `+fetchGrantSQL
+	}
+	ls, err := liveLeases(ctx, t.tx, `l.worker_id = ? AND t.job_id IS NOT NULL AND `+cond, workerID, principal)
 	if err != nil {
 		return nil, err
 	}
 	now := t.s.now()
 	var cancelled []string
 	for _, l := range ls {
-		end, err := t.s.endLease(ctx, t.tx, l, api.OutcomeCancelled, true, "process grant revoked", "", now)
+		end, err := t.s.endLease(ctx, t.tx, l, api.OutcomeCancelled, true, reason, "", now)
 		if err != nil {
 			return nil, err
 		}
 		if end != nil {
 			cancelled = append(cancelled, l.ID)
 		}
+	}
+	if role == api.RoleFetch {
+		_, ended, err := t.failAllOrphanedFetchJobs(ctx)
+		if err != nil {
+			return nil, err
+		}
+		cancelled = append(cancelled, ended...)
 	}
 	return cancelled, nil
 }
