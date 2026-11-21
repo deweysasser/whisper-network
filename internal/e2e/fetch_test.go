@@ -29,6 +29,11 @@ func fetchEnv(t *testing.T) *e2etest.Env {
 
 func startDownloader(e *e2etest.Env, desc string, mods ...func(*worker.Config)) *e2etest.Worker {
 	d := e.StartDownloader(desc, "home", mods...)
+	// Like requirePrepareSandbox: below full, the downloader is correctly
+	// never offered fetch tasks, so the test would only wait.
+	if lvl := e.WorkerByDescription(desc).Facts.SandboxLevel; lvl != api.SandboxFull {
+		e.T.Skipf("this platform's downloader sandbox level is %s, below the default fetch policy", lvl)
+	}
 	e.Approve(d.ID(), "public")
 	return d
 }
@@ -149,6 +154,7 @@ func TestE2ERetryRefetch(t *testing.T) {
 	job := submitURL(t, sub, "http://127.0.0.1:1/private")
 	failed := e.WaitJob(job.ID, api.JobFailed)
 	require.NotNil(t, failed.Error)
+	assert.Contains(t, *failed.Error, "permanent failure", "classified permanent, not a retryable error")
 	require.True(t, failed.Retryable, "retryable: %v", *failed.Error)
 	require.NoError(t, bad.Stop())
 
