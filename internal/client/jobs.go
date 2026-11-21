@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -59,6 +60,36 @@ func (c *Client) Submit(ctx context.Context, queue string, params api.JobParams,
 		return nil, false, fmt.Errorf("submit: decoding job: %w", err)
 	}
 	return job, resp.StatusCode == http.StatusCreated, nil
+}
+
+// SubmitURL asks the server to have a downloader worker fetch req.URL into a
+// new job on queue. The server never fetches the URL itself; with no eligible
+// downloader it answers 409 (problem type no-downloader), returned as *Error.
+// A 200 means idempotencyKey matched an existing job.
+func (c *Client) SubmitURL(ctx context.Context, queue string, req api.FetchRequest, idempotencyKey string) (*api.Job, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	hr, err := c.newRequest(ctx, http.MethodPost, c.endpoint("queue", queue, "fetch"), bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	hr.Header.Set("Content-Type", "application/json")
+	hr.Header.Set("Accept", "application/json")
+	if idempotencyKey != "" {
+		hr.Header.Set("Idempotency-Key", idempotencyKey)
+	}
+	resp, err := c.send(hr, http.StatusCreated, http.StatusOK)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	job := new(api.Job)
+	if err := json.NewDecoder(resp.Body).Decode(job); err != nil {
+		return nil, fmt.Errorf("submit url: decoding job: %w", err)
+	}
+	return job, nil
 }
 
 func writeSubmitBody(mw *multipart.Writer, params []byte, media io.Reader, filename string) error {

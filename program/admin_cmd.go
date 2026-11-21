@@ -84,7 +84,7 @@ func parseGrants(specs []string) ([]api.Grant, error) {
 type AdminCreateClientCmd struct {
 	adminData
 	Name  string   `required:"" help:"Client name"`
-	Grant []string `help:"role=scope grant, repeatable (e.g. submit=queue:public)"`
+	Grant []string `help:"role=scope grant, repeatable (e.g. submit=queue:public; submit_url lets a client submit URLs)"`
 }
 
 // Run creates the client and prints its token.
@@ -111,7 +111,7 @@ type AdminCreateUserCmd struct {
 	adminData
 	Username string   `required:"" help:"Username"`
 	Password string   `env:"WHISPER_NEW_PASSWORD" help:"Password (random, and must be changed, if unset)"`
-	Grant    []string `help:"role=scope grant, repeatable (e.g. queue_admin=queue:public)"`
+	Grant    []string `help:"role=scope grant, repeatable (e.g. queue_admin=queue:public, submit_url=queue:public)"`
 }
 
 // Run creates the user and prints a generated password.
@@ -167,7 +167,7 @@ func (c *AdminResetPasswordCmd) Run(ctx context.Context, logger zerolog.Logger) 
 type AdminGrantCmd struct {
 	adminData
 	Principal string   `required:"" help:"user:<name>, client:<id> or worker:<id>"`
-	Grant     []string `required:"" help:"role=scope, repeatable"`
+	Grant     []string `required:"" help:"role=scope, repeatable (queue roles: submit, submit_url, view_all, read_all, delete_all, queue_admin; fetch and process are for workers)"`
 	Revoke    bool     `help:"Revoke the grants instead"`
 }
 
@@ -221,7 +221,7 @@ func (c *AdminListWorkersCmd) Run(ctx context.Context, logger zerolog.Logger) er
 		}
 		var queues []string
 		for _, g := range gs {
-			if g.Role == api.RoleProcess {
+			if g.Role == api.RoleProcess || g.Role == api.RoleFetch {
 				queues = append(queues, strings.TrimPrefix(g.Scope, "queue:"))
 			}
 		}
@@ -239,7 +239,7 @@ func (c *AdminListWorkersCmd) Run(ctx context.Context, logger zerolog.Logger) er
 type AdminApproveWorkerCmd struct {
 	adminData
 	ID    string   `required:"" help:"Worker ID"`
-	Queue []string `help:"Queue the worker may process, repeatable"`
+	Queue []string `help:"Queue the worker may serve, repeatable (grants process to processing workers, fetch to downloaders)"`
 }
 
 // Run approves the worker.

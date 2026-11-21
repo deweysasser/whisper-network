@@ -42,6 +42,14 @@ func cliServer(t *testing.T) *httptest.Server {
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(job)
 	})
+	mux.HandleFunc("POST /queue/{q}/fetch", func(w http.ResponseWriter, r *http.Request) {
+		var req api.FetchRequest
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		require.NotEmpty(t, req.URL)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(api.Job{ID: "0193-url", Queue: r.PathValue("q"), State: api.JobFetching, CreatedAt: created})
+	})
 	mux.HandleFunc("GET /queue/{q}", func(w http.ResponseWriter, r *http.Request) {
 		page := api.JobList{}
 		if r.URL.Query().Get("cursor") == "" {
@@ -195,4 +203,35 @@ func TestClientCommandsTakeEnv(t *testing.T) {
 	opts.Status.out = &out
 	require.NoError(t, opts.Status.Run(context.Background()))
 
+}
+
+func TestSubmitCmdRequiresFileXorURL(t *testing.T) {
+	srv := cliServer(t)
+	media := filepath.Join(t.TempDir(), "a.wav")
+	require.NoError(t, os.WriteFile(media, []byte("x"), 0o600))
+	base := []string{"--server", srv.URL, "--token", cliToken}
+	var o Options
+	_, err := o.Parse(append([]string{"submit"}, base...))
+	assert.Error(t, err, "neither file nor url")
+	o = Options{}
+	_, err = o.Parse(append([]string{"submit", "--url", "https://example.com/a", media}, base...))
+	assert.Error(t, err, "both file and url")
+
+	opts := parseCLI(t, srv, "submit", "--url", "https://example.com/a", "--label", "l")
+	var out bytes.Buffer
+	opts.Submit.out = &out
+	require.NoError(t, opts.Submit.Run(context.Background()))
+	assert.Equal(t, "0193-url\n", out.String())
+}
+
+func TestListStateFetching(t *testing.T) {
+	srv := cliServer(t)
+	opts := parseCLI(t, srv, "status", "--state", "fetching")
+	var out bytes.Buffer
+	opts.Status.out = &out
+	require.NoError(t, opts.Status.Run(context.Background()))
+	assert.Contains(t, out.String(), "fetching")
+	var o Options
+	_, err := o.Parse([]string{"delete", "--state", "fetching", "--server", srv.URL, "--token", cliToken})
+	assert.NoError(t, err)
 }
