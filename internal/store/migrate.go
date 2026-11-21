@@ -62,12 +62,22 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	for _, m := range ms {
-		if err := retryBusy(ctx, DefaultBusyTimeout, func() error { return s.applyMigration(ctx, m, len(ms)) }); err != nil {
+		if err := retryBusy(ctx, migrationBusyLimit, func() error { return s.applyMigration(ctx, m, len(ms)) }); err != nil {
 			return err
 		}
 	}
 	return nil
 }
+
+// migrationBusyLimit bounds how long an opener keeps trying to take the
+// write lock for a migration step. Each attempt already waits busy_timeout;
+// the lock is not fair, so while another opener applies the steps one after
+// another (each in its own transaction) a waiter can lose every race for
+// longer than that, and the steps themselves are slow under load. A waiter
+// that keeps trying finds the database migrated once the other opener is
+// done (applyMigration checks the version before locking), so the limit only
+// has to outlast a whole migration run, not one step.
+const migrationBusyLimit = 60 * time.Second
 
 // retryBusy runs op until it returns something other than SQLITE_BUSY or
 // limit has passed. It exists for one case the busy_timeout handler does not
@@ -114,6 +124,14 @@ func (s *Store) applyMigration(ctx context.Context, m migration, latest int) err
 		return fmt.Errorf("migration %s: conn: %w", m.name, err)
 	}
 	defer func() { _ = conn.Close() }()
+	// Lock-free fast path: in WAL mode this read never waits for a writer.
+	// Anything already applied (by this process earlier, or by a concurrent
+	// opener) needs no transaction. The version is read again inside the
+	// transaction below, which is the check that counts.
+	var seen int
+	if err := conn.QueryRowContext(ctx, "PRAGMA user_version").Scan(&seen); err == nil && seen >= m.version && seen <= latest {
+		return nil
+	}
 	if m.foreignKeysOff() {
 		if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys=OFF"); err != nil {
 			return fmt.Errorf("migration %s: foreign_keys off: %w", m.name, err)
