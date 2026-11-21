@@ -23,7 +23,7 @@ func TestMemBudgetOffersWhatFits(t *testing.T) {
 	b := newMemBudget(4 * gib)
 	ctx := context.Background()
 
-	o1, r1, err := b.reserve(ctx, both, byMemory, 512*mib)
+	o1, r1, err := b.reserve(ctx, both, byMemory, 512*mib, 1*gib)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"small", "large"}, o1.models)
 	assert.Equal(t, both, o1.kinds)
@@ -33,7 +33,7 @@ func TestMemBudgetOffersWhatFits(t *testing.T) {
 	r1.shrink(small.PeakRSS)
 	assert.Equal(t, gib, b.inUse())
 
-	o2, r2, err := b.reserve(ctx, both, byMemory, 512*mib)
+	o2, r2, err := b.reserve(ctx, both, byMemory, 512*mib, 1*gib)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"small", "large"}, o2.models, "3 GiB still free")
 	r2.shrink(large.PeakRSS)
@@ -41,7 +41,7 @@ func TestMemBudgetOffersWhatFits(t *testing.T) {
 	// 0 bytes free: a third slot waits until memory is returned.
 	got := make(chan offer, 1)
 	go func() {
-		o, _, err := b.reserve(ctx, both, byMemory, 512*mib)
+		o, _, err := b.reserve(ctx, both, byMemory, 512*mib, 1*gib)
 		if err == nil {
 			got <- o
 		}
@@ -64,14 +64,14 @@ func TestMemBudgetOffersWhatFits(t *testing.T) {
 
 func TestMemBudgetPrepareOnlyAndCancel(t *testing.T) {
 	b := newMemBudget(600 * mib)
-	o, r, err := b.reserve(context.Background(), both, byMemory, 512*mib)
+	o, r, err := b.reserve(context.Background(), both, byMemory, 512*mib, 1*gib)
 	require.NoError(t, err)
 	assert.Equal(t, []api.TaskKind{api.KindPrepare}, o.kinds)
 	assert.Empty(t, o.models)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	_, _, err = b.reserve(ctx, both, byMemory, 512*mib)
+	_, _, err = b.reserve(ctx, both, byMemory, 512*mib, 1*gib)
 	assert.ErrorIs(t, err, context.DeadlineExceeded)
 	r.release()
 	assert.Equal(t, int64(0), b.inUse())

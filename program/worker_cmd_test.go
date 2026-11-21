@@ -2,6 +2,7 @@ package program
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -89,4 +90,32 @@ func TestWorkerCmdChildIdentityFlags(t *testing.T) {
 	assert.Equal(t, 10001, opts.Worker.ChildUID)
 	assert.Equal(t, 10002, opts.Worker.ChildGID)
 	assert.Empty(t, opts.Worker.MetricsListen, "no metrics listener unless asked for")
+}
+
+func TestWorkerCmdDownloaderFlags(t *testing.T) {
+	skipOnWindows(t, "the worker is unsupported")
+	var opts Options
+	_, err := opts.Parse([]string{"worker", "--server", "https://wn.example", "--downloader", "--yt-dlp", "/opt/yt-dlp",
+		"--yt-dlp-cookies", "/etc/c.txt", "--egress-group", "home", "--egress-probe", "https://ip.example",
+		"--allow-private-egress", "--fetch-timeout", "30m"})
+	require.NoError(t, err)
+	c := opts.Worker
+	assert.True(t, c.Downloader)
+	assert.Equal(t, "/opt/yt-dlp", c.YtDlp)
+	assert.Equal(t, "/etc/c.txt", c.YtDlpCookies)
+	assert.Equal(t, "home", c.EgressGroup)
+	assert.Equal(t, "https://ip.example", c.EgressProbe)
+	assert.True(t, c.AllowPrivateEgress)
+	assert.Equal(t, 30*time.Minute, c.FetchTimeout)
+	assert.Zero(t, c.Slots, "the worker applies the downloader default of 2")
+
+	opts = Options{}
+	_, err = opts.Parse([]string{"worker", "--server", "https://wn.example", "--downloader"})
+	require.NoError(t, err)
+	assert.Equal(t, "yt-dlp", opts.Worker.YtDlp)
+	assert.Equal(t, 2*time.Hour, opts.Worker.FetchTimeout)
+
+	opts = Options{}
+	_, err = opts.Parse([]string{"worker", "--server", "https://wn.example", "--egress-group", "x"})
+	assert.ErrorContains(t, err, "--downloader")
 }

@@ -39,13 +39,13 @@ type offer struct {
 }
 
 func (o offer) empty() bool {
-	return !slices.Contains(o.kinds, api.KindPrepare) && len(o.models) == 0
+	return !slices.Contains(o.kinds, api.KindPrepare) && !slices.Contains(o.kinds, api.KindFetch) && len(o.models) == 0
 }
 
 // reserve computes what fits in unreserved memory and reserves the largest
 // amount any of it could need. With nothing fitting it waits for memory to be
 // freed, or returns ctx's error.
-func (b *memBudget) reserve(ctx context.Context, kinds []api.TaskKind, candidates []models.Model, prepareMem int64) (offer, *reservation, error) {
+func (b *memBudget) reserve(ctx context.Context, kinds []api.TaskKind, candidates []models.Model, prepareMem, fetchMem int64) (offer, *reservation, error) {
 	for {
 		b.mu.Lock()
 		free := b.total - b.reserved
@@ -54,6 +54,10 @@ func (b *memBudget) reserve(ctx context.Context, kinds []api.TaskKind, candidate
 		if slices.Contains(kinds, api.KindPrepare) && prepareMem <= free {
 			o.kinds = append(o.kinds, api.KindPrepare)
 			need = prepareMem
+		}
+		if slices.Contains(kinds, api.KindFetch) && fetchMem <= free {
+			o.kinds = append(o.kinds, api.KindFetch)
+			need = max(need, fetchMem)
 		}
 		if slices.Contains(kinds, api.KindTranscribe) {
 			for _, m := range candidates {

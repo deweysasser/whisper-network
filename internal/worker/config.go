@@ -115,6 +115,30 @@ type Config struct {
 	NumCPU int
 	// ChildEnv is appended to the scrubbed environment of every child.
 	ChildEnv []string
+	// Downloader makes this a downloader worker: it runs fetch tasks only
+	// (yt-dlp behind a local SSRF-filtering proxy) and needs neither ffmpeg,
+	// whisper-cli nor models.
+	Downloader bool
+	// YtDlp names the yt-dlp binary (default "yt-dlp").
+	YtDlp string
+	// YtDlpCookies is an operator-supplied cookies file, copied into each
+	// lease directory.
+	YtDlpCookies string
+	// EgressGroup names the shared egress this downloader sits behind; the
+	// server rate-limits per group.
+	EgressGroup string
+	// EgressProbe is a URL returning the caller's public IP as plain text.
+	// Empty leaves the egress IP unreported (the server falls back to the
+	// worker's remote address).
+	EgressProbe string
+	// EgressProbeInterval is the period of the egress probe (default 10 min).
+	EgressProbeInterval time.Duration
+	// AllowPrivateEgress lets the downloader reach loopback, private and
+	// link-local addresses.
+	AllowPrivateEgress bool
+	// ProbeDownloaderSandbox measures the downloader sandbox level with the
+	// proxy port allowed (default sandbox.ProbeDownloader(Self, port)).
+	ProbeDownloaderSandbox func(ctx context.Context, proxyPort uint16) (sandbox.ProbeResult, error)
 	// ProbeSandbox measures the sandbox level (default sandbox.Probe(Self)).
 	ProbeSandbox func(ctx context.Context) (sandbox.ProbeResult, error)
 }
@@ -154,6 +178,13 @@ type Limits struct {
 	// PrepareMemory is the memory reserved for a prepare task in the slot
 	// accounting (default 512 MiB).
 	PrepareMemory int64
+	// FetchTimeout bounds one fetch (default 2 h).
+	FetchTimeout time.Duration
+	// FetchMemory is the memory reserved for a fetch in the slot accounting
+	// (default 1 GiB).
+	FetchMemory int64
+	// FetchAddressSpace is yt-dlp's RLIMIT_AS (default 4 GiB).
+	FetchAddressSpace int64
 }
 
 const (
@@ -199,6 +230,14 @@ func (c *Config) setDefaults() error {
 	if c.FreeBytes == nil {
 		c.FreeBytes = diskfree.Free
 	}
+	if c.Downloader {
+		c.Kinds = []api.TaskKind{api.KindFetch}
+		def(&c.Slots, 2)
+		if c.YtDlp == "" {
+			c.YtDlp = "yt-dlp"
+		}
+		defDur(&c.EgressProbeInterval, 10*time.Minute)
+	}
 	if len(c.Kinds) == 0 {
 		c.Kinds = []api.TaskKind{api.KindPrepare, api.KindTranscribe}
 	}
@@ -232,6 +271,12 @@ func (c *Config) setDefaults() error {
 	if c.SysRoot == nil {
 		c.SysRoot = os.DirFS("/")
 	}
+	if c.ProbeDownloaderSandbox == nil {
+		self := c.Self
+		c.ProbeDownloaderSandbox = func(ctx context.Context, port uint16) (sandbox.ProbeResult, error) {
+			return sandbox.ProbeDownloader(ctx, self, port)
+		}
+	}
 	if c.ProbeSandbox == nil {
 		self := c.Self
 		c.ProbeSandbox = func(ctx context.Context) (sandbox.ProbeResult, error) { return sandbox.Probe(ctx, self) }
@@ -250,6 +295,9 @@ func (c *Config) setDefaults() error {
 	def64(&l.OpenFiles, 256)
 	def64(&l.Processes, 256)
 	def64(&l.PrepareMemory, 512*mib)
+	defDur(&l.FetchTimeout, 2*time.Hour)
+	def64(&l.FetchMemory, gib)
+	def64(&l.FetchAddressSpace, 4*gib)
 	return nil
 }
 

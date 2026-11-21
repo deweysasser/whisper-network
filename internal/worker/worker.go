@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/deweysasser/whisper-network/internal/api"
 	"github.com/deweysasser/whisper-network/internal/client"
+	"github.com/deweysasser/whisper-network/internal/egress"
 	"github.com/deweysasser/whisper-network/internal/models"
 	"github.com/deweysasser/whisper-network/internal/obs"
 )
@@ -43,6 +45,14 @@ type Worker struct {
 	// offered are the whisper models in facts, smallest first.
 	offered []models.Model
 
+	// Downloader state: the filtering proxy yt-dlp is pointed at, the
+	// filtered client for the egress probe, and the probe's trigger.
+	proxy         *egress.Proxy
+	egressClient  *http.Client
+	egressTrigger chan struct{}
+	egressMu      sync.Mutex
+	egressIP      string
+
 	mem      *memBudget
 	cache    *ModelCache
 	disk     *diskMeter
@@ -61,6 +71,7 @@ type Worker struct {
 
 // tools are the resolved child binaries and their versions.
 type tools struct {
+	ytdlp, ytdlpVersion          string // downloader only
 	whisper, ffmpeg              string // absolute paths, "" if absent
 	engineVersion, ffmpegVersion string
 	// whisperRO and ffmpegRO are what each tool's sandbox may read besides
@@ -78,15 +89,27 @@ func New(cfg Config) (*Worker, error) {
 		numCPU = runtime.NumCPU()
 	}
 	return &Worker{
-		cfg:          cfg,
-		log:          cfg.Logger,
-		sys:          System{Root: cfg.SysRoot, NumCPU: numCPU},
-		pollInterval: cfg.PausedPoll,
+		cfg:           cfg,
+		log:           cfg.Logger,
+		sys:           System{Root: cfg.SysRoot, NumCPU: numCPU},
+		pollInterval:  cfg.PausedPoll,
+		egressTrigger: make(chan struct{}, 1),
 	}, nil
 }
 
 // Facts returns the facts probed by Run (zero before Run probes).
-func (w *Worker) Facts() api.WorkerFacts { return w.facts }
+func (w *Worker) Facts() api.WorkerFacts { return w.currentFacts() }
+
+// currentFacts is the probed facts with the latest egress IP.
+func (w *Worker) currentFacts() api.WorkerFacts {
+	f := w.facts
+	w.egressMu.Lock()
+	defer w.egressMu.Unlock()
+	if w.egressIP != "" {
+		f.EgressIP = w.egressIP
+	}
+	return f
+}
 
 // ID returns the worker ID once registered, else "".
 func (w *Worker) ID() string {
@@ -127,6 +150,15 @@ func (w *Worker) Run(ctx context.Context) error {
 	if err := w.checkDedicatedChildUID(); err != nil {
 		return err
 	}
+	if w.cfg.Downloader {
+		// Before the probe: the sandbox self-test connects to the proxy's
+		// port and would otherwise listen on it itself.
+		stop, err := w.startEgress(ctx)
+		if err != nil {
+			return err
+		}
+		defer stop()
+	}
 	if err := w.probe(ctx); err != nil {
 		return err
 	}
@@ -163,6 +195,13 @@ func (w *Worker) Run(ctx context.Context) error {
 	w.log.Info().Int("slots", w.facts.Slots).Strs("models", w.facts.Models).
 		Strs("kinds", kindStrings(w.facts.Kinds)).Msg("worker active; starting slots")
 	var wg sync.WaitGroup
+	if w.cfg.Downloader && w.egressClient != nil && w.cfg.EgressProbe != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w.runEgressProbe(runCtx)
+		}()
+	}
 	for i := range w.facts.Slots {
 		wg.Add(1)
 		go func() {
