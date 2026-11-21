@@ -275,8 +275,11 @@ func (s *Server) handleFailure(w http.ResponseWriter, r *http.Request, p *Princi
 		}
 		if l.Kind == api.KindFetch {
 			fetch = l
-			rep.Reason, rep.StderrTail = redactURLs(rep.Reason, l.URL), redactURLs(rep.StderrTail, l.URL)
 		}
+	}
+	stage := rep.Stage
+	if !stage.Valid() {
+		stage = ""
 	}
 	reason := strings.TrimSpace(rep.Reason)
 	if reason == "" {
@@ -285,9 +288,11 @@ func (s *Server) handleFailure(w http.ResponseWriter, r *http.Request, p *Princi
 	if len(reason) > maxReasonLen {
 		reason = strings.ToValidUTF8(reason[:maxReasonLen], "")
 	}
-	stage := rep.Stage
-	if !stage.Valid() {
-		stage = ""
+	tail := obs.StderrTail(rep.StderrTail)
+	if fetch != nil {
+		// A downloader's own words quote the URL in forms no filter
+		// reliably catches (encoded, partial, ids): they are never kept.
+		reason, tail = fetchFailureReason(stage, rep.Retryable), ""
 	}
 	end, err := s.st.FailStage(r.Context(), r.PathValue("id"), p.ID, reason, rep.Retryable, stage)
 	if err != nil {
@@ -297,7 +302,7 @@ func (s *Server) handleFailure(w http.ResponseWriter, r *http.Request, p *Princi
 		Int(obs.FieldTaskSeq, end.Seq).Str(obs.FieldTaskKind, string(end.Kind)).Str(obs.FieldWorkerID, p.ID).
 		Int(obs.FieldAttempt, end.Attempt).Bool("retryable", rep.Retryable).Str("stage", string(stage)).
 		Str(obs.FieldError, reason).
-		Str(obs.FieldStderrTail, obs.StderrTail(rep.StderrTail)).Msg("task failed")
+		Str(obs.FieldStderrTail, tail).Msg("task failed")
 	if fetch != nil {
 		s.fetchFailed(r.Context(), fetch, stage)
 	}
@@ -345,6 +350,13 @@ func (s *Server) leaseEnded(ctx context.Context, end *store.LeaseEnd) {
 		return
 	}
 	s.metrics.LeaseEnded(end.Outcome, end.Kind)
+	if end.Kind == api.KindFetch {
+		switch end.Outcome {
+		case api.OutcomeExpired, api.OutcomeReleased, api.OutcomeCancelled:
+			// Failures are counted where their cause is known.
+			s.metrics.FetchResult(s.jobSiteLabel(ctx, end.JobID), string(end.Outcome))
+		}
+	}
 	if p := end.AutoPaused; p != nil {
 		// Paused and audited in the transaction that ended the lease.
 		obs.Warn(&s.log, obs.EventWorkerAutoPaused).Str(obs.FieldWorkerID, p.WorkerID).

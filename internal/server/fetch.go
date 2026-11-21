@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"net/netip"
-	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -230,6 +229,9 @@ type pacingTimer struct {
 	stop   func() bool // nil when no timer is pending
 	due    time.Time
 	closed bool
+	// gen identifies the pending timer, so a timer that fired after it
+	// was replaced does not clear its successor.
+	gen uint64
 	// invalid is the last set of invalid fetch policy keys logged.
 	invalid string
 }
@@ -270,16 +272,21 @@ func (s *Server) reschedulePacing() {
 		t.stop()
 	}
 	t.due = next
-	t.stop = s.afterFunc(max(next.Sub(now), time.Millisecond), s.pacingFired)
+	t.gen++
+	gen := t.gen
+	t.stop = s.afterFunc(max(next.Sub(now), time.Millisecond), func() { s.pacingFired(gen) })
 }
 
-// pacingFired runs when the pacing timer goes off: wake waiting claims and
-// schedule the next wake-up.
-func (s *Server) pacingFired() {
+// pacingFired runs when timer gen goes off: wake waiting claims and
+// schedule the next wake-up. A timer replaced before it could be stopped
+// still wakes claims, but leaves the pending timer alone.
+func (s *Server) pacingFired(gen uint64) {
 	t := &s.pacing
 	t.mu.Lock()
 	closed := t.closed
-	t.stop, t.due = nil, time.Time{}
+	if t.gen == gen {
+		t.stop, t.due = nil, time.Time{}
+	}
 	t.mu.Unlock()
 	if closed {
 		return
@@ -319,7 +326,7 @@ func (s *Server) checkFetchPolicies(ctx context.Context) {
 	t.invalid = joined
 	t.mu.Unlock()
 	if changed && len(bad) > 0 {
-		s.log.Warn().Strs("keys", bad).
+		s.log.Warn().Strs(obs.FieldPolicyKeys, bad).
 			Msg("invalid fetch policies block the sites they govern; fix them on the fetch policies page")
 	}
 }
@@ -358,6 +365,9 @@ func (s *Server) siteLabel(ctx context.Context, site string) string {
 // page or an API answer (HTML, XML, JSON, plain text) rather than media,
 // and what they look like. It mirrors the downloader's own guard.
 func notMedia(head []byte) (string, bool) {
+	if knownMedia(head) {
+		return "media", false
+	}
 	ct := media.Sniff(head)
 	mt, _, _ := strings.Cut(ct, ";")
 	mt = strings.TrimSpace(mt)
@@ -370,6 +380,23 @@ func notMedia(head []byte) (string, bool) {
 		return "markup or JSON", true
 	}
 	return mt, false
+}
+
+// knownMedia reports whether head starts with the signature of a common
+// audio or video container, which is media whatever a text sniffer makes of
+// it (MPEG audio frames, say, can look like text).
+func knownMedia(head []byte) bool {
+	switch {
+	case len(head) >= 12 && string(head[:4]) == "RIFF" && string(head[8:12]) == "WAVE",
+		bytes.HasPrefix(head, []byte("fLaC")),
+		bytes.HasPrefix(head, []byte("OggS")),
+		bytes.HasPrefix(head, []byte("ID3")),
+		bytes.HasPrefix(head, []byte{0x1A, 0x45, 0xDF, 0xA3}),     // EBML: Matroska, WebM
+		len(head) >= 8 && string(head[4:8]) == "ftyp",             // ISO BMFF: MP4, M4A
+		len(head) >= 2 && head[0] == 0xFF && head[1]&0xE0 == 0xE0: // MPEG audio frame sync, ADTS
+		return true
+	}
+	return false
 }
 
 // fetchResult accepts a fetch lease's result: the fetched media, streamed
@@ -513,31 +540,58 @@ func (s *Server) fetchLimit(l *store.Lease) int64 {
 // job, if it is still live. outcome is the whisper_fetch_total outcome.
 func (s *Server) rejectFetch(ctx context.Context, l *store.Lease, status int, typ, reason, outcome string) error {
 	if l.Live {
-		end, err := s.st.Fail(ctx, l.ID, l.WorkerID, "invalid result: "+reason, false)
+		why := map[string]string{"not_media": fetchReasonNotMedia, "too_large": fetchReasonTooLarge}[outcome]
+		if why == "" {
+			why = fetchReasonBadMedia
+		}
+		end, err := s.st.Fail(ctx, l.ID, l.WorkerID, "invalid result: "+why, false)
 		if err != nil {
 			return err
 		}
 		obs.Warn(&s.log, obs.EventTaskFailed).Str(obs.FieldLeaseID, l.ID).Str(obs.FieldJobID, l.JobID).
 			Int(obs.FieldTaskSeq, l.Seq).Str(obs.FieldTaskKind, string(l.Kind)).Str(obs.FieldWorkerID, l.WorkerID).
 			Int(obs.FieldAttempt, end.Attempt).Str(obs.FieldSite, l.Site).
-			Str(obs.FieldError, "invalid result: "+reason).Msg("result rejected")
+			Str(obs.FieldError, "invalid result: "+why).Msg("result rejected")
 		s.metrics.FetchResult(s.siteLabel(ctx, l.Site), outcome)
 		s.leaseEnded(ctx, end)
 	}
 	return newProblem(status, typ, reason)
 }
 
-// urlRE matches URLs in free text (a downloader's error output).
-var urlRE = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]*://[^\s"'<>]+`)
+// Classified failure reasons of fetch leases: the only failure text a
+// fetch lease's job error and logs ever carry (see handleFailure).
+const (
+	fetchReasonRateLimited = "rate limited"
+	fetchReasonPreWork     = "pre-work failure"
+	fetchReasonPermanent   = "permanent failure"
+	fetchReasonTransient   = "transient failure"
+	fetchReasonNotMedia    = "not media"
+	fetchReasonTooLarge    = "too large"
+	fetchReasonBadMedia    = "unusable media"
+)
 
-// redactURLs removes the lease's URL, and anything else that looks like a
-// URL, from a downloader's failure reason or stderr: yt-dlp quotes the URL
-// in its errors, and reasons end up in logs (and job errors in job.failed).
-func redactURLs(s, rawURL string) string {
-	if rawURL != "" {
-		s = strings.ReplaceAll(s, rawURL, "<url>")
+// fetchFailureReason classifies a downloader's failure report by its stage
+// and retryability alone.
+func fetchFailureReason(stage api.FailureStage, retryable bool) string {
+	switch {
+	case stage == api.StageRateLimited:
+		return fetchReasonRateLimited
+	case stage == api.StagePreWork:
+		return fetchReasonPreWork
+	case !retryable:
+		return fetchReasonPermanent
 	}
-	return urlRE.ReplaceAllString(s, "<url>")
+	return fetchReasonTransient
+}
+
+// jobSiteLabel is the site label (fetchSiteLabels) of a job's fetch site;
+// "other" if the job is gone.
+func (s *Server) jobSiteLabel(ctx context.Context, jobID string) string {
+	site := ""
+	if j, err := s.st.Job(ctx, jobID); err == nil {
+		site = j.FetchSite
+	}
+	return s.siteLabel(ctx, site)
 }
 
 // fetchFailed does the fetch-specific bookkeeping of a reported failure of
@@ -557,8 +611,8 @@ func (s *Server) fetchFailed(ctx context.Context, l *store.Lease, stage api.Fail
 		for _, c := range cds {
 			if c.EgressKey == l.EgressKey && c.Site == l.Site {
 				obs.Warn(&s.log, obs.EventFetchCooldown).Str(obs.FieldSite, c.Site).
-					Str(obs.FieldEgressKey, c.EgressKey).Time(obs.FieldUntil, c.Until).Int("level", c.Level).
-					Bool("manual", c.Manual).Msg("fetch cooldown")
+					Str(obs.FieldEgressKey, c.EgressKey).Time(obs.FieldUntil, c.Until).Int(obs.FieldCooldownLevel, c.Level).
+					Bool(obs.FieldManual, c.Manual).Msg("fetch cooldown")
 			}
 		}
 	}

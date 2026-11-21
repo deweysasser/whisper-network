@@ -2,12 +2,14 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -245,6 +247,8 @@ func TestFetchResultNotMedia422(t *testing.T) {
 		h.expectProblem(resp, b, http.StatusUnprocessableEntity, api.ProblemNotMedia)
 		j := h.job(job.ID)
 		assert.Equal(t, api.JobFailed, j.State, "not media fails the job at once")
+		require.NotNil(t, j.Error)
+		assert.Contains(t, *j.Error, "invalid result: not media")
 		assertNoOriginal(t, h, job.ID)
 		assert.Nil(t, h.claim(d2, d2tok, "", nil), "not requeued")
 	}
@@ -369,7 +373,8 @@ func TestFetchPacingWakesWaitingClaim(t *testing.T) {
 	wait := testscale.D(8 * time.Second)
 	got := make(chan *api.Lease, 1)
 	go func() { got <- h.claim(did, dtok, wait.String(), nil) }()
-	time.Sleep(200 * time.Millisecond) // let the claim start waiting
+	require.Eventually(t, func() bool { return len(h.srv.waiters.keys()) > 0 },
+		testscale.D(5*time.Second), 5*time.Millisecond, "the claim is waiting")
 	start := time.Now()
 	h.clk.Advance(3*time.Minute + time.Second)
 	select {
@@ -470,33 +475,51 @@ func TestFetchSubmitURLNotLoggedOrAudited(t *testing.T) {
 	h := newHarness(t)
 	client := h.client(submitURLOn("public"))
 	did, dtok := h.downloader("", "", "public")
-	secretURL := "https://media.example.com/a.wav?token=secret"
-	job := h.fetchSubmit(client, "public", secretURL)
+	// The bare token, the URL, and a percent-decoded form of it.
+	const token = "secret"
+	secretURL := "https://media.example.com/my%20talk.wav?token=" + token + "%2Fx"
+	decoded := "https://media.example.com/my talk.wav?token=" + token + "/x"
+	resp, b := h.fetchCall(client, "public", api.FetchRequest{
+		JobParams: api.JobParams{Model: "small.en", Source: "my talk"}, URL: secretURL}, "")
+	require.Equal(t, http.StatusCreated, resp.StatusCode, string(b))
+	var job api.Job
+	require.NoError(t, json.Unmarshal(b, &job))
 	// Bad submissions must not echo it into logs either.
 	h.fetchCall(client, "public", api.FetchRequest{JobParams: api.JobParams{Model: "nope"}, URL: secretURL}, "")
 	h.fetchCall(client, "public", api.FetchRequest{JobParams: api.JobParams{Model: "small.en"},
-		URL: "ftp://media.example.com/a.wav?token=secret"}, "")
+		URL: "ftp://media.example.com/a.wav?token=" + token}, "")
 	l := h.claim(did, dtok, "", nil)
 	require.NotNil(t, l)
 	assert.Equal(t, secretURL, l.URL, "the downloader gets the URL")
 	h.expect("POST", "/lease/"+l.ID+"/failure", dtok, api.FailureReport{
-		Reason:     "ERROR: [generic] " + secretURL + ": HTTP Error 404: Not Found",
-		StderrTail: "fetching " + secretURL + "\nERROR 404", Retryable: false, Stage: api.StageInput},
+		Reason:     "ERROR: [generic] " + secretURL + ": HTTP Error 404 for " + decoded + " (token " + token + ")",
+		StderrTail: "fetching " + decoded + "\nmedia.example.com/my talk.wav?token=" + token + "\nERROR 404",
+		Retryable:  false, Stage: api.StageInput},
 		http.StatusNoContent, nil)
-	j := h.job(job.ID)
+	_, jb := h.call("GET", "/job/"+job.ID, client, nil)
+	var j api.Job
+	require.NoError(t, json.Unmarshal(jb, &j))
 	require.Equal(t, api.JobFailed, j.State)
 	require.NotNil(t, j.Error)
-	assert.NotContains(t, *j.Error, "secret")
-	assert.Contains(t, *j.Error, "HTTP Error 404")
+	assert.Contains(t, *j.Error, "permanent failure", "a classified reason, not the worker's text")
+	assert.NotContains(t, string(jb), token, "the job view")
+	assert.NotContains(t, string(jb), "media.example.com")
 	h.srv.refreshStats(h.ctx)
 
-	assert.NotContains(t, string(h.logs.Bytes()), "secret")
-	assert.NotContains(t, h.metricsText(), "secret")
+	logs := string(h.logs.Bytes())
+	for _, leak := range []string{token, "media.example.com", "my talk.wav", "my%20talk"} {
+		assert.NotContains(t, logs, leak)
+		assert.NotContains(t, h.metricsText(), leak)
+	}
+	failed := h.logs.events(t, obs.EventTaskFailed)
+	require.Len(t, failed, 1)
+	assert.Equal(t, "permanent failure", failed[0][obs.FieldError])
+	assert.Empty(t, failed[0][obs.FieldStderrTail])
 	es, err := h.st.QueryAudit(h.ctx, store.AuditFilter{Limit: 1000})
 	require.NoError(t, err)
 	var found bool
 	for _, e := range es {
-		assert.NotContains(t, e.Detail, "secret", e.Action)
+		assert.NotContains(t, e.Detail, token, e.Action)
 		assert.NotContains(t, e.Detail, "media.example.com", e.Action)
 		if e.Action == "job.create" {
 			found = true
@@ -504,6 +527,164 @@ func TestFetchSubmitURLNotLoggedOrAudited(t *testing.T) {
 		}
 	}
 	assert.True(t, found)
+}
+
+func TestFetchFailureReasons(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		stage     api.FailureStage
+		retryable bool
+		want      string
+	}{
+		{api.StageRateLimited, false, "rate limited"},
+		{api.StagePreWork, true, "pre-work failure"},
+		{api.StageInput, false, "permanent failure"},
+		{api.StageInput, true, "transient failure"},
+		{"", true, "transient failure"},
+	} {
+		assert.Equal(t, tc.want, fetchFailureReason(tc.stage, tc.retryable), "%s %v", tc.stage, tc.retryable)
+	}
+}
+
+// TestFetchFailureKeepsProcessingReasons: other leases keep the worker's
+// own failure text.
+func TestFetchFailureKeepsProcessingReasons(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	client := h.client(submitOn("public"))
+	wid, wtok := h.activeWorker(api.WorkerFacts{}, "public")
+	h.submit(client, "public", api.JobParams{Model: "small.en"}, []byte("not audio at all"))
+	l := h.claim(wid, wtok, "", nil)
+	require.NotNil(t, l)
+	h.expect("POST", "/lease/"+l.ID+"/failure", wtok, api.FailureReport{Reason: "ffmpeg exploded",
+		Retryable: true}, http.StatusNoContent, nil)
+	failed := h.logs.events(t, obs.EventTaskFailed)
+	require.Len(t, failed, 1)
+	assert.Equal(t, "ffmpeg exploded", failed[0][obs.FieldError])
+}
+
+func TestFetchLeaseEndOutcomesCounted(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	client := h.client(submitURLOn("public"))
+	did, dtok := h.downloader("", "", "public")
+	h.fetchSubmit(client, "public", exURL)
+	l := h.claim(did, dtok, "", nil)
+	require.NotNil(t, l)
+	h.expect("DELETE", "/lease/"+l.ID, dtok, nil, http.StatusNoContent, nil)
+	assert.Contains(t, h.metricsText(), `whisper_fetch_total{site="other",outcome="released"} 1`)
+
+	l = h.claim(did, dtok, "", nil)
+	require.NotNil(t, l)
+	h.clk.Advance(time.Hour)
+	h.srv.reapOnce(h.ctx)
+	assert.Contains(t, h.metricsText(), `whisper_fetch_total{site="other",outcome="expired"} 1`)
+}
+
+func TestNotMediaAllowsKnownMedia(t *testing.T) {
+	t.Parallel()
+	pad := func(b []byte) []byte { return append(b, bytes.Repeat([]byte("plain text "), 40)...) }
+	for name, head := range map[string][]byte{
+		"mpeg layer I": pad([]byte{0xFF, 0xFE, 0x90, 0x00}), // FF FE also reads as a UTF-16 BOM
+		"mp3 frame":    pad([]byte{0xFF, 0xFB, 0x90, 0x00}),
+		"id3":          pad([]byte("ID3\x04\x00")),
+		"ogg":          pad([]byte("OggS\x00")),
+		"mp4":          pad([]byte("\x00\x00\x00\x20ftypisom")),
+		"webm":         pad([]byte{0x1A, 0x45, 0xDF, 0xA3}),
+		"wav":          canonicalWAV(speech(0.01, media.SampleRate)),
+		"flac":         pad([]byte("fLaC")),
+	} {
+		_, bad := notMedia(head)
+		assert.False(t, bad, name)
+	}
+	for name, head := range map[string][]byte{
+		"html": []byte("<!doctype html><html></html>"),
+		"json": []byte(`  {"a":1}`),
+		"xml":  []byte(`<?xml version="1.0"?><a/>`),
+		"text": []byte("Too many requests, slow down"),
+	} {
+		_, bad := notMedia(head)
+		assert.True(t, bad, name)
+	}
+}
+
+// TestPacingTimerGenerations: a timer that fires after it was replaced
+// leaves its successor pending.
+func TestPacingTimerGenerations(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	client := h.client(submitURLOn("public"))
+	did, dtok := h.downloader("a", "", "public")
+	h.fetchSubmit(client, "public", ytURL)
+	l := h.claim(did, dtok, "", nil)
+	require.NotNil(t, l)
+	resp, b := h.putFetch(l, dtok, canonicalFLAC(t, speech(1, media.SampleRate)))
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(b))
+	h.fetchSubmit(client, "public", ytURL+"x") // paced: a timer is set
+
+	pt := &h.srv.pacing
+	state := func() (bool, uint64, time.Time) {
+		pt.mu.Lock()
+		defer pt.mu.Unlock()
+		return pt.stop != nil, pt.gen, pt.due
+	}
+	pending, gen, due := state()
+	require.True(t, pending)
+	h.srv.pacingFired(gen - 1) // a stale timer
+	p2, g2, d2 := state()
+	assert.True(t, p2, "the pending timer is kept")
+	assert.Equal(t, gen, g2)
+	assert.Equal(t, due, d2)
+
+	h.srv.pacingFired(gen) // the current one: cleared, then rescheduled
+	p3, g3, _ := state()
+	assert.True(t, p3)
+	assert.Equal(t, gen+1, g3)
+}
+
+// TestFetchWaitersLifecycle: a downloader's key is registered while its
+// claim long-polls, and removed however the claim ends.
+func TestFetchWaitersLifecycle(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	client := h.client(submitURLOn("public"))
+	did, dtok := h.downloader("a", "", "public")
+	waiting := func() bool { return slices.Contains(h.srv.waiters.keys(), "label:a") }
+	gone := func() bool { return len(h.srv.waiters.keys()) == 0 }
+	tick := 5 * time.Millisecond
+	within := testscale.D(5 * time.Second)
+
+	// Timeout.
+	done := make(chan *api.Lease, 1)
+	go func() { done <- h.claim(did, dtok, "500ms", nil) }()
+	require.Eventually(t, waiting, within, tick)
+	assert.Nil(t, <-done)
+	require.Eventually(t, gone, within, tick)
+
+	// A lease.
+	go func() { done <- h.claim(did, dtok, testscale.D(8*time.Second).String(), nil) }()
+	require.Eventually(t, waiting, within, tick)
+	h.fetchSubmit(client, "public", exURL)
+	assert.NotNil(t, <-done)
+	require.Eventually(t, gone, within, tick)
+
+	// The worker goes away.
+	ctx, cancel := context.WithCancel(h.ctx)
+	hr, err := http.NewRequestWithContext(ctx, "POST", h.ts.URL+"/worker/"+did+"/leases?wait=8s", nil)
+	require.NoError(t, err)
+	hr.Header.Set("Authorization", "Bearer "+dtok)
+	errc := make(chan error, 1)
+	go func() {
+		resp, err := h.ts.Client().Do(hr)
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+		errc <- err
+	}()
+	require.Eventually(t, waiting, within, tick)
+	cancel()
+	assert.Error(t, <-errc)
+	require.Eventually(t, gone, within, tick)
 }
 
 // TestFetchSiteLabel: a site gets its own metric label only when a fetch

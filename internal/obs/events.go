@@ -92,4 +92,10 @@ const (
 	FieldEgressKey   = "egress_key"
 	FieldFetchMethod = "fetch_method"
 	FieldUntil       = "until"
+	// FieldCooldownLevel is a fetch cooldown's backoff level ("level" is
+	// the log level's key) and FieldManual whether an admin set it.
+	FieldCooldownLevel = "cooldown_level"
+	FieldManual        = "manual"
+	// FieldPolicyKeys lists fetch policy keys.
+	FieldPolicyKeys = "policy_keys"
 )
