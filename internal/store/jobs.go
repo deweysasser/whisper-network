@@ -354,10 +354,10 @@ func (o JobSort) Valid() bool { return o == "" || o == SortCreated || o == SortS
 
 // jobStateRankSQL and jobStateKeySQL (over j = jobs) are the state order's
 // group and the time within the group. They must match the expressions of
-// the jobs_queue_state_order index (migration 0009) exactly.
+// the jobs_queue_state_order index (migrations 0009, 0012) exactly.
 const (
 	jobStateRankSQL = `(CASE j.state WHEN 'running' THEN 0 WHEN 'queued' THEN 1 WHEN 'preparing' THEN 1 ` +
-		`WHEN 'failed' THEN 2 ELSE 3 END)`
+		`WHEN 'fetching' THEN 1 WHEN 'failed' THEN 2 ELSE 3 END)`
 	jobStateKeySQL = `(CASE WHEN j.state IN ('failed','done') THEN -COALESCE(j.completed_at, j.created_at) ` +
 		`ELSE j.created_at END)`
 )
@@ -368,7 +368,7 @@ func (j *Job) stateOrder() (rank, key int64) {
 	switch j.State {
 	case api.JobRunning:
 		return 0, toMS(j.CreatedAt)
-	case api.JobQueued, api.JobPreparing:
+	case api.JobQueued, api.JobPreparing, api.JobFetching:
 		return 1, toMS(j.CreatedAt)
 	}
 	rank, t := int64(3), j.CreatedAt

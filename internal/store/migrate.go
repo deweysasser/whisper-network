@@ -95,8 +95,36 @@ func retryBusy(ctx context.Context, limit time.Duration, op func() error) error 
 	}
 }
 
+// foreignKeysOffDirective, as the first line of a migration, runs it with
+// foreign key enforcement off, which SQLite's table rebuild procedure needs
+// (https://sqlite.org/lang_altertable.html, "Making Other Kinds Of Table
+// Schema Changes"). PRAGMA foreign_keys cannot change inside a transaction,
+// so it is set on the dedicated connection before BEGIN; foreign_key_check
+// must come back empty before COMMIT; enforcement is restored in every path.
+const foreignKeysOffDirective = "-- whisper:foreign-keys-off"
+
+func (m migration) foreignKeysOff() bool {
+	first, _, _ := strings.Cut(m.sql, "\n")
+	return strings.TrimSpace(first) == foreignKeysOffDirective
+}
+
 func (s *Store) applyMigration(ctx context.Context, m migration, latest int) error {
-	tx, err := s.w.BeginTx(ctx, nil)
+	conn, err := s.w.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("migration %s: conn: %w", m.name, err)
+	}
+	defer func() { _ = conn.Close() }()
+	if m.foreignKeysOff() {
+		if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys=OFF"); err != nil {
+			return fmt.Errorf("migration %s: foreign_keys off: %w", m.name, err)
+		}
+		defer func() {
+			// Use a fresh context: ctx may be cancelled, and a pooled
+			// connection must never go back with enforcement off.
+			_, _ = conn.ExecContext(context.Background(), "PRAGMA foreign_keys=ON")
+		}()
+	}
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("migration %s: begin: %w", m.name, err)
 	}
@@ -113,6 +141,20 @@ func (s *Store) applyMigration(ctx context.Context, m migration, latest int) err
 	}
 	if _, err := tx.ExecContext(ctx, m.sql); err != nil {
 		return fmt.Errorf("migration %s: %w", m.name, err)
+	}
+	if m.foreignKeysOff() {
+		rows, err := tx.QueryContext(ctx, "PRAGMA foreign_key_check")
+		if err != nil {
+			return fmt.Errorf("migration %s: foreign_key_check: %w", m.name, err)
+		}
+		violations := rows.Next()
+		_ = rows.Close()
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("migration %s: foreign_key_check: %w", m.name, err)
+		}
+		if violations {
+			return fmt.Errorf("migration %s: foreign_key_check found violations", m.name)
+		}
 	}
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", m.version)); err != nil {
 		return fmt.Errorf("migration %s: set version: %w", m.name, err)

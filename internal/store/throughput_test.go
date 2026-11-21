@@ -111,7 +111,7 @@ func TestThroughputMigration(t *testing.T) {
 	f.complete(f.claim(w))
 	f.fail(func() *Lease { f.job(f.pubID, "c", api.WeightMedium, 1, 99); return f.claim(w) }(), true)
 
-	_, err := f.s.w.ExecContext(f.ctx, `DROP TABLE throughput; PRAGMA user_version = 10`)
+	_, err := f.s.w.ExecContext(f.ctx, undo0012+`DROP TABLE throughput; PRAGMA user_version = 10`)
 	require.NoError(t, err)
 	require.NoError(t, f.s.Close())
 	f.s = f.open()

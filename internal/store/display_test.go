@@ -69,7 +69,7 @@ func TestPendingSinceMigration(t *testing.T) {
 	f.clk.Advance(time.Minute)
 	f.fail(f.claim(w), true)
 
-	_, err := f.s.w.ExecContext(f.ctx, `ALTER TABLE tasks DROP COLUMN pending_since; DROP TABLE throughput; PRAGMA user_version = 9`)
+	_, err := f.s.w.ExecContext(f.ctx, undo0012+`ALTER TABLE tasks DROP COLUMN pending_since; DROP TABLE throughput; PRAGMA user_version = 9`)
 	require.NoError(t, err)
 	require.NoError(t, f.s.Close())
 	f.s = f.open()
