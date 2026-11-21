@@ -111,6 +111,28 @@ func buildSeccomp(r seccompRules) ([]unix.SockFilter, error) {
 			bpfStmt(bpfRet, seccompDeny(unix.EACCES)),
 			bpfStmt(bpfRet, unix.SECCOMP_RET_ALLOW))
 	}
+	// allowUnixStreamPair lets socketpair(2) through only for (AF_UNIX,
+	// SOCK_STREAM [|SOCK_NONBLOCK|SOCK_CLOEXEC], 0) and refuses every
+	// other pair with EACCES. Such a pair is connected to itself from
+	// birth: connect(2) on it fails with EISCONN and a Unix stream socket
+	// refuses a destination address on sendto(2)/sendmsg(2), so it
+	// reaches nothing but its other end. Runtimes need it for their
+	// in-process wakeups (deno's tokio signal driver, Python asyncio).
+	// Datagram pairs stay refused: they can sendto(2) any pathname socket.
+	allowUnixStreamPair := func() {
+		const typeFlags = unix.SOCK_NONBLOCK | unix.SOCK_CLOEXEC
+		prog = append(prog,
+			bpfJump(bpfJEQ, unix.SYS_SOCKETPAIR, 0, 9),
+			bpfStmt(bpfLoadW, seccompOffArg0Low),
+			bpfJump(bpfJEQ, unix.AF_UNIX, 0, 5), // → deny
+			bpfStmt(bpfLoadW, seccompOffArg1Low),
+			bpfStmt(bpfAND, ^uint32(typeFlags)),
+			bpfJump(bpfJEQ, unix.SOCK_STREAM, 0, 2), // → deny
+			bpfStmt(bpfLoadW, seccompOffArg2Low),
+			bpfJump(bpfJEQ, 0, 1, 0), // → allow
+			bpfStmt(bpfRet, seccompDeny(unix.EACCES)),
+			bpfStmt(bpfRet, unix.SECCOMP_RET_ALLOW))
+	}
 
 	// Process containment: the worker kills the child's whole process
 	// group on cancel, so no descendant may leave it. io_uring can create
@@ -133,9 +155,12 @@ func buildSeccomp(r seccompRules) ([]unix.SockFilter, error) {
 		// still sendto(2) a pathname address (/dev/log, the journald
 		// socket), which Landlock below ABI 9 does not check. The child's
 		// inherited descriptors are /dev/null and pipes, not sockets, so
-		// with neither call there is no socket to send from.
+		// with neither call there is no socket to send from. inetStream
+		// allows stream pairs only (allowUnixStreamPair), before this
+		// catch-all.
 		if r.inetStream {
 			allowTCPSocket()
+			allowUnixStreamPair()
 			// Outbound only: listen(2) on an unbound socket autobinds
 			// an ephemeral port without Landlock's bind check.
 			deny(unix.SYS_LISTEN, unix.EACCES)

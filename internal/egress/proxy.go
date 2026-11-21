@@ -28,13 +28,18 @@ type Proxy struct {
 	mu     sync.Mutex
 	conns  map[net.Conn]struct{}
 	closed bool
+	// done is closed when the accept loop ends; err is why, if not Close.
+	done chan struct{}
+	err  error
 }
 
 type proxyConfig struct {
-	allowPort func(uint16) bool
-	header    time.Duration // time allowed to receive the request header
-	idle      time.Duration // max inactivity (either direction)
-	maxConns  int
+	header   time.Duration // time allowed to receive the request header
+	idle     time.Duration // max inactivity (either direction)
+	maxConns int
+	// listener, when set, is served instead of a new 127.0.0.1:0 one
+	// (tests).
+	listener net.Listener
 }
 
 const (
@@ -44,21 +49,13 @@ const (
 	maxClientConn = 64
 )
 
-func defaultAllowPort(p uint16) bool { return p == 80 || p == 443 }
-
 // StartProxy listens on 127.0.0.1:0 and serves until ctx is done or Close.
+// It dials only the ports d allows (d.PortAllowed).
 func StartProxy(ctx context.Context, d *Dialer) (*Proxy, error) {
 	return startProxyCfg(ctx, d, proxyConfig{})
 }
 
-func startProxy(ctx context.Context, d *Dialer, allow func(uint16) bool) (*Proxy, error) {
-	return startProxyCfg(ctx, d, proxyConfig{allowPort: allow})
-}
-
 func startProxyCfg(ctx context.Context, d *Dialer, cfg proxyConfig) (*Proxy, error) {
-	if cfg.allowPort == nil {
-		cfg.allowPort = defaultAllowPort
-	}
 	if cfg.header == 0 {
 		cfg.header = headerTimeout
 	}
@@ -68,13 +65,16 @@ func startProxyCfg(ctx context.Context, d *Dialer, cfg proxyConfig) (*Proxy, err
 	if cfg.maxConns == 0 {
 		cfg.maxConns = maxClientConn
 	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return nil, err
+	ln := cfg.listener
+	if ln == nil {
+		var err error
+		if ln, err = net.Listen("tcp", "127.0.0.1:0"); err != nil {
+			return nil, err
+		}
 	}
 	pctx, cancel := context.WithCancel(ctx)
 	p := &Proxy{ln: ln, d: d, cfg: cfg, ctx: pctx, cancel: cancel,
-		sem: make(chan struct{}, cfg.maxConns), conns: map[net.Conn]struct{}{}}
+		sem: make(chan struct{}, cfg.maxConns), conns: map[net.Conn]struct{}{}, done: make(chan struct{})}
 	p.wg.Add(1)
 	go p.serve()
 	go func() { <-pctx.Done(); p.Close() }()
@@ -83,6 +83,21 @@ func startProxyCfg(ctx context.Context, d *Dialer, cfg proxyConfig) (*Proxy, err
 
 // Port is the listening TCP port.
 func (p *Proxy) Port() uint16 { return uint16(p.ln.Addr().(*net.TCPAddr).Port) }
+
+// Done is closed when the proxy stops accepting connections: after Close
+// (or the end of its context), or on a permanent accept error.
+func (p *Proxy) Done() <-chan struct{} { return p.done }
+
+// Err is the permanent accept error that stopped the proxy, nil while it
+// runs or after a Close. Valid once Done is closed.
+func (p *Proxy) Err() error {
+	select {
+	case <-p.done:
+		return p.err
+	default:
+		return nil
+	}
+}
 
 // Close stops the listener, drops live connections and waits for handlers.
 func (p *Proxy) Close() error {
@@ -130,11 +145,12 @@ func transientAccept(err error) bool {
 
 func (p *Proxy) serve() {
 	defer p.wg.Done()
+	defer close(p.done)
 	delay := 5 * time.Millisecond
 	for {
 		c, err := p.ln.Accept()
 		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
+			if errors.Is(err, net.ErrClosed) || p.ctx.Err() != nil {
 				return
 			}
 			if transientAccept(err) {
@@ -148,6 +164,7 @@ func (p *Proxy) serve() {
 				}
 				continue
 			}
+			p.err = err
 			p.ln.Close()
 			return
 		}
@@ -213,7 +230,7 @@ func (p *Proxy) dial(hostport string) (net.Conn, int) {
 	if err != nil {
 		return nil, 400
 	}
-	if !p.cfg.allowPort(uint16(n)) {
+	if !p.d.PortAllowed(uint16(n)) {
 		return nil, 403
 	}
 	ctx, cancel := context.WithTimeout(p.ctx, 30*time.Second)
@@ -322,10 +339,8 @@ func (p *Proxy) forward(c net.Conn, req *http.Request) {
 	}
 	host := req.URL.Host
 	if _, _, err := net.SplitHostPort(host); err != nil {
-		if strings.HasSuffix(host, ":") || strings.Contains(host, "]:") {
-			reply(c, 400, "Bad Request")
-			return
-		}
+		// No port ("x.test", "[::1]"); an empty one ("x.test:") splits
+		// and is refused by dial.
 		host = net.JoinHostPort(req.URL.Hostname(), "80")
 	}
 	up, code := p.dial(host)

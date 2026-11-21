@@ -27,6 +27,12 @@ const (
 	// an ephemeral port). Only [ProbeDownloader] runs it: elsewhere no
 	// socket can be created at all.
 	CheckTCPListen = "tcp_listen"
+	// CheckTCPFastOpen is sendto(2) with MSG_FASTOPEN to the tcp_connect
+	// listener (a port outside the allowlist): a connect that Landlock's
+	// connect hook does not see, which only the seccomp filter refuses.
+	// Only [ProbeDownloader] runs it. A kernel with TCP Fast Open disabled
+	// reports it unsupported.
+	CheckTCPFastOpen = "tcp_fastopen"
 )
 
 // Checks lists every self-test check.
@@ -35,8 +41,8 @@ var Checks = []string{CheckFSRead, CheckTCPConnect, CheckMPTCPConnect, CheckUDPS
 
 // DownloaderChecks lists the checks of a downloader self-test: every check of
 // [Checks], where tcp_connect targets a port outside the allowlist, plus
-// [CheckTCPListen] and [CheckTCPConnectAllowed].
-var DownloaderChecks = append(append([]string(nil), Checks...), CheckTCPListen, CheckTCPConnectAllowed)
+// [CheckTCPListen], [CheckTCPFastOpen] and [CheckTCPConnectAllowed].
+var DownloaderChecks = append(append([]string(nil), Checks...), CheckTCPListen, CheckTCPFastOpen, CheckTCPConnectAllowed)
 
 // Outcomes of a check.
 const (

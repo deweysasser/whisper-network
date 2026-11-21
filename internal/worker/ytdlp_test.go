@@ -54,6 +54,14 @@ func TestClassifyYtDlp(t *testing.T) {
 		{"connection reset", exit, "ERROR: unable to download video data: [Errno 104] Connection reset by peer\n", ytdlpTransient},
 		{"503", exit, "ERROR: unable to download video data: HTTP Error 503: Service Unavailable\n", ytdlpTransient},
 		{"proxy refused", exit, "ERROR: [youtube] x: Unable to download webpage: ('Unable to connect to proxy', OSError('Tunnel connection failed: 403 Forbidden'))\n", ytdlpTransient},
+		// A verdict counts only as yt-dlp phrases it, at the start of the
+		// message: page data quoted later in an ERROR line must not cool
+		// the site down.
+		{"429 phrase later in the message", exit, "ERROR: [youtube] x: Unable to extract title; got 'HTTP Error 429: Too Many Requests'\n", ytdlpTransient},
+		{"loose too many requests", exit, "ERROR: [youtube] x: Unable to extract uploader: Too Many Requests Fan Club\n", ytdlpTransient},
+		{"loose rate-limited", exit, "ERROR: [soundcloud] x: Track rate-limited remix is not streamable\n", ytdlpTransient},
+		{"loose rate-limit reached", exit, "ERROR: [vimeo] x: rate-limit reached by the uploader's title\n", ytdlpTransient},
+		{"bot check quoted later", exit, "ERROR: [youtube] x: Unable to extract description: Sign in to confirm you're not a bot\n", ytdlpTransient},
 		{"no stderr", exit, "", ytdlpTransient},
 		{"killed", errors.New("signal: killed"), "", ytdlpTransient},
 	} {

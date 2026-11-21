@@ -153,6 +153,10 @@ COPY --from=downloader-tools /dl/yt-dlp /dl/deno /usr/local/bin/
 RUN yt-dlp --version && deno --version
 COPY --from=builder /out/whisper-network /usr/local/bin/whisper-network
 USER 10001
+# Smoke test: the real deno and yt-dlp under the exact sandbox and limits of
+# a fetch child (Landlock, seccomp, rlimits, connect only to the proxy port).
+# Fails the build if either cannot run there, or the sandbox is below full.
+RUN whisper-network downloader-selftest
 VOLUME ["/var/lib/whisper-network"]
 ENTRYPOINT ["/usr/local/bin/whisper-network"]
 CMD ["worker", "--downloader", "--help"]

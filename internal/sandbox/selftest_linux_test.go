@@ -54,7 +54,10 @@ func TestSelfTestConnectAllowlist(t *testing.T) {
 	assert.Equal(t, "denied", runHelperUnder(t, spec, "udp", "127.0.0.1:"+strconv.Itoa(int(portOf(t, allowed)))), "UDP refused on the allowed port number")
 	assert.Equal(t, "denied", runHelperUnder(t, spec, "unix", unixListener(t, filepath.Join(t.TempDir(), "s"))), "unix refused")
 	assert.Equal(t, "denied", runHelperUnder(t, spec, "unix", unixListener(t, "@wn-allowlist-"+strconv.Itoa(os.Getpid()))), "abstract unix refused")
-	assert.Equal(t, "denied", runHelperUnder(t, spec, "socketpair"), "socketpair refused")
+	assert.Equal(t, "ok", runHelperUnder(t, spec, "socketpair"), "a Unix stream socketpair (runtimes' wakeups) is allowed")
+	assert.Equal(t, "denied", runHelperUnder(t, spec, "socketpair-dgram"), "a datagram socketpair is refused")
+	assert.Equal(t, "contained", runHelperUnder(t, spec, "socketpair-escape", unixListener(t, filepath.Join(t.TempDir(), "p"))),
+		"a stream pair reaches only its other end")
 	assert.Equal(t, "denied", runHelperUnder(t, spec, "raw"), "raw socket refused")
 	assert.Equal(t, "denied", runHelperUnder(t, spec, "netlink"), "netlink refused")
 	assert.Equal(t, "denied", runHelperUnder(t, spec, "sctp"), "SOCK_STREAM with another protocol refused")
@@ -96,6 +99,8 @@ func TestProbeDownloader(t *testing.T) {
 			t.Logf("probe: level=%s abi=%d blocked=%v open=%v checks=%v", res.Level, res.LandlockABI,
 				res.Blocked(), res.Open(), res.Checks)
 			assert.Len(t, res.Checks, len(DownloaderChecks))
+			assert.Contains(t, []string{OutcomeBlocked, OutcomeUnsupported}, res.Checks[CheckTCPFastOpen],
+				"a TCP Fast Open connect to another port")
 			switch abi := landlockABI(); {
 			case abi >= 4:
 				assert.Equal(t, api.SandboxFull, res.Level, "open: %v", res.Open())

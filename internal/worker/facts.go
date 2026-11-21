@@ -214,39 +214,33 @@ func (w *Worker) sandboxProbed(res sandbox.ProbeResult) {
 // probeDownloader is probe for a downloader: it needs yt-dlp and the local
 // egress proxy (started by Run), and nothing of the processing toolchain.
 func (w *Worker) probeDownloader(ctx context.Context) error {
-	p, err := lookTool(w.cfg.YtDlp)
-	if err != nil {
-		return fmt.Errorf("yt-dlp not found (%s): a downloader needs it; install it or set --yt-dlp", w.cfg.YtDlp)
-	}
-	w.tools.ytdlp = p
-	w.tools.ytdlpVersion = parseYtDlpVersion(w.toolOutput(ctx, p, "--version"))
-	if err := checkStateOutside(w.cfg.StateDir, slices.Concat(systemReadOnly, childSystemFiles, fetchSystemReadOnly)); err != nil {
+	if err := w.resolveDownloaderTools(ctx); err != nil {
 		return err
-	}
-	home := homeDir()
-	if w.tools.ytdlpRO, err = ytdlpReadOnly(p, w.cfg.StateDir, home); err != nil {
-		return err
-	}
-	// yt-dlp runs deno, when installed, for YouTube's JavaScript challenges.
-	if d, err := lookTool("deno"); err == nil {
-		if ro, err := toolReadOnly(d, w.cfg.StateDir, home); err == nil {
-			w.tools.ytdlpRO = append(w.tools.ytdlpRO, ro...)
-		} else {
-			w.log.Warn().Err(err).Msg("deno is not usable in the yt-dlp sandbox; sites that need it may fail")
-		}
 	}
 
 	level := api.SandboxNone
 	if w.proxy == nil {
 		return errors.New("downloader egress proxy is not running")
 	}
-	if res, err := w.cfg.ProbeDownloaderSandbox(ctx, w.proxy.Port()); err != nil {
+	abi := 0
+	res, err := w.cfg.ProbeDownloaderSandbox(ctx, w.proxy.Port())
+	if err != nil {
 		w.sandboxFailed(err, level)
 	} else {
-		level = res.Level
+		level, abi = res.Level, res.LandlockABI
 		w.sandboxProbed(res)
 	}
-	if level != api.SandboxFull {
+	// On Linux the fetch child's sandbox lets it connect to the proxy only
+	// with Landlock ABI 4 (TCP connect rules); below that it gets no sockets
+	// at all (sandbox.Spec.ConnectPorts fails closed), so yt-dlp could only
+	// fail. Elsewhere nothing confines the child's network.
+	w.noProxyConnect = runtime.GOOS == "linux" && (err != nil || abi < 4)
+	switch {
+	case w.noProxyConnect:
+		w.log.Warn().Str(obs.FieldSandboxLevel, string(level)).Int(obs.FieldLandlockABI, abi).
+			Msg("downloader sandbox cannot permit proxy connects (needs Landlock ABI 4, Linux 6.7): " +
+				"the fetch child would get no sockets, so every fetch lease is refused as pre-work")
+	case level != api.SandboxFull:
 		w.log.Warn().Str(obs.FieldSandboxLevel, string(level)).
 			Msg("downloader sandbox is below full (Landlock ABI 4 with TCP connect rules): " +
 				"the server's default --fetch-min-sandbox=full will not offer fetch leases to this worker")
@@ -280,6 +274,34 @@ func (w *Worker) probeDownloader(ctx context.Context) error {
 	w.log.Info().Str(obs.FieldHostname, hostname).Int("slots", slots).Str("yt_dlp_version", w.tools.ytdlpVersion).
 		Str("egress_group", w.cfg.EgressGroup).Bool("egress_ip_known", w.facts.EgressIP != "").
 		Msg("probed downloader")
+	return nil
+}
+
+// resolveDownloaderTools finds yt-dlp (and deno, which yt-dlp runs for
+// YouTube's JavaScript challenges, when installed) and works out what the
+// fetch child may read.
+func (w *Worker) resolveDownloaderTools(ctx context.Context) error {
+	p, err := lookTool(w.cfg.YtDlp)
+	if err != nil {
+		return fmt.Errorf("yt-dlp not found (%s): a downloader needs it; install it or set --yt-dlp", w.cfg.YtDlp)
+	}
+	w.tools.ytdlp = p
+	w.tools.ytdlpVersion = parseYtDlpVersion(w.toolOutput(ctx, p, "--version"))
+	if err := checkStateOutside(w.cfg.StateDir, slices.Concat(systemReadOnly, childSystemFiles, fetchSystemReadOnly)); err != nil {
+		return err
+	}
+	home := homeDir()
+	if w.tools.ytdlpRO, err = ytdlpReadOnly(p, w.cfg.StateDir, home); err != nil {
+		return err
+	}
+	if d, err := lookTool("deno"); err == nil {
+		if ro, err := toolReadOnly(d, w.cfg.StateDir, home); err == nil {
+			w.tools.deno = d
+			w.tools.ytdlpRO = append(w.tools.ytdlpRO, ro...)
+		} else {
+			w.log.Warn().Err(err).Msg("deno is not usable in the yt-dlp sandbox; sites that need it may fail")
+		}
+	}
 	return nil
 }
 

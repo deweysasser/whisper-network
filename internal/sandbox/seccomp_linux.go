@@ -38,6 +38,8 @@ type seccompRules struct {
 	// still may not listen(2) (an unbound socket autobinds without the
 	// Landlock bind check) or accept(2), and sendto(2)/sendmsg(2)/
 	// sendmmsg(2) with MSG_FASTOPEN (a connect without connect(2)) fail.
+	// socketpair(2) may create AF_UNIX SOCK_STREAM pairs (connected to
+	// each other only); other pairs are refused.
 	inetStream bool
 	// signalPid, when non-zero, confines signals to this process and its
 	// process group: the fallback for kernels without Landlock signal

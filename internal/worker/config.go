@@ -136,6 +136,10 @@ type Config struct {
 	// AllowPrivateEgress lets the downloader reach loopback, private and
 	// link-local addresses.
 	AllowPrivateEgress bool
+	// EgressPorts are the only TCP ports a fetch may reach, through the
+	// proxy or the plain GET and its redirects (default egress.DefaultPorts,
+	// 80 and 443). The egress probe may also reach its own URL's port.
+	EgressPorts []uint16
 	// ProbeDownloaderSandbox measures the downloader sandbox level with the
 	// proxy port allowed (default sandbox.ProbeDownloader(Self, port)).
 	ProbeDownloaderSandbox func(ctx context.Context, proxyPort uint16) (sandbox.ProbeResult, error)
@@ -183,7 +187,9 @@ type Limits struct {
 	// FetchMemory is the memory reserved for a fetch in the slot accounting
 	// (default 1 GiB).
 	FetchMemory int64
-	// FetchAddressSpace is yt-dlp's RLIMIT_AS (default 4 GiB).
+	// FetchAddressSpace is the fetch child's RLIMIT_AS; 0 (the default)
+	// sets none. deno, which yt-dlp runs for YouTube, reserves tens of GiB
+	// of virtual address space at startup and fails under 4 GiB.
 	FetchAddressSpace int64
 }
 
@@ -297,7 +303,9 @@ func (c *Config) setDefaults() error {
 	def64(&l.PrepareMemory, 512*mib)
 	defDur(&l.FetchTimeout, 2*time.Hour)
 	def64(&l.FetchMemory, gib)
-	def64(&l.FetchAddressSpace, 4*gib)
+	if l.FetchAddressSpace < 0 {
+		l.FetchAddressSpace = 0
+	}
 	return nil
 }
 

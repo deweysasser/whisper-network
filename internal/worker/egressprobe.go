@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,17 +24,47 @@ const (
 	egressProbeTimeout = 15 * time.Second
 )
 
+// proxyPortTries is how many ephemeral ports startEgress tries for the proxy
+// before giving up on finding one outside the egress ports.
+const proxyPortTries = 8
+
 // startEgress starts the SSRF-filtering CONNECT proxy yt-dlp is pointed at
-// and builds the filtered client of the egress probe. The returned func stops
+// and builds the filtered clients of plain GET fetches and of the egress
+// probe (which may also reach its own URL's port). The returned func stops
 // the proxy.
+//
+// The fetch child may connect to the proxy's port on any address (Landlock
+// has no address rules), so an operator's egress firewall that allows only
+// the egress ports and the server's port closes the direct path around the
+// proxy (DESIGN.md §13) only if the proxy's port is none of those: a port
+// that is gets replaced.
 func (w *Worker) startEgress(ctx context.Context) (func(), error) {
-	d := &egress.Dialer{AllowPrivate: w.cfg.AllowPrivateEgress}
-	p, err := egress.StartProxy(ctx, d)
-	if err != nil {
-		return nil, fmt.Errorf("starting the egress proxy: %w", err)
+	d := &egress.Dialer{AllowPrivate: w.cfg.AllowPrivateEgress, AllowPorts: w.cfg.EgressPorts}
+	forbidden := slices.Concat(egress.DefaultPorts, w.cfg.EgressPorts)
+	if p := serverPort(w.cfg.Client.BaseURL()); p != 0 {
+		forbidden = append(forbidden, p)
+	}
+	var p *egress.Proxy
+	for range proxyPortTries {
+		var err error
+		if p, err = egress.StartProxy(ctx, d); err != nil {
+			return nil, fmt.Errorf("starting the egress proxy: %w", err)
+		}
+		if !slices.Contains(forbidden, p.Port()) {
+			break
+		}
+		_ = p.Close()
+		p = nil
+	}
+	if p == nil {
+		return nil, fmt.Errorf("starting the egress proxy: no port outside %v after %d tries", forbidden, proxyPortTries)
 	}
 	w.proxy = p
-	w.egressClient = d.HTTPClient(egressProbeTimeout)
+	probe := d
+	if pp := serverPort(w.cfg.EgressProbe); pp != 0 {
+		probe = d.WithPorts(pp)
+	}
+	w.egressClient = probe.HTTPClient(egressProbeTimeout)
 	w.fetchClient = d.HTTPClient(w.cfg.Limits.FetchTimeout)
 	if w.cfg.AllowPrivateEgress {
 		w.log.Warn().Msg("--allow-private-egress: this downloader may reach loopback, private and link-local " +
@@ -40,6 +72,29 @@ func (w *Worker) startEgress(ctx context.Context) (func(), error) {
 	}
 	w.log.Info().Uint16("proxy_port", p.Port()).Msg("egress proxy started")
 	return func() { _ = p.Close() }, nil
+}
+
+// serverPort is the TCP port of an http(s) URL, explicit or the scheme's
+// default; 0 if there is none.
+func serverPort(raw string) uint16 {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return 0
+	}
+	if p := u.Port(); p != "" {
+		n, err := strconv.ParseUint(p, 10, 16)
+		if err != nil {
+			return 0
+		}
+		return uint16(n)
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http":
+		return 80
+	case "https":
+		return 443
+	}
+	return 0
 }
 
 // initialEgressIP probes once during startup so the registration carries the

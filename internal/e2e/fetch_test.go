@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -88,7 +89,9 @@ func TestE2EFetchFallbackGET(t *testing.T) {
 		_, _ = w.Write(wav)
 	}))
 	defer srv.Close()
-	startDownloader(e, "dl", e2etest.ChildEnv(workertest.YtDlpMode(workertest.YtDlpUnsupported)))
+	port := uint16(srv.Listener.Addr().(*net.TCPAddr).Port)
+	startDownloader(e, "dl", e2etest.ChildEnv(workertest.YtDlpMode(workertest.YtDlpUnsupported)),
+		func(c *worker.Config) { c.EgressPorts = []uint16{port} })
 	sub := urlSubmitter(e)
 	job := submitURL(t, sub, srv.URL+"/a.wav")
 	done := e.WaitJob(job.ID, api.JobDone)

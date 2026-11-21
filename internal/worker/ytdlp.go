@@ -63,13 +63,6 @@ var (
 		"unsupported url",              // the generic extractor gave up
 		"no suitable extractor found ", // no extractor matched (generic disabled)
 	}
-	ytdlpRateLimitMsgs = []string{
-		"http error 429",
-		"too many requests",
-		"sign in to confirm you", // YouTube's bot check ("you’re", with a typographic apostrophe)
-		"rate-limited",
-		"rate-limit reached",
-	}
 	ytdlpPermanentMsgs = []string{
 		"video unavailable",
 		"private video",
@@ -105,6 +98,14 @@ func classifyYtDlp(exitErr error, stderr string) ytdlpOutcome {
 			filtered = true
 		}
 	}
+	rateLimited := func() bool {
+		for _, e := range errs {
+			if ytdlpRateLimitRE.MatchString(e) {
+				return true
+			}
+		}
+		return false
+	}
 	has := func(msgs []string) bool {
 		for _, e := range errs {
 			for _, m := range msgs {
@@ -122,13 +123,22 @@ func classifyYtDlp(exitErr error, stderr string) ytdlpOutcome {
 		return ytdlpOK
 	case has(ytdlpUnsupportedMsgs):
 		return ytdlpUnsupported
-	case has(ytdlpRateLimitMsgs):
+	case rateLimited():
 		return ytdlpRateLimited
 	case has(ytdlpPermanentMsgs):
 		return ytdlpPermanent
 	}
 	return ytdlpTransient
 }
+
+// ytdlpRateLimitRE matches a rate-limit verdict as yt-dlp phrases it, at the
+// start of an ERROR message (less its prefix): an HTTP 429, possibly after
+// yt-dlp's own "Unable to download webpage: " style note; YouTube's bot
+// check ("you’re", with a typographic apostrophe, or "you're"); or its
+// session rate limit. Anchoring keeps page data quoted later in the message
+// (a title, an uploader) from cooling the site down.
+var ytdlpRateLimitRE = regexp.MustCompile(`^(?:unable to (?:download|extract) [a-z0-9 /-]+: )?` +
+	`http error 429: too many requests|^sign in to confirm you|^the current session has been rate-limited by youtube`)
 
 // ytdlpPrefixRE is the "[extractor] id: " prefix of an ERROR line; the id
 // comes from the URL.

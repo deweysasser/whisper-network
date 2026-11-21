@@ -87,3 +87,12 @@ func TestShebang(t *testing.T) {
 	}
 	assert.Equal(t, "", shebang(filepath.Join(dir, "missing")))
 }
+
+// TestFetchSystemReadOnlyNoPrivateKeys: the fetch child reads CA
+// certificates, never the host's TLS private keys.
+func TestFetchSystemReadOnlyNoPrivateKeys(t *testing.T) {
+	for _, private := range []string{"/etc/ssl/private/host.key", "/etc/pki/tls/private/host.key"} {
+		assert.False(t, underAny(private, fetchSystemReadOnly), private)
+	}
+	assert.True(t, underAny("/etc/ssl/certs/ca-certificates.crt", fetchSystemReadOnly))
+}

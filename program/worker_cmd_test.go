@@ -97,7 +97,7 @@ func TestWorkerCmdDownloaderFlags(t *testing.T) {
 	var opts Options
 	_, err := opts.Parse([]string{"worker", "--server", "https://wn.example", "--downloader", "--yt-dlp", "/opt/yt-dlp",
 		"--yt-dlp-cookies", "/etc/c.txt", "--egress-group", "home", "--egress-probe", "https://ip.example",
-		"--allow-private-egress", "--fetch-timeout", "30m"})
+		"--allow-private-egress", "--fetch-timeout", "30m", "--fetch-address-space", "64GiB"})
 	require.NoError(t, err)
 	c := opts.Worker
 	assert.True(t, c.Downloader)
@@ -107,6 +107,7 @@ func TestWorkerCmdDownloaderFlags(t *testing.T) {
 	assert.Equal(t, "https://ip.example", c.EgressProbe)
 	assert.True(t, c.AllowPrivateEgress)
 	assert.Equal(t, 30*time.Minute, c.FetchTimeout)
+	assert.Equal(t, ByteSize(64<<30), c.FetchAddressSpace)
 	assert.Zero(t, c.Slots, "the worker applies the downloader default of 2")
 
 	opts = Options{}
@@ -114,8 +115,19 @@ func TestWorkerCmdDownloaderFlags(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "yt-dlp", opts.Worker.YtDlp)
 	assert.Equal(t, 2*time.Hour, opts.Worker.FetchTimeout)
+	assert.Zero(t, opts.Worker.FetchAddressSpace, "no RLIMIT_AS by default")
 
 	opts = Options{}
 	_, err = opts.Parse([]string{"worker", "--server", "https://wn.example", "--egress-group", "x"})
 	assert.ErrorContains(t, err, "--downloader")
+
+	// Several downloader-only flags: the message names the first, in flag
+	// order, every time.
+	for range 20 {
+		opts = Options{}
+		_, err = opts.Parse([]string{"worker", "--server", "https://wn.example", "--allow-private-egress",
+			"--yt-dlp-cookies", "/c", "--egress-group", "x", "--egress-probe", "https://ip.example"})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "--yt-dlp-cookies needs --downloader")
+	}
 }

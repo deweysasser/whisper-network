@@ -55,11 +55,13 @@ func TestDownloaderFactsAndKinds(t *testing.T) {
 func TestDownloaderWarnsBelowFullSandbox(t *testing.T) {
 	h := downloaderHarness(t)
 	h.cfg.ProbeDownloaderSandbox = func(context.Context, uint16) (sandbox.ProbeResult, error) {
-		return sandbox.ProbeResult{Level: api.SandboxFSOnly, LandlockABI: 3}, nil
+		// TCP connect rules work (ABI 4) but another check failed.
+		return sandbox.ProbeResult{Level: api.SandboxFSOnly, LandlockABI: 4}, nil
 	}
 	h.run()
 	h.worker()
 	assert.Contains(t, string(h.logs.Bytes()), "will not offer fetch leases")
+	assert.NotContains(t, string(h.logs.Bytes()), "every fetch lease is refused")
 }
 
 func TestDownloaderRequiresYtDlp(t *testing.T) {
@@ -177,4 +179,38 @@ func TestFactsEqualIncludesEgress(t *testing.T) {
 		mut(&o)
 		assert.False(t, factsEqual(base, o), name)
 	}
+}
+
+func TestServerPort(t *testing.T) {
+	for in, want := range map[string]uint16{
+		"https://wn.example": 443, "http://wn.example/x": 80, "https://wn.example:8443/": 8443,
+		"http://[::1]:9090": 9090, "": 0, "ftp://x": 0, "http://x:99999": 0,
+	} {
+		assert.Equal(t, want, serverPort(in), in)
+	}
+}
+
+// TestProxyPortNotAnEgressPort: the fetch child may connect to the proxy's
+// port on any address, so it must not be one an egress firewall lets out.
+func TestProxyPortNotAnEgressPort(t *testing.T) {
+	h := downloaderHarness(t)
+	w, err := New(h.cfg)
+	require.NoError(t, err)
+	stop, err := w.startEgress(t.Context())
+	require.NoError(t, err)
+	defer stop()
+	assert.NotContains(t, []uint16{80, 443, serverPort(h.srv.URL)}, w.proxy.Port())
+}
+
+// TestDownloaderStopsWhenProxyStops: a downloader whose egress proxy stopped
+// accepting can fetch nothing, so it stops instead of claiming on.
+func TestDownloaderStopsWhenProxyStops(t *testing.T) {
+	h := downloaderHarness(t)
+	w, done := h.start(t.Context())
+	h.activate()
+	h.eventually(func() bool { return len(h.srv.Claims()) > 0 }, "worker never claimed")
+	require.NoError(t, w.proxy.Close())
+	err := waitDone(t, done)
+	require.ErrorIs(t, err, ErrEgressProxyStopped)
+	assert.True(t, w.proxyStopped())
 }

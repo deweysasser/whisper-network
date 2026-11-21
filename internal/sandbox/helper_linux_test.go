@@ -75,6 +75,31 @@ func runHelper(args []string) int {
 			unix.Close(fds[1])
 		}
 		fmt.Println(classify(err))
+	case "socketpair-dgram":
+		fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_DGRAM, 0)
+		if err == nil {
+			unix.Close(fds[0])
+			unix.Close(fds[1])
+		}
+		fmt.Println(classify(err))
+	case "socketpair-escape":
+		// socketpair-escape <path>: from a Unix stream pair, try to
+		// connect to and send to a pathname socket. "ok" means it got out.
+		fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+		if err != nil {
+			fmt.Println(classify(err))
+			break
+		}
+		cerr := unix.Connect(fds[0], &unix.SockaddrUnix{Name: args[1]})
+		serr := unix.Sendto(fds[0], []byte("x"), 0, &unix.SockaddrUnix{Name: args[1]})
+		switch {
+		case cerr == nil:
+			fmt.Println("ok: connected")
+		case serr == nil:
+			fmt.Println("ok: sent")
+		default:
+			fmt.Println("contained")
+		}
 	case "dgram":
 		fmt.Println(classify(sendUnixDgram(args[1])))
 	case "unshare":

@@ -16,7 +16,10 @@ func TestRefusedRanges(t *testing.T) {
 		"64:ff9b::808:808": false, "2002:0808:0808::1": false,
 		"::7f00:1": true, "::a00:1": true, "64:ff9b:1::1": true, "2001::1": true,
 		"100::1": true, "fec0::1": true, "::808:808": true,
-		"8.8.8.8": false, "2606:4700::1": false,
+		// SIIT (::ffff:0:a.b.c.d, RFC 2765) and ORCHIDv2 (RFC 7343).
+		"::ffff:0:a00:1": true, "::ffff:0:808:808": true, "2001:20::1": true, "2001:2f:ffff::1": true,
+		"2001:30::1": false,
+		"8.8.8.8":    false, "2606:4700::1": false,
 	}
 	for s, want := range cases {
 		if got := Refused(netip.MustParseAddr(s)); got != want {

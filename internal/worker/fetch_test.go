@@ -11,6 +11,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -112,6 +114,7 @@ func TestFetchFallsBackToGETOnUnsupported(t *testing.T) {
 	srv, hits := mediaServer(t, http.StatusOK, "audio/flac", fakeMedia)
 	h := fetchHarness(t, workertest.YtDlpUnsupported, nil)
 	h.cfg.AllowPrivateEgress = true
+	h.cfg.EgressPorts = []uint16{serverPort(srv.URL)}
 	u := srv.URL + "/podcast/secretVideoId.flac"
 	task := startFetch(t, h, workertest.Task{URL: u, Site: "127.0.0.1"})
 	h.eventually(h.taskState(task, api.TaskDone), "GET fallback never completed")
@@ -210,6 +213,7 @@ func TestFetchGETOutcomes(t *testing.T) {
 			srv, _ := mediaServer(t, c.status, c.ctype, c.body)
 			h := fetchHarness(t, workertest.YtDlpUnsupported, nil)
 			h.cfg.AllowPrivateEgress = true
+			h.cfg.EgressPorts = []uint16{serverPort(srv.URL)}
 			task := startFetch(t, h, workertest.Task{URL: srv.URL + "/a.flac"})
 			f := h.failure(task)
 			assert.Equal(t, c.stage, f.Stage)
@@ -224,6 +228,7 @@ func TestFetchGETTooLarge(t *testing.T) {
 	srv, _ := mediaServer(t, http.StatusOK, "audio/flac", fakeMedia)
 	h := fetchHarness(t, workertest.YtDlpUnsupported, nil)
 	h.cfg.AllowPrivateEgress = true
+	h.cfg.EgressPorts = []uint16{serverPort(srv.URL)}
 	task := startFetch(t, h, workertest.Task{URL: srv.URL + "/a.flac", MaxOutputBytes: 1000})
 	f := h.failure(task)
 	assert.False(t, f.Retryable)
@@ -250,6 +255,7 @@ func TestFetchNetworkErrorTriggersEgressProbe(t *testing.T) {
 	require.NoError(t, err)
 	dead := "http://" + ln.Addr().String() + "/a.flac"
 	require.NoError(t, ln.Close())
+	h.cfg.EgressPorts = []uint16{serverPort(dead)}
 	var probes atomic.Int32
 	probe := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		probes.Add(1)
@@ -373,6 +379,7 @@ func TestFetchStalledUploadEndsAtTimeout(t *testing.T) {
 		defer media.Close()
 		h := fetchHarness(t, workertest.YtDlpUnsupported, nil)
 		h.cfg.AllowPrivateEgress = true
+		h.cfg.EgressPorts = []uint16{serverPort(media.URL)}
 		h.cfg.Limits.FetchTimeout = limit
 		h.srv.StallResults(t)
 		start := time.Now()
@@ -415,4 +422,65 @@ func TestFetchHeartbeat410KillsFetch(t *testing.T) {
 	}, "heartbeat 410 did not kill the fetch")
 	h.eventually(func() bool { return h.srv.Task(task).AbortedResults == 1 }, "the PUT was not aborted")
 	assert.Nil(t, h.srv.Task(task).Fetched)
+}
+
+// TestFetchChildSpecAddressSpace: deno (which yt-dlp runs for YouTube)
+// reserves far more than 4 GiB of virtual address space at startup, so the
+// fetch child gets no RLIMIT_AS unless the operator sets one.
+func TestFetchChildSpecAddressSpace(t *testing.T) {
+	h := downloaderHarness(t)
+	h.cfg.Limits = Limits{} // the harness disables RLIMIT_AS; use the real defaults
+	w, err := New(h.cfg)
+	require.NoError(t, err)
+	dir := t.TempDir()
+	spec := w.fetchChildSpec(dir, 4242)
+	assert.Zero(t, spec.AddressSpace, "no RLIMIT_AS by default")
+	assert.True(t, spec.DenyNet)
+	assert.Equal(t, []uint16{4242}, spec.ConnectPorts)
+	assert.Equal(t, []string{dir}, spec.ReadWrite)
+	assert.Equal(t, uint64(fetchFileSize), spec.FileSize)
+
+	h.cfg.Limits = Limits{FetchAddressSpace: 64 << 30}
+	w, err = New(h.cfg)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(64<<30), w.fetchChildSpec(dir, 4242).AddressSpace, "operator's --fetch-address-space")
+}
+
+// TestFetchRefusedWithoutProxyConnect: below Landlock ABI 4 the fetch child
+// gets no sockets at all, so a downloader there (the server's floor lowered
+// to let it fetch) refuses fetch leases as pre-work instead of running
+// yt-dlp into a transient failure on every attempt.
+func TestFetchRefusedWithoutProxyConnect(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("only Linux applies a seccomp/Landlock network policy to the fetch child")
+	}
+	h := fetchHarness(t, workertest.YtDlpOK, fakeMedia)
+	h.cfg.ProbeDownloaderSandbox = func(context.Context, uint16) (sandbox.ProbeResult, error) {
+		return sandbox.ProbeResult{Level: api.SandboxFSOnly, LandlockABI: 3}, nil
+	}
+	task := startFetch(t, h, workertest.Task{})
+	f := h.failure(task)
+	assert.Equal(t, api.StagePreWork, f.Stage)
+	assert.Contains(t, f.Reason, "proxy connects")
+	assert.Nil(t, h.srv.Task(task).Fetched)
+	assert.Equal(t, 1, strings.Count(string(h.logs.Bytes()), "every fetch lease is refused"), "warned once, at startup")
+}
+
+// TestFetchGETRedirectToOtherPortRefused: the plain GET's redirects are held
+// to the same port allowlist as the proxy.
+func TestFetchGETRedirectToOtherPortRefused(t *testing.T) {
+	target, hits := mediaServer(t, http.StatusOK, "audio/flac", fakeMedia)
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/secretVideoId.flac", http.StatusFound)
+	}))
+	defer src.Close()
+	h := fetchHarness(t, workertest.YtDlpUnsupported, nil)
+	h.cfg.AllowPrivateEgress = true
+	h.cfg.EgressPorts = []uint16{serverPort(src.URL)}
+	task := startFetch(t, h, workertest.Task{URL: src.URL + "/a.flac"})
+	f := h.failure(task)
+	assert.False(t, f.Retryable, "a refused port is the URL's fault")
+	assert.Equal(t, api.StageInput, f.Stage)
+	assert.Zero(t, hits.Load(), "the redirect target was reached")
+	h.assertNoURL(src.URL, target.URL)
 }

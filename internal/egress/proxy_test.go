@@ -2,6 +2,7 @@ package egress
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -9,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -76,11 +78,8 @@ func TestProxyMethodsAndForm(t *testing.T) {
 func TestProxyForwardsAllowed(t *testing.T) {
 	_, port := localServer(t)
 	r := &stubResolver{seq: [][]netip.Addr{{netip.MustParseAddr("127.0.0.1")}}}
-	p, err := startProxy(t.Context(), &Dialer{Resolver: r, AllowPrivate: true}, func(uint16) bool { return true })
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { p.Close() })
+	n, _ := strconv.Atoi(port)
+	p := startTestProxy(t, &Dialer{Resolver: r, AllowPrivate: true, AllowPorts: []uint16{uint16(n)}})
 	proxyURL := fmt.Sprintf("http://127.0.0.1:%d", p.Port())
 	cl := &http.Client{Timeout: 3 * time.Second, Transport: &http.Transport{
 		Proxy: func(*http.Request) (*url.URL, error) { return url.Parse(proxyURL) },
@@ -121,11 +120,7 @@ func TestProxyConnectTunnels(t *testing.T) {
 		io.Copy(c, c)
 		c.Close()
 	}()
-	p, err := startProxy(t.Context(), &Dialer{AllowPrivate: true}, func(uint16) bool { return true })
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { p.Close() })
+	p := startTestProxy(t, &Dialer{AllowPrivate: true, AllowPorts: []uint16{lnPort(ln)}})
 	addr := ln.Addr().String()
 	br, c := rawRequest(t, p, "CONNECT "+addr+" HTTP/1.1\r\nHost: "+addr+"\r\n\r\n")
 	if l := status(t, br); !strings.Contains(l, " 200 ") {
@@ -138,6 +133,8 @@ func TestProxyConnectTunnels(t *testing.T) {
 		t.Fatalf("%q %v", buf, err)
 	}
 }
+
+func lnPort(ln net.Listener) uint16 { return uint16(ln.Addr().(*net.TCPAddr).Port) }
 
 func startCfg(t *testing.T, d *Dialer, cfg proxyConfig) *Proxy {
 	t.Helper()
@@ -187,7 +184,7 @@ func TestProxyHeaderTimeout(t *testing.T) {
 }
 
 func TestProxyForwardBodyRejected(t *testing.T) {
-	p := startCfg(t, &Dialer{AllowPrivate: true}, proxyConfig{allowPort: func(uint16) bool { return true }})
+	p := startTestProxy(t, &Dialer{AllowPrivate: true, AllowPorts: []uint16{1}})
 	br, _ := rawRequest(t, p, "GET http://127.0.0.1:1/ HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello")
 	if l := status(t, br); !strings.Contains(l, " 400 ") {
 		t.Fatal(l)
@@ -200,7 +197,7 @@ func TestProxyForwardStripsHeaders(t *testing.T) {
 		got <- r.Header.Clone()
 	}))
 	defer srv.Close()
-	p := startCfg(t, &Dialer{AllowPrivate: true}, proxyConfig{allowPort: func(uint16) bool { return true }})
+	p := startTestProxy(t, &Dialer{AllowPrivate: true, AllowPorts: []uint16{lnPort(srv.Listener)}})
 	br, _ := rawRequest(t, p, "GET http://"+srv.Listener.Addr().String()+"/ HTTP/1.1\r\nHost: x\r\n"+
 		"Proxy-Authorization: Basic secret\r\nConnection: X-Secret, keep-alive\r\nX-Secret: s\r\n"+
 		"Keep-Alive: 5\r\nUpgrade: websocket\r\nTE: trailers\r\nX-Keep: ok\r\n\r\n")
@@ -232,7 +229,7 @@ func TestProxyConnectIdleTracksBothDirections(t *testing.T) {
 			time.Sleep(100 * time.Millisecond)
 		}
 	}()
-	p := startCfg(t, &Dialer{AllowPrivate: true}, proxyConfig{allowPort: func(uint16) bool { return true }, idle: time.Second})
+	p := startCfg(t, &Dialer{AllowPrivate: true, AllowPorts: []uint16{lnPort(ln)}}, proxyConfig{idle: time.Second})
 	addr := ln.Addr().String()
 	br, c := rawRequest(t, p, "CONNECT "+addr+" HTTP/1.1\r\nHost: "+addr+"\r\n\r\n")
 	c.SetDeadline(time.Now().Add(10 * time.Second))
@@ -255,7 +252,7 @@ func TestProxyConnectIdleExpires(t *testing.T) {
 			io.Copy(io.Discard, c)
 		}
 	}()
-	p := startCfg(t, &Dialer{AllowPrivate: true}, proxyConfig{allowPort: func(uint16) bool { return true }, idle: 300 * time.Millisecond})
+	p := startCfg(t, &Dialer{AllowPrivate: true, AllowPorts: []uint16{lnPort(ln)}}, proxyConfig{idle: 300 * time.Millisecond})
 	addr := ln.Addr().String()
 	br, c := rawRequest(t, p, "CONNECT "+addr+" HTTP/1.1\r\nHost: "+addr+"\r\n\r\n")
 	status(t, br)
@@ -282,5 +279,42 @@ func TestProxyConnCap(t *testing.T) {
 	c.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
 	if _, err := br.ReadString('\n'); err == nil {
 		t.Fatal("second conn served despite cap")
+	}
+}
+
+// brokenListener accepts nothing: Accept fails with a permanent error.
+type brokenListener struct {
+	net.Listener
+	err error
+}
+
+func (b brokenListener) Accept() (net.Conn, error) { return nil, b.err }
+
+func TestProxyPermanentAcceptErrorRecorded(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	boom := errors.New("accept: boom")
+	p := startCfg(t, &Dialer{}, proxyConfig{listener: brokenListener{Listener: ln, err: boom}})
+	select {
+	case <-p.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("Done not closed after a permanent accept error")
+	}
+	if !errors.Is(p.Err(), boom) {
+		t.Fatalf("Err() = %v, want the accept error", p.Err())
+	}
+}
+
+func TestProxyCloseIsNotAnError(t *testing.T) {
+	p := startTestProxy(t, &Dialer{})
+	if p.Err() != nil {
+		t.Fatal("Err before Done")
+	}
+	p.Close()
+	<-p.Done()
+	if p.Err() != nil {
+		t.Fatalf("Err() after Close = %v, want nil", p.Err())
 	}
 }

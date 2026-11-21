@@ -97,9 +97,11 @@ func homeDir() string {
 }
 
 // fetchSystemReadOnly are the system files yt-dlp (Python) needs besides
-// systemReadOnly: CA certificates for TLS through the proxy, and the
-// timezone.
-var fetchSystemReadOnly = []string{"/etc/ssl", "/etc/pki", "/etc/ca-certificates", "/etc/localtime"}
+// systemReadOnly: CA certificates and the OpenSSL configuration for TLS
+// through the proxy (Debian and Red Hat layouts), and the timezone. Not
+// /etc/ssl or /etc/pki whole: their private/ directories hold host keys.
+var fetchSystemReadOnly = []string{"/etc/ssl/certs", "/etc/ssl/openssl.cnf", "/etc/ca-certificates",
+	"/etc/pki/tls/certs", "/etc/pki/tls/openssl.cnf", "/etc/pki/ca-trust", "/etc/localtime"}
 
 // ytdlpReadOnly is what a yt-dlp child may read besides the system paths:
 // toolReadOnly of yt-dlp itself; the root of the virtualenv it lives in

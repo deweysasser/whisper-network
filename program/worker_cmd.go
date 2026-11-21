@@ -48,6 +48,7 @@ type WorkerCmd struct {
 	EgressProbe        string        `env:"WHISPER_EGRESS_PROBE" help:"URL that returns this downloader's public IP as plain text, e.g. https://api.ipify.org (downloader; optional)"`
 	AllowPrivateEgress bool          `env:"WHISPER_ALLOW_PRIVATE_EGRESS" help:"Let the downloader reach loopback, private and link-local addresses (disables the SSRF filter; downloader)"`
 	FetchTimeout       time.Duration `default:"2h" env:"WHISPER_FETCH_TIMEOUT" help:"Time limit of one fetch (downloader)"`
+	FetchAddressSpace  ByteSize      `default:"0" env:"WHISPER_FETCH_ADDRESS_SPACE" help:"RLIMIT_AS of the yt-dlp child and the deno it runs (0: none; deno reserves tens of GiB of address space, so a low limit breaks YouTube; downloader)"`
 	MetricsListen      string        `env:"WHISPER_METRICS_LISTEN" help:"Serve /metrics on this address (optional; e.g. 127.0.0.1:9091 — the endpoint is unauthenticated)"`
 	MetricsPushURL     string        `env:"WHISPER_METRICS_PUSH_URL" help:"Push metrics to this VictoriaMetrics import URL (optional)"`
 	MetricsPushInt     time.Duration `name:"metrics-push-interval" default:"15s" env:"WHISPER_METRICS_PUSH_INTERVAL" help:"Metrics push interval"`
@@ -57,10 +58,16 @@ type WorkerCmd struct {
 // Validate checks the flags that relate to each other.
 func (c *WorkerCmd) Validate() error {
 	if !c.Downloader {
-		for flag, set := range map[string]bool{"--yt-dlp-cookies": c.YtDlpCookies != "", "--egress-group": c.EgressGroup != "",
-			"--egress-probe": c.EgressProbe != "", "--allow-private-egress": c.AllowPrivateEgress} {
-			if set {
-				return fmt.Errorf("%s needs --downloader", flag)
+		for _, f := range []struct {
+			flag string
+			set  bool
+		}{
+			{"--yt-dlp-cookies", c.YtDlpCookies != ""}, {"--egress-group", c.EgressGroup != ""},
+			{"--egress-probe", c.EgressProbe != ""}, {"--allow-private-egress", c.AllowPrivateEgress},
+			{"--fetch-address-space", c.FetchAddressSpace != 0},
+		} {
+			if f.set {
+				return fmt.Errorf("%s needs --downloader", f.flag)
 			}
 		}
 	}
@@ -99,7 +106,7 @@ func (c *WorkerCmd) Run(ctx context.Context, logger zerolog.Logger) error {
 		Version: Version, Logger: log, Metrics: m,
 		Downloader: c.Downloader, YtDlp: c.YtDlp, YtDlpCookies: c.YtDlpCookies, EgressGroup: c.EgressGroup,
 		EgressProbe: c.EgressProbe, AllowPrivateEgress: c.AllowPrivateEgress,
-		Limits: worker.Limits{FetchTimeout: c.FetchTimeout, TimeoutFactor: c.ChildTimeout, PrepareTimeout: c.PrepareTimeout,
+		Limits: worker.Limits{FetchTimeout: c.FetchTimeout, FetchAddressSpace: int64(c.FetchAddressSpace), TimeoutFactor: c.ChildTimeout, PrepareTimeout: c.PrepareTimeout,
 			PrepareMinRate: int64(c.PrepareMinRate)},
 	})
 	if err != nil {

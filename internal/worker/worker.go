@@ -30,6 +30,9 @@ var (
 	// ErrUnknownWorker means the server does not accept this worker's
 	// credentials (401). The worker does not silently re-register.
 	ErrUnknownWorker = errors.New("server does not recognize this worker's credentials")
+	// ErrEgressProxyStopped means a downloader's egress proxy stopped
+	// accepting connections while the worker ran: it can fetch nothing.
+	ErrEgressProxyStopped = errors.New("the downloader's egress proxy stopped")
 )
 
 // Worker is one worker process. Create it with New and call Run once.
@@ -54,6 +57,9 @@ type Worker struct {
 	egressTrigger chan struct{}
 	egressMu      sync.Mutex
 	egressIP      string
+	// noProxyConnect: the fetch child's sandbox cannot let it reach the
+	// proxy (Linux below Landlock ABI 4), so fetch leases are refused.
+	noProxyConnect bool
 
 	mem      *memBudget
 	cache    *ModelCache
@@ -74,6 +80,7 @@ type Worker struct {
 // tools are the resolved child binaries and their versions.
 type tools struct {
 	ytdlp, ytdlpVersion          string // downloader only
+	deno                         string // downloader only; "" if absent or unusable
 	whisper, ffmpeg              string // absolute paths, "" if absent
 	engineVersion, ffmpegVersion string
 	// whisperRO, ffmpegRO and ytdlpRO are what each tool's sandbox may
@@ -176,6 +183,10 @@ func (w *Worker) Run(ctx context.Context) error {
 		return w.result(ctx, runCtx, err)
 	}
 
+	if w.proxy != nil {
+		go w.watchProxy(runCtx)
+	}
+
 	workCtx := runCtx
 	if w.cfg.Drain {
 		// Running tasks survive the shutdown signal but not a fatal error.
@@ -215,6 +226,22 @@ func (w *Worker) Run(ctx context.Context) error {
 	return w.result(ctx, runCtx, nil)
 }
 
+// watchProxy stops the worker when its egress proxy stops (a permanent
+// accept error) before ctx ends: without it every fetch would fail.
+func (w *Worker) watchProxy(ctx context.Context) {
+	select {
+	case <-ctx.Done():
+	case <-w.proxy.Done():
+		if ctx.Err() == nil {
+			err := ErrEgressProxyStopped
+			if perr := w.proxy.Err(); perr != nil {
+				err = fmt.Errorf("%w: %w", ErrEgressProxyStopped, perr)
+			}
+			w.fail(err)
+		}
+	}
+}
+
 // result maps how Run ended to its return value.
 func (w *Worker) result(ctx, runCtx context.Context, err error) error {
 	if cause := context.Cause(runCtx); isFatal(cause) {
@@ -241,7 +268,7 @@ func (w *Worker) fail(err error) {
 
 // isFatal reports errors that must stop the worker.
 func isFatal(err error) bool {
-	return errors.Is(err, ErrRejected) || errors.Is(err, ErrUnknownWorker) ||
+	return errors.Is(err, ErrRejected) || errors.Is(err, ErrUnknownWorker) || errors.Is(err, ErrEgressProxyStopped) ||
 		client.IsRejected(err) || client.IsUnauthorized(err)
 }
 

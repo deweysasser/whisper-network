@@ -51,8 +51,11 @@ func (w *Worker) fetch(ctx context.Context, l *api.Lease, dir string, run *lease
 	if l.URL == "" {
 		return taskStats{}, preWork("fetch lease carries no url", nil)
 	}
-	if w.proxy == nil || w.fetchClient == nil {
+	if w.proxy == nil || w.fetchClient == nil || w.proxyStopped() {
 		return taskStats{}, preWork("the egress proxy is not running", nil)
+	}
+	if w.noProxyConnect {
+		return taskStats{}, preWork("the downloader sandbox cannot permit proxy connects (Landlock ABI 4 needed)", nil)
 	}
 	// yt-dlp may have been removed or replaced since startup.
 	if _, err := exec.LookPath(w.tools.ytdlp); err != nil {
@@ -82,6 +85,17 @@ func (w *Worker) fetch(ctx context.Context, l *api.Lease, dir string, run *lease
 	return taskStats{computeMS: elapsed.Milliseconds()}, nil
 }
 
+// proxyStopped reports whether the egress proxy no longer accepts
+// connections.
+func (w *Worker) proxyStopped() bool {
+	select {
+	case <-w.proxy.Done():
+		return true
+	default:
+		return false
+	}
+}
+
 // copyForChild copies the operator's file src to dst, a new file the child
 // may read and write.
 func (w *Worker) copyForChild(src, dst string) error {
@@ -98,23 +112,34 @@ func (w *Worker) copyForChild(src, dst string) error {
 	return errors.Join(err, out.Close())
 }
 
-// fetchYtDlp runs yt-dlp with its stdout streamed into the result PUT.
-func (w *Worker) fetchYtDlp(ctx context.Context, l *api.Lease, dir, cookies string, run *leaseRun, log zerolog.Logger) (int64, error) {
+// fetchChildSpec is the sandbox of a fetch child (yt-dlp, and the deno it
+// may run) working in dir: read-only system paths and the yt-dlp tree,
+// read-write dir, TCP connect to proxyPort only (DESIGN.md §7.6), small
+// files, lowest priority, and no RLIMIT_AS unless the operator set
+// Limits.FetchAddressSpace (deno reserves tens of GiB of address space).
+func (w *Worker) fetchChildSpec(dir string, proxyPort uint16) sandbox.Spec {
 	lim := w.cfg.Limits
 	spec := sandbox.Spec{
 		ReadOnly:     slices.Concat(systemReadOnly, childSystemFiles, fetchSystemReadOnly, w.tools.ytdlpRO),
 		ReadWrite:    []string{dir},
 		DenyNet:      true,
-		ConnectPorts: []uint16{w.proxy.Port()},
+		ConnectPorts: []uint16{proxyPort},
 		FileSize:     fetchFileSize,
 		OpenFiles:    uint64(lim.OpenFiles),
 		UID:          w.cfg.ChildUID,
 		GID:          w.cfg.ChildGID,
 	}.WithLowestPriority()
 	w.limitProcesses(&spec)
-	if !lim.NoAddressSpaceLimit {
+	if !lim.NoAddressSpaceLimit && lim.FetchAddressSpace > 0 {
 		spec.AddressSpace = uint64(lim.FetchAddressSpace)
 	}
+	return spec
+}
+
+// fetchYtDlp runs yt-dlp with its stdout streamed into the result PUT.
+func (w *Worker) fetchYtDlp(ctx context.Context, l *api.Lease, dir, cookies string, run *leaseRun, log zerolog.Logger) (int64, error) {
+	lim := w.cfg.Limits
+	spec := w.fetchChildSpec(dir, w.proxy.Port())
 	// FetchTimeout bounds the whole fetch, upload included: a server that
 	// stops reading must not hold the slot past it.
 	fetchCtx, cancelFetch := context.WithTimeoutCause(ctx, lim.FetchTimeout, errFetchTimeout)
@@ -261,7 +286,7 @@ func (w *Worker) getFailure(ctx context.Context, err error) error {
 	}
 	class := errClass(err)
 	if class == "refused" {
-		return fetchPermanent("GET refused: the URL resolves to a filtered address")
+		return fetchPermanent("GET refused: the URL or a redirect leads to a filtered address or port")
 	}
 	w.requestEgressProbe()
 	return fetchTransient("GET failed (" + class + ")")
