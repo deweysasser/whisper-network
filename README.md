@@ -329,8 +329,9 @@ per 3 minutes and back off for 12 hours after a rate limit. Downloaders behind
 one public address should share `--egress-group NAME` (or set `--egress-probe`)
 so they are paced together. Needs a kernel with Landlock ABI 4 (Linux 6.7+):
 below that the sandbox cannot let yt-dlp reach the proxy, and the downloader
-refuses fetch leases (lowering `--fetch-min-sandbox` does not change that on
-Linux).
+refuses fetch leases. Lowering `--fetch-min-sandbox` does not help on Linux:
+the downloader is then offered fetch leases, refuses each, and is paused by the
+server's circuit breaker.
 
 Give the downloader its own network and an egress firewall that allows only
 outbound TCP to ports 80, 443 and the server's port, plus DNS. With Docker and
@@ -341,6 +342,16 @@ iptables -I DOCKER-USER -s 172.30.0.0/24 -j DROP
 iptables -I DOCKER-USER -s 172.30.0.0/24 -p udp --dport 53 -j ACCEPT
 iptables -I DOCKER-USER -s 172.30.0.0/24 -p tcp -m multiport --dports 53,80,443,8080 -j ACCEPT
 iptables -I DOCKER-USER -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+```
+
+If that network has IPv6 enabled, add the same rules with `ip6tables` for its
+IPv6 subnet (here `fd30::/64`):
+
+```sh
+ip6tables -I DOCKER-USER -s fd30::/64 -j DROP
+ip6tables -I DOCKER-USER -s fd30::/64 -p udp --dport 53 -j ACCEPT
+ip6tables -I DOCKER-USER -s fd30::/64 -p tcp -m multiport --dports 53,80,443,8080 -j ACCEPT
+ip6tables -I DOCKER-USER -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 ```
 
 That closes the one path around the egress proxy (DESIGN.md section 13).

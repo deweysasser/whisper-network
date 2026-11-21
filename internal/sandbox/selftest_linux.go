@@ -24,6 +24,7 @@ func runNetChecks(tg selfTestTargets, out map[string]string) {
 	if tg.allowedTCP != "" {
 		out[CheckTCPListen] = outcome(listenTCP())
 		out[CheckTCPFastOpen] = outcome(fastOpenTo(tg.tcp))
+		out[CheckAbstractBind] = outcome(bindAbstract(tg.abstract + "-bind"))
 		out[CheckTCPConnectAllowed] = outcome(dialInet(unix.SOCK_STREAM, 0, tg.allowedTCP))
 	}
 }
@@ -37,6 +38,18 @@ func listenTCP() error {
 	}
 	defer unix.Close(fd)
 	return unix.Listen(fd, 1)
+}
+
+// bindAbstract binds one end of a fresh AF_UNIX stream socketpair to the
+// abstract name.
+func bindAbstract(name string) error {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fds[0])
+	defer unix.Close(fds[1])
+	return unix.Bind(fds[0], &unix.SockaddrUnix{Name: "@" + name})
 }
 
 // fastOpenTo sends one byte with MSG_FASTOPEN to addr from a fresh TCP

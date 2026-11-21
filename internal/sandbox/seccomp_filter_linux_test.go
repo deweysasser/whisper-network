@@ -97,6 +97,7 @@ func TestSeccompFilterDecisions(t *testing.T) {
 		{"socketpair stream proto 1", unix.SYS_SOCKETPAIR, []uint64{unix.AF_UNIX, unix.SOCK_STREAM, 1}, eacces},
 		{"socketpair AF_INET stream", unix.SYS_SOCKETPAIR, []uint64{unix.AF_INET, unix.SOCK_STREAM, 0}, eacces},
 		{"socketpair AF_NETLINK", unix.SYS_SOCKETPAIR, []uint64{unix.AF_NETLINK, unix.SOCK_RAW, 0}, eacces},
+		{"bind", unix.SYS_BIND, []uint64{3, 0, 16}, eacces},
 		{"listen", unix.SYS_LISTEN, []uint64{3, 1}, eacces},
 		{"accept", unix.SYS_ACCEPT, []uint64{3, 0, 0}, eacces},
 		{"accept4", unix.SYS_ACCEPT4, []uint64{3, 0, 0, cx}, eacces},

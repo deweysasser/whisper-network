@@ -161,8 +161,10 @@ func (w *Worker) Run(ctx context.Context) error {
 	}
 	if w.cfg.Downloader {
 		// Before the probe: the sandbox self-test connects to the proxy's
-		// port and would otherwise listen on it itself.
-		stop, err := w.startEgress(ctx)
+		// port and would otherwise listen on it itself. Not bound to ctx:
+		// with --drain, fetches running at the shutdown signal still need
+		// it; it closes when Run returns, after the slots.
+		stop, err := w.startEgress(context.WithoutCancel(ctx))
 		if err != nil {
 			return err
 		}

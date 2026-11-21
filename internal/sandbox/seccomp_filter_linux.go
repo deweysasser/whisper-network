@@ -162,7 +162,11 @@ func buildSeccomp(r seccompRules) ([]unix.SockFilter, error) {
 			allowTCPSocket()
 			allowUnixStreamPair()
 			// Outbound only: listen(2) on an unbound socket autobinds
-			// an ephemeral port without Landlock's bind check.
+			// an ephemeral port without Landlock's bind check. A
+			// connect autobinds without bind(2), which is refused so
+			// stream pairs cannot claim abstract names (Landlock's
+			// abstract scoping covers connect, not bind).
+			deny(unix.SYS_BIND, unix.EACCES)
 			deny(unix.SYS_LISTEN, unix.EACCES)
 			deny(unix.SYS_ACCEPT, unix.EACCES)
 			deny(unix.SYS_ACCEPT4, unix.EACCES)

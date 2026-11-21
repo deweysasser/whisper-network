@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -271,6 +272,7 @@ const (
 	YtDlpOKFiltered      = "ok-filtered"       // print the body, then the live filter's skip notice, and exit 0
 	YtDlpEndless         = "endless"           // print the body, then zeros as fast as possible, forever
 	YtDlpTrickle         = "trickle"           // print the body, then 1 KiB every 20 ms, forever
+	YtDlpProxyLate       = "proxy-late"        // wait 1s, connect to the egress proxy, then print the body
 )
 
 // CookiesHeader is the first line yt-dlp expects of a cookies file; the
@@ -376,6 +378,17 @@ func fakeYtDlp(args []string) int {
 				time.Sleep(20 * time.Millisecond)
 			}
 		}
+	case YtDlpProxyLate:
+		time.Sleep(time.Second)
+		proxy := args[slices.Index(expectedYtDlpArgs, "PROXY")]
+		c, err := net.DialTimeout("tcp", strings.TrimPrefix(proxy, "http://"), 5*time.Second)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: Unable to connect to proxy: %v\n", err)
+			return 1
+		}
+		_ = c.Close()
+		_, _ = os.Stdout.Write(body)
+		return 0
 	case YtDlpHTML:
 		_, _ = os.Stdout.WriteString("<!DOCTYPE html>\n<html><head><title>Sign in</title></head><body>" +
 			strings.Repeat("<p>please sign in</p>", 100) + "</body></html>\n")

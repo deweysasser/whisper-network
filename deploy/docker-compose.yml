@@ -62,7 +62,8 @@ services:
   # proxy's port, but on any address (Landlock has no address rules). For a
   # real deployment give it its own network and an egress firewall that lets
   # out only TCP to 80, 443 and the server's port, plus DNS (the proxy's port
-  # is ephemeral and never one of those), e.g. Docker's DOCKER-USER chain;
+  # is ephemeral and never one of those), e.g. Docker's DOCKER-USER chain,
+  # for IPv4 and, if the network has it, IPv6 (ip6tables);
   # see DESIGN.md section 13. A --yt-dlp-cookies file is readable by yt-dlp:
   # use a throwaway account's.
   downloader:

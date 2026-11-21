@@ -194,6 +194,9 @@ type FetchPolicyRow struct {
 	UpdatedAt                    time.Time
 	// Invalid is why the row does not validate (empty for a valid row).
 	Invalid string
+	// parsed is the row's policy, built once when the row is read; zero
+	// for an invalid row.
+	parsed fetchpolicy.Policy
 }
 
 // FetchPolicyRows returns every fetch policy row in key order, including the
@@ -243,8 +246,10 @@ func queryFetchPolicyRows(ctx context.Context, q querier, key string) ([]FetchPo
 		r.UpdatedAt = fromMS(at)
 		if err := json.Unmarshal([]byte(rules), &r.Rules); err != nil {
 			r.Rules, r.Invalid = nil, "rules: "+err.Error()
+		} else if p, why := r.validate(); why != "" {
+			r.Invalid = why
 		} else {
-			_, r.Invalid = r.validate()
+			r.parsed = p
 		}
 		out = append(out, r)
 	}
@@ -271,9 +276,5 @@ func (r FetchPolicyRow) validate() (fetchpolicy.Policy, string) {
 
 // policy is the row's policy, and whether the row is valid.
 func (r FetchPolicyRow) policy() (fetchpolicy.Policy, bool) {
-	if r.Invalid != "" {
-		return fetchpolicy.Policy{}, false
-	}
-	p, _ := r.validate()
-	return p, true
+	return r.parsed, r.Invalid == ""
 }

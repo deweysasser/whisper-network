@@ -22,13 +22,15 @@ func itoa64(n int64) string { return strconv.FormatInt(n, 10) }
 // validateFacts bounds what a worker may report about itself. The values
 // end up in the UI and in metric labels, so they must stay small.
 func validateFacts(f *api.WorkerFacts) error {
-	for name, v := range map[string]string{
-		"hostname": f.Hostname, "cpu_model": f.CPUModel, "os": f.OS, "arch": f.Arch,
-		"engine_version": f.EngineVersion, "ffmpeg_version": f.FFmpegVersion, "version": f.Version,
-		"yt_dlp_version": f.YtDlpVersion,
+	// In field order, so a report with several bad fields always names
+	// the same one.
+	for _, fv := range []struct{ name, v string }{
+		{"hostname", f.Hostname}, {"cpu_model", f.CPUModel}, {"os", f.OS}, {"arch", f.Arch},
+		{"engine_version", f.EngineVersion}, {"ffmpeg_version", f.FFmpegVersion}, {"version", f.Version},
+		{"yt_dlp_version", f.YtDlpVersion},
 	} {
-		if len(v) > 200 || !utf8.ValidString(v) {
-			return badRequest(name + " must be valid UTF-8 of at most 200 bytes")
+		if len(fv.v) > 200 || !utf8.ValidString(fv.v) {
+			return badRequest(fv.name + " must be valid UTF-8 of at most 200 bytes")
 		}
 	}
 	if f.Hostname == "" {

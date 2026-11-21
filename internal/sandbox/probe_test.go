@@ -49,6 +49,8 @@ func TestProbeDownloaderLevels(t *testing.T) {
 		"fastopen open":         {downloaderReport(6, CheckTCPFastOpen, OutcomeOpen), api.SandboxFSOnly, false},
 		"fastopen unsupported":  {downloaderReport(6, CheckTCPFastOpen, OutcomeUnsupported), api.SandboxFull, false},
 		"missing fastopen":      {downloaderReport(6, CheckTCPFastOpen, ""), "", true},
+		"abstract bind open":    {downloaderReport(6, CheckAbstractBind, OutcomeOpen), api.SandboxFSOnly, false},
+		"missing abstract bind": {downloaderReport(6, CheckAbstractBind, ""), "", true},
 		"unix open":             {downloaderReport(6, CheckUnixConnect, OutcomeOpen), api.SandboxFSOnly, false},
 		"fs open":               {downloaderReport(6, CheckFSRead, OutcomeOpen), api.SandboxNone, false},
 		"missing allowed check": {downloaderReport(6, CheckTCPConnectAllowed, ""), "", true},

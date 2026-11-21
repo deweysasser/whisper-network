@@ -45,20 +45,9 @@ func (w *Worker) startEgress(ctx context.Context) (func(), error) {
 	if p := serverPort(w.cfg.Client.BaseURL()); p != 0 {
 		forbidden = append(forbidden, p)
 	}
-	var p *egress.Proxy
-	for range proxyPortTries {
-		var err error
-		if p, err = egress.StartProxy(ctx, d); err != nil {
-			return nil, fmt.Errorf("starting the egress proxy: %w", err)
-		}
-		if !slices.Contains(forbidden, p.Port()) {
-			break
-		}
-		_ = p.Close()
-		p = nil
-	}
-	if p == nil {
-		return nil, fmt.Errorf("starting the egress proxy: no port outside %v after %d tries", forbidden, proxyPortTries)
+	p, err := startProxyAvoiding(func() (*egress.Proxy, error) { return egress.StartProxy(ctx, d) }, forbidden)
+	if err != nil {
+		return nil, err
 	}
 	w.proxy = p
 	probe := d
@@ -73,6 +62,24 @@ func (w *Worker) startEgress(ctx context.Context) (func(), error) {
 	}
 	w.log.Info().Uint16(obs.FieldProxyPort, p.Port()).Msg("egress proxy started")
 	return func() { _ = p.Close() }, nil
+}
+
+// startProxyAvoiding starts proxies with start until one listens on a port
+// outside forbidden, closing the others, for at most proxyPortTries tries.
+// The proxy's port is the one port the yt-dlp child may connect to, so it
+// must not be a port that reaches anything else (80, 443, the server's).
+func startProxyAvoiding(start func() (*egress.Proxy, error), forbidden []uint16) (*egress.Proxy, error) {
+	for range proxyPortTries {
+		p, err := start()
+		if err != nil {
+			return nil, fmt.Errorf("starting the egress proxy: %w", err)
+		}
+		if !slices.Contains(forbidden, p.Port()) {
+			return p, nil
+		}
+		_ = p.Close()
+	}
+	return nil, fmt.Errorf("starting the egress proxy: no port outside %v after %d tries", forbidden, proxyPortTries)
 }
 
 // serverPort is the TCP port of an http(s) URL, explicit or the scheme's

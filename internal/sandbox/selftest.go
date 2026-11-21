@@ -33,6 +33,11 @@ const (
 	// Only [ProbeDownloader] runs it. A kernel with TCP Fast Open disabled
 	// reports it unsupported.
 	CheckTCPFastOpen = "tcp_fastopen"
+	// CheckAbstractBind is bind(2) of a socketpair(AF_UNIX, SOCK_STREAM)
+	// end to an abstract name: the stream pairs the downloader profile
+	// allows must not claim names other processes connect to. Only
+	// [ProbeDownloader] runs it.
+	CheckAbstractBind = "abstract_bind"
 )
 
 // Checks lists every self-test check.
@@ -41,8 +46,10 @@ var Checks = []string{CheckFSRead, CheckTCPConnect, CheckMPTCPConnect, CheckUDPS
 
 // DownloaderChecks lists the checks of a downloader self-test: every check of
 // [Checks], where tcp_connect targets a port outside the allowlist, plus
-// [CheckTCPListen], [CheckTCPFastOpen] and [CheckTCPConnectAllowed].
-var DownloaderChecks = append(append([]string(nil), Checks...), CheckTCPListen, CheckTCPFastOpen, CheckTCPConnectAllowed)
+// [CheckTCPListen], [CheckTCPFastOpen], [CheckAbstractBind] and
+// [CheckTCPConnectAllowed].
+var DownloaderChecks = append(append([]string(nil), Checks...), CheckTCPListen, CheckTCPFastOpen, CheckAbstractBind,
+	CheckTCPConnectAllowed)
 
 // Outcomes of a check.
 const (

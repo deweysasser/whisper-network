@@ -486,3 +486,21 @@ func TestFetchGETRedirectToOtherPortRefused(t *testing.T) {
 	assert.Zero(t, hits.Load(), "the redirect target was reached")
 	assert.Contains(t, f.Reason, "refused")
 }
+
+// TestDrainKeepsEgressProxyForRunningFetch: with --drain, a fetch running
+// at the shutdown signal can still reach the egress proxy and finishes.
+func TestDrainKeepsEgressProxyForRunningFetch(t *testing.T) {
+	h := fetchHarness(t, workertest.YtDlpProxyLate, fakeMedia)
+	h.cfg.Drain = true
+	cancel, done := h.run()
+	h.activate()
+	task := h.srv.AddTask(workertest.Task{Kind: api.KindFetch, URL: fetchURL, Site: "youtube.com"})
+	h.liveLease(task)
+	h.eventually(func() bool { return h.srv.LeasesFor(task)[0].Heartbeats >= 1 }, "worker never held the lease")
+	cancel()
+	require.NoError(t, waitDone(t, done))
+	l := h.srv.LeasesFor(task)
+	require.Len(t, l, 1)
+	assert.Equal(t, api.OutcomeDone, l[0].Outcome, "failures: %v", h.srv.Task(task).Failures)
+	assert.True(t, bytes.Equal(fakeMedia, h.srv.Task(task).Fetched), "the fetched media reached the server")
+}
