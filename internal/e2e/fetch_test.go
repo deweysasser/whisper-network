@@ -156,7 +156,8 @@ func TestE2ERetryRefetch(t *testing.T) {
 	job := submitURL(t, sub, "http://127.0.0.1:1/private")
 	failed := e.WaitJob(job.ID, api.JobFailed)
 	require.NotNil(t, failed.Error)
-	assert.Contains(t, *failed.Error, "permanent failure", "classified permanent, not a retryable error")
+	assert.Contains(t, *failed.Error, "after 1 attempt(s)", "classified permanent, not a retryable error")
+	assert.Contains(t, *failed.Error, "ERROR: [youtube] secretVideoId: Private video", "yt-dlp's own words reach the job")
 	require.True(t, failed.Retryable, "retryable: %v", *failed.Error)
 	require.NoError(t, bad.Stop())
 

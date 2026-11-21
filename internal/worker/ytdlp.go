@@ -140,6 +140,18 @@ func classifyYtDlp(exitErr error, stderr string) ytdlpOutcome {
 var ytdlpRateLimitRE = regexp.MustCompile(`^(?:unable to (?:download|extract) [a-z0-9 /-]+: )?` +
 	`http error 429: too many requests|^sign in to confirm you|^the current session has been rate-limited by youtube`)
 
+// ytdlpErrorLine returns the last "ERROR:" line of yt-dlp's stderr, as
+// written, or "" if there is none.
+func ytdlpErrorLine(stderr string) string {
+	lines := strings.Split(stderr, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if line := strings.TrimSpace(lines[i]); strings.HasPrefix(line, "ERROR:") {
+			return line
+		}
+	}
+	return ""
+}
+
 // ytdlpPrefixRE is the "[extractor] id: " prefix of an ERROR line; the id
 // comes from the URL.
 var ytdlpPrefixRE = regexp.MustCompile(`^\[[^\]]*\] [^ ]*: `)

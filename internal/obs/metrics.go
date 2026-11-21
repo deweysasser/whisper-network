@@ -147,7 +147,7 @@ func (m *Metrics) DBTx(op string, d time.Duration) {
 	m.hist("whisper_db_tx_seconds", dbBuckets, "op", op).Update(d.Seconds())
 }
 
-// FetchResult counts a fetch lease's outcome ("done", "failed",
+// FetchResult counts a fetch lease's outcome ("done", "failed", "released", "expired",
 // "rate_limited", "not_media", "too_large", "invalid") by site label: a
 // policy site key or "other", never a URL.
 func (m *Metrics) FetchResult(site, outcome string) {

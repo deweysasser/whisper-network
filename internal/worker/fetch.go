@@ -44,9 +44,10 @@ var errUploadEnded = errors.New("result upload ended")
 // egress proxy, or, when yt-dlp has no extractor for the URL, with a plain
 // GET through the same filter. Nothing touches the disk.
 //
-// The URL never reaches the logs or the failure report: the lease's site
-// stands for it, and failures are reported by class (stage and
-// retryability), not with yt-dlp's stderr or a Go error's text.
+// Routine logs name the lease's site, not its URL. A failure report
+// carries the full details for the server: yt-dlp's last ERROR line in the
+// reason and its stderr tail, or the Go error's text; those may quote the
+// URL.
 func (w *Worker) fetch(ctx context.Context, l *api.Lease, dir string, run *leaseRun, log zerolog.Logger) (taskStats, error) {
 	if l.URL == "" {
 		return taskStats{}, preWork("fetch lease carries no url", nil)
@@ -159,7 +160,7 @@ func (w *Worker) fetchYtDlp(ctx context.Context, l *api.Lease, dir, cookies stri
 		return n, context.Cause(ctx)
 	case errors.Is(context.Cause(fetchCtx), errFetchTimeout), errors.Is(err, errChildTimeout):
 		w.requestEgressProbe()
-		return n, fetchTransient("yt-dlp timed out")
+		return n, withStderr(fetchTransient("yt-dlp timed out"), res.stderr)
 	case uerr != nil:
 		return n, w.uploadFailure(ctx, l, uerr)
 	case err == nil && n > 0:
@@ -168,29 +169,43 @@ func (w *Worker) fetchYtDlp(ctx context.Context, l *api.Lease, dir, cookies stri
 		return n, nil
 	}
 	if rerr := ytdlpRunError(err); rerr != nil {
-		return n, rerr
+		return n, withStderr(rerr, res.stderr)
 	}
 	var ee *exec.ExitError
 	errors.As(err, &ee)
-	// Only the class is logged: the stderr quotes the URL, the video's id
-	// and its title, even with the URL itself redacted.
+	// The URL is redacted for classification only, so a URL quoted in an
+	// ERROR line cannot pick the verdict; the report gets the raw stderr.
 	outcome := classifyYtDlp(errOrNil(ee), redactURL(res.stderr, l.URL))
 	log.Info().Str(obs.FieldYtDlpOutcome, outcome.String()).Msg("yt-dlp finished")
 	switch outcome {
 	case ytdlpOK:
-		return 0, fetchTransient("yt-dlp produced no output")
+		return 0, withStderr(fetchTransient("yt-dlp produced no output"), res.stderr)
 	case ytdlpUnsupported:
 		if n == 0 {
 			return 0, errYtDlpUnsupported
 		}
-		return n, fetchTransient("yt-dlp failed")
+		return n, withStderr(fetchTransient("yt-dlp failed"), res.stderr)
 	case ytdlpRateLimited:
-		return n, fetchRateLimited("rate limited (yt-dlp)")
+		return n, withStderr(fetchRateLimited("rate limited (yt-dlp)"), res.stderr)
 	case ytdlpPermanent:
-		return n, fetchPermanent("media unavailable (yt-dlp)")
+		return n, withStderr(fetchPermanent("media unavailable (yt-dlp)"), res.stderr)
 	}
 	w.requestEgressProbe()
-	return n, fetchTransient("yt-dlp failed")
+	return n, withStderr(fetchTransient("yt-dlp failed"), res.stderr)
+}
+
+// withStderr attaches a yt-dlp run's stderr tail to its failure, and
+// yt-dlp's last ERROR line to the reason.
+func withStderr(err error, stderr string) error {
+	var te *taskError
+	if !errors.As(err, &te) || stderr == "" {
+		return err
+	}
+	if line := ytdlpErrorLine(stderr); line != "" {
+		te.reason += ": " + line
+	}
+	te.stderr = stderr
+	return te
 }
 
 // ytdlpRunError classifies how a yt-dlp child ended before its stderr is
@@ -212,7 +227,7 @@ func ytdlpRunError(err error) error {
 	case errors.As(err, &ee):
 		return nil
 	}
-	return fetchTransient("yt-dlp failed")
+	return &taskError{reason: "yt-dlp failed", retryable: true, stage: api.StageInput, err: err}
 }
 
 // errOrNil returns ee as an error, or nil when it is nil (avoiding a
@@ -231,7 +246,7 @@ func (w *Worker) fetchGET(ctx context.Context, l *api.Lease, run *leaseRun) (int
 	defer cancel()
 	req, err := http.NewRequestWithContext(getCtx, http.MethodGet, l.URL, nil)
 	if err != nil {
-		return 0, fetchPermanent("the URL cannot be fetched")
+		return 0, &taskError{reason: "the URL cannot be fetched", stage: api.StageInput, err: err}
 	}
 	req.Header.Set("User-Agent", "whisper-network-downloader")
 	resp, err := w.fetchClient.Do(req)
@@ -284,12 +299,12 @@ func (w *Worker) getFailure(ctx context.Context, err error) error {
 	if ctx.Err() != nil {
 		return context.Cause(ctx)
 	}
-	class := errClass(err)
-	if class == "refused" {
-		return fetchPermanent("GET refused: the URL or a redirect leads to a filtered address or port")
+	if errClass(err) == "refused" {
+		return &taskError{reason: "GET refused: the URL or a redirect leads to a filtered address or port",
+			stage: api.StageInput, err: err}
 	}
 	w.requestEgressProbe()
-	return fetchTransient("GET failed (" + class + ")")
+	return &taskError{reason: "GET failed", retryable: true, stage: api.StageInput, err: err}
 }
 
 // isContentRefusal reports the media guard's or the byte cap's verdict.

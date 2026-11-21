@@ -76,3 +76,8 @@ func TestRedactURL(t *testing.T) {
 	assert.Equal(t, "ERROR: Unsupported URL: <url>\n[x] <url>", redactURL("ERROR: Unsupported URL: "+u+"\n[x] "+u, u))
 	assert.Equal(t, "abc", redactURL("abc", ""))
 }
+
+func TestYtDlpErrorLine(t *testing.T) {
+	assert.Equal(t, "ERROR: b", ytdlpErrorLine("[x] a\nERROR: a\nWARNING: w\n  ERROR: b  \n[x] done\n"))
+	assert.Empty(t, ytdlpErrorLine("[x] a\nWARNING: w\n"))
+}

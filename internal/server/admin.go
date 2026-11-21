@@ -22,6 +22,7 @@ package server
 //	POST   /admin/grants                   api.PrincipalGrant → 204              CanGrantTo
 //	DELETE /admin/grants?principal=&role=&scope=  → 204                          CanGrantTo
 //	GET    /admin/fetch-policies           []api.FetchPolicy                     admin
+//	GET    /admin/fetch-policies/{key}     api.FetchPolicy; 404 if none           admin
 //	PUT    /admin/fetch-policies/{key}     api.FetchPolicy → 200 (201 created)   admin; the path key wins
 //	DELETE /admin/fetch-policies/{key}     → 204; 409 for "*"                    admin
 //	GET    /admin/fetch-cooldowns          []api.FetchCooldown in force          admin

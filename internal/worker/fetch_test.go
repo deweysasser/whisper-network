@@ -64,7 +64,7 @@ func (h *harness) failure(task string) api.FailureReport {
 	return h.srv.Task(task).Failures[0]
 }
 
-// assertNoURL checks the worker never logged a fetch URL.
+// assertNoURL checks a successful fetch never logged its URL.
 func (h *harness) assertNoURL(urls ...string) {
 	h.t.Helper()
 	logs := string(h.logs.Bytes())
@@ -133,9 +133,9 @@ func TestFetchNoFallbackOnRateLimit(t *testing.T) {
 	f := h.failure(task)
 	assert.Equal(t, api.StageRateLimited, f.Stage)
 	assert.True(t, f.Retryable)
-	assert.Empty(t, f.StderrTail, "yt-dlp's stderr may quote the URL")
+	assert.Contains(t, f.Reason, "ERROR: [youtube] secretVideoId: Sign in to confirm")
+	assert.Contains(t, f.StderrTail, srv.URL, "the full stderr reaches the server")
 	assert.Zero(t, hits.Load(), "no GET after a rate limit")
-	h.assertNoURL(srv.URL)
 }
 
 func TestFetchPrivateVideoNotRetryable(t *testing.T) {
@@ -144,8 +144,8 @@ func TestFetchPrivateVideoNotRetryable(t *testing.T) {
 	f := h.failure(task)
 	assert.False(t, f.Retryable)
 	assert.Equal(t, api.StageInput, f.Stage)
-	assert.Empty(t, f.StderrTail)
-	h.assertNoURL(fetchURL)
+	assert.Contains(t, f.Reason, "Private video")
+	assert.Contains(t, f.StderrTail, "ERROR: [youtube] secretVideoId: Private video")
 }
 
 func TestFetchHTMLRefused(t *testing.T) {
@@ -189,7 +189,7 @@ func TestFetchGETRefusesPrivateByDefault(t *testing.T) {
 	assert.False(t, f.Retryable, "a URL on a refused address is the input's fault")
 	assert.Equal(t, api.StageInput, f.Stage)
 	assert.Zero(t, hits.Load())
-	h.assertNoURL(srv.URL)
+	assert.Contains(t, f.Reason, "refused")
 }
 
 func TestFetchGETOutcomes(t *testing.T) {
@@ -221,7 +221,6 @@ func TestFetchGETOutcomes(t *testing.T) {
 			assert.Equal(t, c.stage, f.Stage)
 			assert.Equal(t, c.retryable, f.Retryable)
 			assert.Nil(t, h.srv.Task(task).Fetched)
-			h.assertNoURL(srv.URL)
 		})
 	}
 }
@@ -485,5 +484,5 @@ func TestFetchGETRedirectToOtherPortRefused(t *testing.T) {
 	assert.False(t, f.Retryable, "a refused port is the URL's fault")
 	assert.Equal(t, api.StageInput, f.Stage)
 	assert.Zero(t, hits.Load(), "the redirect target was reached")
-	h.assertNoURL(src.URL, target.URL)
+	assert.Contains(t, f.Reason, "refused")
 }

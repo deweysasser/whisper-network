@@ -39,8 +39,8 @@ type WorkerCmd struct {
 	ChildTimeout       float64       `default:"4" env:"WHISPER_CHILD_TIMEOUT_FACTOR" help:"whisper-cli time limit as a multiple of the audio duration (plus 10 min)"`
 	PrepareTimeout     time.Duration `default:"2h" env:"WHISPER_PREPARE_TIMEOUT" help:"Least time limit of one ffmpeg (prepare) run; larger inputs get more (see --prepare-min-rate)"`
 	PrepareMinRate     ByteSize      `default:"1MiB" env:"WHISPER_PREPARE_MIN_RATE" help:"Slowest input rate, per second, a prepare run may take before it times out: an input gets at least its size divided by this"`
-	ChildUID           int           `name:"child-uid" env:"WHISPER_CHILD_UID" help:"Unprivileged uid, dedicated to whisper-network, to run ffmpeg and whisper-cli as. Required when the worker runs as root; nothing else may run as it."`
-	ChildGID           int           `name:"child-gid" env:"WHISPER_CHILD_GID" help:"Unprivileged gid to run ffmpeg and whisper-cli as. Required when the worker runs as root."`
+	ChildUID           int           `name:"child-uid" env:"WHISPER_CHILD_UID" help:"Unprivileged uid, dedicated to whisper-network, to run ffmpeg, whisper-cli and yt-dlp as. Required when the worker runs as root; nothing else may run as it."`
+	ChildGID           int           `name:"child-gid" env:"WHISPER_CHILD_GID" help:"Unprivileged gid to run ffmpeg, whisper-cli and yt-dlp as. Required when the worker runs as root."`
 	Downloader         bool          `env:"WHISPER_DOWNLOADER" help:"Run as a downloader: fetch URLs with yt-dlp for the server instead of processing media (needs yt-dlp; not ffmpeg or whisper-cli)"`
 	YtDlp              string        `name:"yt-dlp" default:"yt-dlp" env:"WHISPER_YT_DLP" help:"yt-dlp binary (downloader)"`
 	YtDlpCookies       string        `name:"yt-dlp-cookies" env:"WHISPER_YT_DLP_COOKIES" type:"path" help:"Cookies file passed to yt-dlp (downloader)"`

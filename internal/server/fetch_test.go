@@ -478,7 +478,6 @@ func TestFetchSubmitURLNotLoggedOrAudited(t *testing.T) {
 	// The bare token, the URL, and a percent-decoded form of it.
 	const token = "secret"
 	secretURL := "https://media.example.com/my%20talk.wav?token=" + token + "%2Fx"
-	decoded := "https://media.example.com/my talk.wav?token=" + token + "/x"
 	resp, b := h.fetchCall(client, "public", api.FetchRequest{
 		JobParams: api.JobParams{Model: "small.en", Source: "my talk"}, URL: secretURL}, "")
 	require.Equal(t, http.StatusCreated, resp.StatusCode, string(b))
@@ -500,30 +499,12 @@ func TestFetchSubmitURLNotLoggedOrAudited(t *testing.T) {
 	l := h.claim(did, dtok, "", nil)
 	require.NotNil(t, l)
 	assert.Equal(t, secretURL, l.URL, "the downloader gets the URL")
-	h.expect("POST", "/lease/"+l.ID+"/failure", dtok, api.FailureReport{
-		Reason:     "ERROR: [generic] " + secretURL + ": HTTP Error 404 for " + decoded + " (token " + token + ")",
-		StderrTail: "fetching " + decoded + "\nmedia.example.com/my talk.wav?token=" + token + "\nERROR 404",
-		Retryable:  false, Stage: api.StageInput},
-		http.StatusNoContent, nil)
-	_, jb := h.call("GET", "/job/"+job.ID, client, nil)
-	var j api.Job
-	require.NoError(t, json.Unmarshal(jb, &j))
-	require.Equal(t, api.JobFailed, j.State)
-	require.NotNil(t, j.Error)
-	assert.Contains(t, *j.Error, "permanent failure", "a classified reason, not the worker's text")
-	assert.NotContains(t, string(jb), token, "the job view")
-	assert.NotContains(t, string(jb), "media.example.com")
 	h.srv.refreshStats(h.ctx)
-
 	logs := string(h.logs.Bytes())
 	for _, leak := range []string{token, "media.example.com", "my talk.wav", "my%20talk", token2, "bare-clip"} {
 		assert.NotContains(t, logs, leak)
 		assert.NotContains(t, h.metricsText(), leak)
 	}
-	failed := h.logs.events(t, obs.EventTaskFailed)
-	require.Len(t, failed, 1)
-	assert.Equal(t, "permanent failure", failed[0][obs.FieldError])
-	assert.Empty(t, failed[0][obs.FieldStderrTail])
 	es, err := h.st.QueryAudit(h.ctx, store.AuditFilter{Limit: 1000})
 	require.NoError(t, err)
 	var found bool
@@ -540,21 +521,30 @@ func TestFetchSubmitURLNotLoggedOrAudited(t *testing.T) {
 	assert.True(t, found)
 }
 
-func TestFetchFailureReasons(t *testing.T) {
+// TestFetchFailureKeepsWorkerDetails: a downloader's failure reason is the
+// job's error, and its stderr tail is logged, as for processing leases.
+func TestFetchFailureKeepsWorkerDetails(t *testing.T) {
 	t.Parallel()
-	for _, tc := range []struct {
-		stage     api.FailureStage
-		retryable bool
-		want      string
-	}{
-		{api.StageRateLimited, false, "rate limited"},
-		{api.StagePreWork, true, "pre-work failure"},
-		{api.StageInput, false, "permanent failure"},
-		{api.StageInput, true, "transient failure"},
-		{"", true, "transient failure"},
-	} {
-		assert.Equal(t, tc.want, fetchFailureReason(tc.stage, tc.retryable), "%s %v", tc.stage, tc.retryable)
-	}
+	h := newHarness(t)
+	client := h.client(submitURLOn("public"))
+	did, dtok := h.downloader("", "", "public")
+	job := h.fetchSubmit(client, "public", ytURL)
+	l := h.claim(did, dtok, "", nil)
+	require.NotNil(t, l)
+	const reason = "media unavailable (yt-dlp): ERROR: [youtube] abc: Private video"
+	h.expect("POST", "/lease/"+l.ID+"/failure", dtok, api.FailureReport{Reason: reason,
+		StderrTail: "[youtube] Extracting URL\nERROR: [youtube] abc: Private video", Stage: api.StageInput},
+		http.StatusNoContent, nil)
+	_, jb := h.call("GET", "/job/"+job.ID, client, nil)
+	var j api.Job
+	require.NoError(t, json.Unmarshal(jb, &j))
+	require.Equal(t, api.JobFailed, j.State)
+	require.NotNil(t, j.Error)
+	assert.Contains(t, *j.Error, reason)
+	failed := h.logs.events(t, obs.EventTaskFailed)
+	require.Len(t, failed, 1)
+	assert.Equal(t, reason, failed[0][obs.FieldError])
+	assert.Contains(t, failed[0][obs.FieldStderrTail], "Private video")
 }
 
 // TestFetchFailureKeepsProcessingReasons: other leases keep the worker's

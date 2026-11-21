@@ -58,7 +58,7 @@ If your token has the `submit_url` grant on the queue, you can have a downloader
       -d '{"model":"small.en","url":"https://example.com/talk.mp3"}' \
       https://wn.example/queue/public/fetch
 
-Response `201 Created` with a job document, as for an upload; the job's `state` starts as `fetching`. Streaming sites are fetched with yt-dlp (audio only, a single video, no live streams); anything else is downloaded as a plain file. If the fetch fails, the job is `failed` with a short fixed `error` reason (the failing URL's details are never recorded); `POST /job/{id}/retry` fetches it again, which also works after the media has been purged. Fetches from a site can be rate limited or paused by the operator, so a URL job may stay `fetching` for a while. Besides the usual errors:
+Response `201 Created` with a job document, as for an upload; the job's `state` starts as `fetching`. Streaming sites are fetched with yt-dlp (audio only, a single video, no live streams); anything else is downloaded as a plain file. The fetched media is held to the same size limit as an upload (2 GiB, or the queue's lower one); larger media fails the job. If the fetch fails, the job is `failed` and its `error` holds the downloader's reason (for yt-dlp, its last `ERROR:` line), which may quote the URL; `POST /job/{id}/retry` fetches it again, which also works after the media has been purged. Fetches from a site can be rate limited or paused by the operator, so a URL job may stay `fetching` for a while. Besides the usual errors:
 
 - `403`: your token lacks `submit_url` on the queue.
 - `409` with problem type `no-downloader`: no downloader worker may fetch for this queue right now. Upload the file instead, or ask the operator.
@@ -87,7 +87,7 @@ Both return `409` with problem type `not-done` until the job is `done`. For a fa
 
 ## Retry a failed job
 
-`POST /job/{id}/retry` (allowed for the job's creator) re-runs a `failed` job's unfinished tasks from the media the server kept; finished parts are kept. It returns `200` with the job document (state `queued` or `preparing`). It returns `409` with problem type `not-retryable` if the job is not failed or its media has been purged; the job document's `retryable` says which beforehand, and `media.kept_until` says how long a failed job's media is kept (about 24 hours, sooner if the server's disk fills).
+`POST /job/{id}/retry` (allowed for the job's creator) re-runs a `failed` job's unfinished tasks from the media the server kept; finished parts are kept. It returns `200` with the job document (state `queued`, `preparing`, or `fetching` when a URL job's media is gone and is fetched again). It returns `409` with problem type `not-retryable` if the job is not failed or, for an uploaded job, its media has been purged; the job document's `retryable` says which beforehand, and `media.kept_until` says how long a failed job's media is kept (about 24 hours, sooner if the server's disk fills).
 
 Whisper output is good but not perfect: names are often misspelled (the prompt helps), and occasionally a phrase repeats or a passage is dropped. Check against the audio before quoting someone.
 

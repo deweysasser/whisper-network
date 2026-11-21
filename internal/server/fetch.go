@@ -545,31 +545,12 @@ func (s *Server) rejectFetch(ctx context.Context, l *store.Lease, status int, ty
 	return newProblem(status, typ, reason)
 }
 
-// Classified failure reasons of fetch leases: the only failure text a
-// fetch lease's job error and logs ever carry (see handleFailure).
+// Reasons the server gives when it rejects a downloader's result.
 const (
-	fetchReasonRateLimited = "rate limited"
-	fetchReasonPreWork     = "pre-work failure"
-	fetchReasonPermanent   = "permanent failure"
-	fetchReasonTransient   = "transient failure"
-	fetchReasonNotMedia    = "not media"
-	fetchReasonTooLarge    = "too large"
-	fetchReasonBadMedia    = "unusable media"
+	fetchReasonNotMedia = "not media"
+	fetchReasonTooLarge = "too large"
+	fetchReasonBadMedia = "unusable media"
 )
-
-// fetchFailureReason classifies a downloader's failure report by its stage
-// and retryability alone.
-func fetchFailureReason(stage api.FailureStage, retryable bool) string {
-	switch {
-	case stage == api.StageRateLimited:
-		return fetchReasonRateLimited
-	case stage == api.StagePreWork:
-		return fetchReasonPreWork
-	case !retryable:
-		return fetchReasonPermanent
-	}
-	return fetchReasonTransient
-}
 
 // jobSiteLabel is the site label (fetchSiteLabels) of a job's fetch site;
 // "other" if the job is gone.

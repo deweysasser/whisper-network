@@ -296,11 +296,6 @@ func (s *Server) handleFailure(w http.ResponseWriter, r *http.Request, p *Princi
 		reason = strings.ToValidUTF8(reason[:maxReasonLen], "")
 	}
 	tail := obs.StderrTail(rep.StderrTail)
-	if fetch != nil {
-		// A downloader's own words quote the URL in forms no filter
-		// reliably catches (encoded, partial, ids): they are never kept.
-		reason, tail = fetchFailureReason(stage, rep.Retryable), ""
-	}
 	end, err := s.st.FailStage(r.Context(), r.PathValue("id"), p.ID, reason, rep.Retryable, stage)
 	if err != nil {
 		return err

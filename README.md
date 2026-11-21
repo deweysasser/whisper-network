@@ -170,12 +170,13 @@ network that lets out only TCP to 80, 443 and the server's port (plus DNS):
 the proxy's port is ephemeral and never one of those. A `--yt-dlp-cookies`
 file is readable by yt-dlp, so it is what a compromised yt-dlp would steal,
 and anyone with `submit_url` fetches with that account's session: use a
-throwaway account. See DESIGN.md section 13. A URL is job content and is
-never logged; logs and metrics carry only the site (`youtube.com`).
+throwaway account. See DESIGN.md section 13. A URL is job content: metrics,
+the audit log and routine logs carry only the site (`youtube.com`), but a
+failed fetch's error and logged stderr are kept in full and may quote it.
 
 ### Media is handled in a sandbox
 
-Every ffmpeg and whisper-cli process runs under `sandbox-exec`: Landlock
+Every ffmpeg, whisper-cli and yt-dlp process runs under `sandbox-exec`: Landlock
 filesystem (and, on kernel 6.7+, network) rules, a seccomp filter that
 refuses sockets and new namespaces, `no_new_privs`, resource limits, a
 timeout, and a dedicated unprivileged UID when the worker runs as root. The
@@ -262,8 +263,8 @@ docker run -d --name wn-worker \
 
 For a worker on another machine, point `--server` at the server's HTTPS URL.
 
-The image runs the worker as an unprivileged user (uid 10001), and ffmpeg and
-whisper-cli run as that user inside the sandbox. If you run the worker as root
+The image runs the worker as an unprivileged user (uid 10001), and ffmpeg,
+whisper-cli and (on downloaders) yt-dlp run as that user inside the sandbox. If you run the worker as root
 (for example from a binary under systemd), it refuses to start unless you pass
 `--child-uid` and `--child-gid`: an unprivileged user and group, dedicated to
 whisper-network, that the children switch to. Do not use `nobody` or any uid
@@ -445,7 +446,7 @@ with the model, prepare needing a full sandbox, the only able worker already
 failed it, all slots busy); the job page lists every waiting task with its
 wait, attempts and last failure.
 
-**Sandbox levels.** Every ffmpeg and whisper-cli child runs under
+**Sandbox levels.** Every ffmpeg, whisper-cli and yt-dlp child runs under
 `whisper-network sandbox-exec`, which applies lowest CPU and I/O priority,
 `no_new_privs`, resource limits and Landlock filesystem rules, and (kernel 6.7
 or later) Landlock TCP restrictions. The worker self-tests at startup and
@@ -544,7 +545,7 @@ for the authoritative list.
 | `--trust-proxy` | off | `WHISPER_TRUST_PROXY` | Trust `X-Forwarded-For`; only behind a proxy that sets it |
 | `--heartbeat-interval` | `30s` | `WHISPER_HEARTBEAT_INTERVAL` | Worker heartbeat interval; leases live 3x this |
 | `--max-attempts` | `2` | `WHISPER_MAX_ATTEMPTS` | Distinct workers a task may fail on (or let its lease expire) before the job fails; a worker never retries a task it failed |
-| `--retry-wait-limit` | `24h` | `WHISPER_RETRY_WAIT_LIMIT` | Fail a job whose failed task no other eligible worker has taken for this long |
+| `--retry-wait-limit` | `24h` | `WHISPER_RETRY_WAIT_LIMIT` | Fail a job whose failed task no other eligible worker has taken for this long; also fails a URL job that every downloader has been refused for rate limiting this long (measured from the first refusal) |
 | `--worker-failure-limit` | `3` | `WHISPER_WORKER_FAILURE_LIMIT` | Pause a worker after this many failed or expired leases in a row, spanning at least 2 jobs; `0` disables |
 | `--task-target` | `60m` | `WHISPER_TASK_TARGET` | Target audio length of one transcribe task |
 | `--split-window` | `60s` | `WHISPER_SPLIT_WINDOW` | Search window around each split point |
@@ -552,7 +553,7 @@ for the authoritative list.
 | `--model-factors` | `small.en=1,large-v3-turbo=3` | `WHISPER_MODEL_FACTORS` | Scheduling cost factor per model |
 | `--prepare-min-sandbox` | `full` | `WHISPER_PREPARE_MIN_SANDBOX` | `full`, `fs-only` or `none`: least sandbox level for prepare tasks |
 | `--fetch-min-sandbox` | `full` | `WHISPER_FETCH_MIN_SANDBOX` | `full`, `fs-only` or `none`: least sandbox level for a downloader to get fetch tasks. `full` means filesystem restricted and TCP connect limited to its egress proxy (Landlock ABI 4+). Lowering it only helps non-Linux downloaders: a Linux one below ABI 4 refuses fetch leases itself |
-| `--max-upload-bytes` | `2GiB` | `WHISPER_MAX_UPLOAD_BYTES` | Default upload cap (a queue may set a lower one). Raise it for large media, e.g. `13GiB` for 12 GB videos; a file is prepared only on a worker with room for it, and fails after `--retry-wait-limit` if no worker has |
+| `--max-upload-bytes` | `2GiB` | `WHISPER_MAX_UPLOAD_BYTES` | Default upload cap (a queue may set a lower one); also caps media a downloader fetches for a URL job. Raise it for large media, e.g. `13GiB` for 12 GB videos; a file is prepared only on a worker with room for it, and fails after `--retry-wait-limit` if no worker has |
 | `--min-free-bytes` | `1GiB` | `WHISPER_MIN_FREE_BYTES` | Refuse uploads below this much free disk |
 | `--audio-retention` | `24h` | `WHISPER_AUDIO_RETENTION` | Keep canonical audio this long after a job is done |
 | `--failed-retention` | `24h` | `WHISPER_FAILED_RETENTION` | Keep a failed job's media at least this long after it failed, so it can be retried |
@@ -599,7 +600,7 @@ for the authoritative list.
 | `--child-timeout` | `4` | `WHISPER_CHILD_TIMEOUT_FACTOR` | whisper-cli time limit as a multiple of audio duration, plus 10 min |
 | `--prepare-timeout` | `2h` | `WHISPER_PREPARE_TIMEOUT` | Least time limit of one ffmpeg (prepare) run |
 | `--prepare-min-rate` | `1MiB` | `WHISPER_PREPARE_MIN_RATE` | An ffmpeg run gets at least its input's size divided by this per second (12 GiB: 3.4 h) |
-| `--child-uid` | | `WHISPER_CHILD_UID` | Dedicated unprivileged uid for ffmpeg and whisper-cli; required (and only allowed) when the worker runs as root |
+| `--child-uid` | | `WHISPER_CHILD_UID` | Dedicated unprivileged uid for ffmpeg, whisper-cli and yt-dlp; required (and only allowed) when the worker runs as root |
 | `--child-gid` | | `WHISPER_CHILD_GID` | Group for the children; required with `--child-uid` |
 | `--metrics-listen` | | `WHISPER_METRICS_LISTEN` | Serve `/metrics` on this address |
 | `--metrics-push-url` | | `WHISPER_METRICS_PUSH_URL` | Push to a VictoriaMetrics import URL |
