@@ -58,6 +58,13 @@ services:
   # worker it must be approved in the server UI, and URL jobs also need the
   # submit_url grant on the queue and a fetch grant for this worker.
   # Remove this service if you do not want URL jobs.
+  # The downloader's sandbox limits yt-dlp's TCP connects to the egress
+  # proxy's port, but on any address (Landlock has no address rules). For a
+  # real deployment give it its own network and an egress firewall that lets
+  # out only TCP to 80, 443 and the server's port, plus DNS (the proxy's port
+  # is ephemeral and never one of those), e.g. Docker's DOCKER-USER chain;
+  # see DESIGN.md section 13. A --yt-dlp-cookies file is readable by yt-dlp:
+  # use a throwaway account's.
   downloader:
     image: ${WN_IMAGE:-ghcr.io/deweysasser/whisper-network}:${WN_TAG:-latest}-downloader
     command: ["worker", "--downloader", "--server", "http://server:8080", "--description", "compose-downloader"]

@@ -162,9 +162,15 @@ process media, and processing workers never fetch. Every connection a
 downloader makes goes through an address filter that refuses loopback, private,
 CGNAT, link-local and similar addresses (unless `--allow-private-egress`), and
 yt-dlp runs in a sandbox that may only connect to that filter's proxy port.
+The proxy and the plain GET (redirects included) reach only ports 80 and 443.
 Residual risk: Landlock limits TCP connects by port, not address, so a
 compromised yt-dlp could reach a host listening on the proxy's own port,
-bypassing the filter; see DESIGN.md section 13. A URL is job content and is
+bypassing the filter. Close that with an egress firewall on the downloader's
+network that lets out only TCP to 80, 443 and the server's port (plus DNS):
+the proxy's port is ephemeral and never one of those. A `--yt-dlp-cookies`
+file is readable by yt-dlp, so it is what a compromised yt-dlp would steal,
+and anyone with `submit_url` fetches with that account's session: use a
+throwaway account. See DESIGN.md section 13. A URL is job content and is
 never logged; logs and metrics carry only the site (`youtube.com`).
 
 ### Media is handled in a sandbox
@@ -320,8 +326,23 @@ are per site and per egress address, set by an admin on the **Fetch** page
 (`/ui/fetch`) or `/admin/fetch-policies`: the defaults allow YouTube one fetch
 per 3 minutes and back off for 12 hours after a rate limit. Downloaders behind
 one public address should share `--egress-group NAME` (or set `--egress-probe`)
-so they are paced together. Needs a kernel with Landlock ABI 4 (Linux 6.7+) for
-the default `--fetch-min-sandbox full`.
+so they are paced together. Needs a kernel with Landlock ABI 4 (Linux 6.7+):
+below that the sandbox cannot let yt-dlp reach the proxy, and the downloader
+refuses fetch leases (lowering `--fetch-min-sandbox` does not change that on
+Linux).
+
+Give the downloader its own network and an egress firewall that allows only
+outbound TCP to ports 80, 443 and the server's port, plus DNS. With Docker and
+a downloader on bridge network `172.30.0.0/24`, server on 8080:
+
+```sh
+iptables -I DOCKER-USER -s 172.30.0.0/24 -j DROP
+iptables -I DOCKER-USER -s 172.30.0.0/24 -p udp --dport 53 -j ACCEPT
+iptables -I DOCKER-USER -s 172.30.0.0/24 -p tcp -m multiport --dports 53,80,443,8080 -j ACCEPT
+iptables -I DOCKER-USER -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+```
+
+That closes the one path around the egress proxy (DESIGN.md section 13).
 
 ### Compose example
 
@@ -530,7 +551,7 @@ for the authoritative list.
 | `--class-weights` | `low=1,medium=2,high=4` | `WHISPER_CLASS_WEIGHTS` | Job weight-class shares |
 | `--model-factors` | `small.en=1,large-v3-turbo=3` | `WHISPER_MODEL_FACTORS` | Scheduling cost factor per model |
 | `--prepare-min-sandbox` | `full` | `WHISPER_PREPARE_MIN_SANDBOX` | `full`, `fs-only` or `none`: least sandbox level for prepare tasks |
-| `--fetch-min-sandbox` | `full` | `WHISPER_FETCH_MIN_SANDBOX` | `full`, `fs-only` or `none`: least sandbox level for a downloader to get fetch tasks. `full` means filesystem restricted and TCP connect limited to its egress proxy (Landlock ABI 4+) |
+| `--fetch-min-sandbox` | `full` | `WHISPER_FETCH_MIN_SANDBOX` | `full`, `fs-only` or `none`: least sandbox level for a downloader to get fetch tasks. `full` means filesystem restricted and TCP connect limited to its egress proxy (Landlock ABI 4+). Lowering it only helps non-Linux downloaders: a Linux one below ABI 4 refuses fetch leases itself |
 | `--max-upload-bytes` | `2GiB` | `WHISPER_MAX_UPLOAD_BYTES` | Default upload cap (a queue may set a lower one). Raise it for large media, e.g. `13GiB` for 12 GB videos; a file is prepared only on a worker with room for it, and fails after `--retry-wait-limit` if no worker has |
 | `--min-free-bytes` | `1GiB` | `WHISPER_MIN_FREE_BYTES` | Refuse uploads below this much free disk |
 | `--audio-retention` | `24h` | `WHISPER_AUDIO_RETENTION` | Keep canonical audio this long after a job is done |
@@ -570,6 +591,7 @@ for the authoritative list.
 | `--egress-probe` | | `WHISPER_EGRESS_PROBE` | URL returning this downloader's public IP as text, e.g. `https://api.ipify.org` (downloader; optional) |
 | `--allow-private-egress` | off | `WHISPER_ALLOW_PRIVATE_EGRESS` | Let the downloader reach loopback, private and link-local addresses; disables the SSRF filter (downloader) |
 | `--fetch-timeout` | `2h` | `WHISPER_FETCH_TIMEOUT` | Time limit of one fetch (downloader) |
+| `--fetch-address-space` | `0` | `WHISPER_FETCH_ADDRESS_SPACE` | `RLIMIT_AS` of the yt-dlp child and the deno it runs; `0` sets none (deno reserves tens of GiB of address space, so a low limit breaks YouTube; downloader) |
 | `--whisper-cli` | `whisper-cli` | `WHISPER_WHISPER_CLI` | whisper-cli binary |
 | `--ffmpeg` | `ffmpeg` | `WHISPER_FFMPEG` | ffmpeg binary |
 | `--engine-version` | probed | `WHISPER_ENGINE_VERSION` | Override the reported engine version |

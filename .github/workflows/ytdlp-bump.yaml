@@ -27,6 +27,8 @@ jobs:
         id: update
         env:
           GH_TOKEN: ${{ github.token }}
+          # yt-dlp's release signing key (Simon Sawicki, rsa4096, 2023-02-26).
+          YTDLP_KEY_FPR: AC0CBBE6848D6A873464AF4E57CF65933B5A7581
         run: |
           set -euo pipefail
           latest="$(gh api repos/yt-dlp/yt-dlp/releases/latest --jq .tag_name)"
@@ -41,7 +43,20 @@ jobs:
             exit 0
           fi
           sums="$(mktemp)"
+          sig="$(mktemp)"
+          keyring="$(mktemp)"
           gh release download "$latest" -R yt-dlp/yt-dlp -p SHA2-256SUMS -O "$sums" --clobber
+          gh release download "$latest" -R yt-dlp/yt-dlp -p SHA2-256SUMS.sig -O "$sig" --clobber
+          # The checksums are only as good as their source: verify them
+          # against yt-dlp's release signing key, committed in this
+          # repository (fingerprint pinned below), before using any.
+          gpg --dearmor < deploy/yt-dlp-release-key.asc > "$keyring"
+          fpr="$(gpg --batch --with-colons --show-keys deploy/yt-dlp-release-key.asc | awk -F: '$1 == "fpr" {print $10; exit}')"
+          if [[ "$fpr" != "$YTDLP_KEY_FPR" ]]; then
+            echo "deploy/yt-dlp-release-key.asc is not the pinned key ($fpr)" >&2
+            exit 1
+          fi
+          gpgv --keyring "$keyring" "$sig" "$sums"
           amd64="$(awk '$2 == "yt-dlp_linux" {print $1}' "$sums")"
           arm64="$(awk '$2 == "yt-dlp_linux_aarch64" {print $1}' "$sums")"
           for h in "$amd64" "$arm64"; do
@@ -77,4 +92,4 @@ jobs:
           fi
           gh pr create --head "$branch" --base "${{ github.event.repository.default_branch }}" \
             --title "chore(docker): bump yt-dlp to ${VERSION}" \
-            --body "Automated weekly bump of the pinned yt-dlp release and its linux checksums (from the release's SHA2-256SUMS) in the Dockerfile's downloader target. The downloader image build verifies the checksums."
+            --body "Automated weekly bump of the pinned yt-dlp release and its linux checksums (from the release's SHA2-256SUMS, verified against SHA2-256SUMS.sig with the committed yt-dlp release key) in the Dockerfile's downloader target. The downloader image build verifies the checksums."
